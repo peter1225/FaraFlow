@@ -1,0 +1,57 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.19.1
+    restart: unless-stopped
+    ipc: host
+    shm_size: 32gb
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+    command:
+      - microsoft/Fara1.5-9B
+      - --served-model-name
+      - microsoft/Fara1.5-9B
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --dtype
+      - bfloat16
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-65536}
+      - --limit-mm-per-prompt
+      - image=3
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTILIZATION:-0.92}
+      - --enable-prefix-caching
+    volumes:
+      - huggingface-cache:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:5000:5000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30m
+      retries: 20
+    networks: [execution]
+
+  api:
+    depends_on:
+      vllm:
+        condition: service_healthy
+    environment:
+      FARAFLOW_FARA_BASE_URL: http://vllm:5000/v1
+      FARAFLOW_FARA_MODEL: microsoft/Fara1.5-9B
+
+volumes:
+  huggingface-cache:
+

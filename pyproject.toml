@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "faraflow"
+version = "0.1.0"
+description = "Enterprise browser automation agent platform powered by Microsoft Fara1.5"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "FaraFlow Team" }]
+dependencies = [
+  "aiosqlite>=0.20,<1",
+  "asyncpg>=0.30,<1",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "orjson>=3.10,<4",
+  "playwright>=1.48,<1.50",
+  "pydantic>=2.10,<3",
+  "pydantic-settings>=2.7,<3",
+  "python-multipart>=0.0.20,<1",
+  "sqlalchemy[asyncio]>=2.0.36,<3",
+  "uvicorn[standard]>=0.30,<0.34",
+]
+
+[project.optional-dependencies]
+temporal = ["temporalio>=1.9,<2"]
+s3 = ["minio>=7.2,<8"]
+observability = [
+  "opentelemetry-api>=1.29,<2",
+  "opentelemetry-sdk>=1.29,<2",
+  "opentelemetry-instrumentation-fastapi>=0.50b0,<1",
+]
+dev = [
+  "mypy>=1.11,<1.14",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.23,<0.25",
+  "pytest-cov>=5,<6",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+faraflow-api = "faraflow.api.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/faraflow"]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py38"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"backend/faraflow/infra/database.py" = ["UP006"]
+
+[tool.mypy]
+python_version = "3.8"
+strict = true
+warn_unused_ignores = true
