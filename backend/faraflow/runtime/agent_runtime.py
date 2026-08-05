@@ -220,11 +220,12 @@ class AgentRuntime:
                         SessionState.HANDOFF,
                         runtime_state=runtime_state,
                     )
+                    release_payload = await self._release_handoff_session(session_id)
                     await self.emit(
                         session_id,
                         "security.prompt_injection_detected",
                         "页面包含疑似提示注入内容，已停止自动执行并请求人工接管",
-                        {"matched_text": injection},
+                        {"matched_text": injection, **release_payload},
                     )
                     return
 
@@ -491,11 +492,12 @@ class AgentRuntime:
                 SessionState.HANDOFF,
                 runtime_state=runtime_state,
             )
+            release_payload = await self._release_handoff_session(session_id)
             await self.emit(
                 session_id,
                 "security.policy_blocked",
                 "安全策略阻止了浏览器动作，任务转人工处理",
-                {"detail": str(exc)},
+                {"detail": str(exc), **release_payload},
             )
         except Exception as exc:
             trace_ref = await self.browser_pool.close_session(session_id)
@@ -521,6 +523,16 @@ class AgentRuntime:
                     "trace_ref": trace_ref,
                 },
             )
+
+    async def _release_handoff_session(self, session_id: str) -> Dict[str, Any]:
+        try:
+            trace_ref = await self.browser_pool.close_session(session_id)
+        except Exception as exc:
+            return {
+                "trace_ref": None,
+                "browser_close_error": f"{type(exc).__name__}: {exc}",
+            }
+        return {"trace_ref": trace_ref}
 
     @staticmethod
     def _redact_action(action: ComputerAction) -> Dict[str, Any]:

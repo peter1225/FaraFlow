@@ -266,8 +266,10 @@ class BrowserPool:
             await session.context.tracing.stop(path=str(trace_path))
             trace_ref = f"/v1/artifacts/{session_id}/trace.zip"
         finally:
-            await session.context.close()
-            self._capacity.release()
+            try:
+                await session.context.close()
+            finally:
+                self._capacity.release()
         return trace_ref
 
     async def close(self) -> None:
