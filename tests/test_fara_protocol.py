@@ -39,6 +39,15 @@ def test_parse_string_arguments() -> None:
     assert decision.action.answer == "done"
 
 
+def test_parse_python_literal_fallback() -> None:
+    content = (
+        "<tool_call>{'name':'computer_use','arguments':"
+        "{'action':'type','text':'竹知了'}}</tool_call>"
+    )
+    decision = parse_tool_call(content)
+    assert decision.action.text == "竹知了"
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -66,3 +75,6 @@ def test_system_prompt_contains_safety_and_schema() -> None:
     assert '"computer_use"' in prompt
     assert '"ask_user_question"' in prompt
     assert "1000x1000" in prompt
+    assert '"arguments":{...}' not in prompt
+    assert "<function-name>" in prompt
+    assert "<args-json-object>" in prompt

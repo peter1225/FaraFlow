@@ -43,15 +43,8 @@ class FaraAdapter:
         return {
             "role": "user",
             "content": [
-                {
-                    "type": "text",
-                    "text": (
-                        f"User task: {goal}\n"
-                        "This is the current browser screenshot. Think about the safest "
-                        "next browser action."
-                    ),
-                },
                 self.image_part(screenshot),
+                {"type": "text", "text": goal},
             ],
         }
 
@@ -63,14 +56,17 @@ class FaraAdapter:
         user_response: str = "",
         facts: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        text = f"Observation: {observation}\nHere is the next screenshot. Think what to do next."
+        text = (
+            f"Observation: {observation}\n"
+            "Here is the next screenshot. Think about what to do next."
+        )
         if user_response:
             text = f"User response: {user_response}\n{text}"
         if facts:
             text += "\nRemembered facts:\n- " + "\n- ".join(facts[-10:])
         return {
             "role": "user",
-            "content": [{"type": "text", "text": text}, self.image_part(screenshot)],
+            "content": [self.image_part(screenshot), {"type": "text", "text": text}],
         }
 
     def _trim_screenshots(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -114,7 +110,29 @@ class FaraAdapter:
                     )
                 if not isinstance(content, str):
                     raise ModelProtocolError("model response content was not text")
-                return parse_tool_call(content)
+                try:
+                    return parse_tool_call(content)
+                except ModelProtocolError as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        payload["messages"] = [
+                            *payload["messages"],
+                            {"role": "assistant", "content": content},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Your previous <tool_call> was invalid JSON and could not "
+                                    "be executed. Return one corrected <tool_call> now. "
+                                    "Use a real action object, double-quoted JSON properties, "
+                                    "and no placeholders. Copy any non-English text exactly "
+                                    "as written in the original user task instead of using "
+                                    "escape codes."
+                                ),
+                            },
+                        ]
+                        await asyncio.sleep(2**attempt)
+                        continue
+                    raise
             except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
                 last_error = exc
                 if attempt < 2:
