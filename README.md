@@ -4,10 +4,15 @@ FaraFlow 是一个面向企业场景的浏览器智能自动化 Agent 平台。�
 Fara1.5 放进受控的会话、审批、安全策略和审计边界中，而不是让模型直接拥有一台
 不受限制的浏览器。
 
-当前仓库实现的是可运行 MVP：
+当前仓库实现的是可运行 MVP，已经包含以下框架：
 
-- Fara1.5-9B + vLLM OpenAI-compatible 推理适配；
-- Playwright 1440×900 隔离 BrowserContext；
+- Fara1.5-9B + vLLM OpenAI-compatible 推理适配，可连接本机或远程模型服务器；
+- React 19 + Vite 对话工作区，支持普通问答与自动化请求的统一入口；
+- `ChatService` 意图路由：无需实时网页信息时直接对话，需要搜索或操作网页时自动创建浏览器任务；
+- 自动化任务控制台：任务计划、浏览器截图、执行时间线、审批提示和运行状态；
+- 深色/浅色主题切换，并将用户选择保存到浏览器本地存储；
+- `AgentRuntime` 浏览器 Agent 主循环：截图 → 模型决策 → 安全检查 → Playwright 执行 → 结果回传；
+- Playwright 1440×900 隔离 BrowserContext 与并发会话池；
 - Fara 官方 `computer_use` XML/JSON 工具协议与 1000×1000 坐标映射；
 - 域名白名单、私网拦截、页面提示注入检测；
 - 提交、购买、删除、发送和登录控件的模型外审批拦截；
@@ -19,23 +24,50 @@ Fara1.5 放进受控的会话、审批、安全策略和审计边界中，而不
 
 ## 系统架构
 
-![FaraFlow 企业级浏览器智能自动化 Agent 平台系统架构图](./docs/imgs/FaraFlow%20—%20企业级浏览器智能自动化%20Agent%20平台（系统架构图）.png)
+![FaraFlow 企业级浏览器智能自动化 Agent 平台系统架构图](<./docs/imgs/FaraFlow — 企业级浏览器智能自动化 Agent 平台（系统架构图）-v2.png>)
 
 ## 目录结构
 
 ```text
 backend/faraflow/
-  api/               FastAPI 与 WebSocket
-  browser/           Playwright 隔离执行平面
-  domain/            API/领域模型
-  infra/             SQLAlchemy、工件与事件设施
-  model/             Fara1.5 协议和 vLLM 适配器
-  runtime/           Coordinator 任务状态机
-  security/          allow-list、关键动作、注入检测
-frontend/            React + Vite 控制台
+  api/               FastAPI 路由、生命周期和 WebSocket 事件接口
+  browser/           BrowserPool、Playwright 隔离执行平面
+  domain/            API 请求/响应模型与任务状态枚举
+  infra/             SQLAlchemy、Repository、工件与事件设施
+  model/             Fara1.5 协议解析和 vLLM 适配器
+  runtime/           ChatService、TaskService、AgentRuntime
+  security/          域名白名单、关键动作审批、注入检测
+frontend/
+  src/App.tsx        对话、任务、审批和主题切换界面
+  src/api.ts         REST 与 WebSocket 客户端
+  src/types.ts       前端领域类型
+  src/styles.css     控制台视觉主题
+data/                本地 SQLite 数据库（开发运行时生成）
+artifacts/           截图与 Playwright trace（开发运行时生成）
+browser-state/       浏览器登录态 checkpoint（开发运行时生成）
 deploy/              容器、安全与 A6000 部署文件
-tests/               单元与 API 集成测试
+tests/               单元、API、浏览器和 Agent 运行时测试
 ```
+
+## 当前运行链路
+
+用户从控制台发送消息后，后端先由 `ChatService` 判断请求类型：
+
+1. 普通问答、解释或写作请求直接调用 `FaraAdapter`，通过 OpenAI 兼容接口向 vLLM 请求回复，并将消息保存到 SQLite。
+2. 搜索、打开、访问或查询实时网页时，系统创建自动化任务并交给 `AgentRuntime`。
+3. `AgentRuntime` 为任务创建隔离浏览器会话，循环执行“截图 → Fara 决策 → 安全策略 → Playwright 动作”。
+4. 每个动作会写入 Action/Event 记录；截图和 Playwright trace 保存到 `artifacts/`，浏览器登录态保存到 `browser-state/`。
+5. 任务完成、暂停、等待用户输入、等待审批、触发安全接管或失败时，状态通过 REST 和 WebSocket 同步到前端。
+
+当前开发环境可以把 `.env` 中的模型配置指向远程 vLLM OpenAI API，例如：
+
+```dotenv
+FARAFLOW_FARA_BASE_URL=http://127.0.0.1:5000/v1
+FARAFLOW_FARA_MODEL=microsoft/Fara1.5-9B
+FARAFLOW_FARA_API_KEY=not-needed
+```
+
+如果模型部署在内网服务器，将 `FARAFLOW_FARA_BASE_URL` 改成该服务器的 `/v1` 地址即可，前端和后端不需要修改模型调用代码。
 
 ## 本地开发
 
@@ -80,6 +112,15 @@ npm run dev
 
 当前 MVP 的任务循环在 API 进程内运行；Compose 已包含 Temporal 服务，供生产阶段
 将同一状态机迁移为 durable workflow。单机部署应先用单个 API worker，避免重复执行。
+
+主要 API 包括：
+
+- `POST /v1/chats`、`POST /v1/chats/{chat_id}/messages`：创建对话并发送消息；
+- `POST /v1/tasks`：直接创建自动化任务；
+- `POST /v1/tasks/{task_id}/start|pause|terminate|respond`：控制任务生命周期；
+- `POST /v1/tasks/{task_id}/approvals/{approval_id}`：处理高风险动作审批；
+- `WS /v1/sessions/{session_id}/events`：接收实时执行事件；
+- `GET /v1/artifacts/{artifact_path}`：查看任务截图和 trace 工件。
 
 ## A6000 一键部署
 
