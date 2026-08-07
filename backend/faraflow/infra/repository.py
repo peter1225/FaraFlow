@@ -7,11 +7,13 @@ from sqlalchemy import Select, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from faraflow.domain.enums import ApprovalStatus, SessionState
-from faraflow.domain.schemas import SkillManifest, TaskCreate
+from faraflow.domain.schemas import ChatCreate, SkillManifest, TaskCreate
 
 from .database import (
     ActionRecord,
     ApprovalRecord,
+    ChatMessageRecord,
+    ChatThreadRecord,
     EventRecord,
     SessionRecord,
     SkillRecord,
@@ -38,6 +40,89 @@ class ConflictError(RuntimeError):
 class Repository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+
+    async def create_chat(self, request: ChatCreate) -> ChatThreadRecord:
+        async with self._session_factory() as db:
+            chat = ChatThreadRecord(
+                chat_id=new_id("chat"),
+                tenant_id=request.tenant_id,
+                user_id=request.user_id,
+                title=request.title,
+            )
+            db.add(chat)
+            await db.commit()
+            await db.refresh(chat)
+            return chat
+
+    async def list_chats(
+        self, tenant_id: Optional[str] = None, limit: int = 100
+    ) -> List[ChatThreadRecord]:
+        statement: Select[Tuple[ChatThreadRecord]] = select(ChatThreadRecord).order_by(
+            desc(ChatThreadRecord.updated_at)
+        )
+        if tenant_id:
+            statement = statement.where(ChatThreadRecord.tenant_id == tenant_id)
+        statement = statement.limit(limit)
+        async with self._session_factory() as db:
+            return list((await db.scalars(statement)).all())
+
+    async def get_chat(self, chat_id: str) -> ChatThreadRecord:
+        async with self._session_factory() as db:
+            chat = await db.get(ChatThreadRecord, chat_id)
+            if chat is None:
+                raise NotFoundError(f"chat {chat_id} not found")
+            return chat
+
+    async def update_chat_title(self, chat_id: str, title: str) -> None:
+        async with self._session_factory() as db:
+            chat = await db.get(ChatThreadRecord, chat_id)
+            if chat is None:
+                raise NotFoundError(f"chat {chat_id} not found")
+            chat.title = title
+            chat.updated_at = now_utc()
+            await db.commit()
+
+    async def append_chat_message(
+        self,
+        *,
+        chat_id: str,
+        role: str,
+        content: str,
+        mode: str = "chat",
+        task_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ChatMessageRecord:
+        async with self._session_factory() as db:
+            chat = await db.get(ChatThreadRecord, chat_id)
+            if chat is None:
+                raise NotFoundError(f"chat {chat_id} not found")
+            message = ChatMessageRecord(
+                message_id=new_id("msg"),
+                chat_id=chat_id,
+                role=role,
+                content=content,
+                mode=mode,
+                task_id=task_id,
+                message_metadata=metadata or {},
+            )
+            chat.updated_at = now_utc()
+            db.add(message)
+            await db.commit()
+            await db.refresh(message)
+            return message
+
+    async def list_chat_messages(
+        self, chat_id: str, limit: int = 200
+    ) -> List[ChatMessageRecord]:
+        await self.get_chat(chat_id)
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(ChatMessageRecord)
+                .where(ChatMessageRecord.chat_id == chat_id)
+                .order_by(ChatMessageRecord.created_at)
+                .limit(limit)
+            )
+            return list(rows.all())
 
     async def create_task(
         self, request: TaskCreate, plan: List[Dict[str, Any]]

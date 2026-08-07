@@ -82,3 +82,33 @@ export interface BrowserAction {
   created_at: string;
 }
 
+export interface ChatMessage {
+  message_id: string;
+  chat_id: string;
+  role: "user" | "assistant";
+  content: string;
+  mode: "chat" | "automation";
+  task_id?: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface ChatSummary {
+  chat_id: string;
+  tenant_id: string;
+  user_id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface Chat extends ChatSummary {
+  messages: ChatMessage[];
+}
+
+export interface ChatReply {
+  route: "chat" | "automation";
+  chat: Chat;
+  task?: Task;
+}
+

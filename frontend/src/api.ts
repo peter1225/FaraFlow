@@ -1,4 +1,12 @@
-import type { Approval, BrowserAction, SessionEvent, Task } from "./types";
+import type {
+  Approval,
+  BrowserAction,
+  Chat,
+  ChatReply,
+  ChatSummary,
+  SessionEvent,
+  Task,
+} from "./types";
 
 const configuredBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 export const API_BASE = (configuredBase ?? "").replace(/\/$/, "");
@@ -19,6 +27,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  listChats: () => request<ChatSummary[]>("/v1/chats"),
+  getChat: (chatId: string) => request<Chat>(`/v1/chats/${chatId}`),
+  createChat: (payload: Record<string, unknown> = {}) =>
+    request<Chat>("/v1/chats", { method: "POST", body: JSON.stringify(payload) }),
+  sendChatMessage: (chatId: string, content: string, autoStart = true) =>
+    request<ChatReply>(`/v1/chats/${chatId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content, auto_start: autoStart }),
+    }),
   listTasks: () => request<Task[]>("/v1/tasks"),
   getTask: (taskId: string) => request<Task>(`/v1/tasks/${taskId}`),
   createTask: (payload: Record<string, unknown>) =>

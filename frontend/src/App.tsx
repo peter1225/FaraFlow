@@ -1,7 +1,16 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api, artifactUrl, eventWebSocketUrl } from "./api";
-import type { Approval, BrowserAction, SessionEvent, SessionState, Task } from "./types";
+import type {
+  Approval,
+  BrowserAction,
+  Chat,
+  ChatMessage,
+  ChatSummary,
+  SessionEvent,
+  SessionState,
+  Task,
+} from "./types";
 
 const STATUS_LABELS: Record<SessionState, string> = {
   CREATED: "已创建",
@@ -17,6 +26,14 @@ const STATUS_LABELS: Record<SessionState, string> = {
   TERMINATED: "已终止",
   EXPIRED: "已过期",
 };
+
+type Theme = "light" | "dark";
+
+function initialTheme(): Theme {
+  const saved = window.localStorage.getItem("faraflow-theme");
+  if (saved === "light" || saved === "dark") return saved;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
 
 function formatTime(value?: string): string {
   if (!value) return "—";
@@ -43,7 +60,7 @@ function Logo() {
       </div>
       <div>
         <div className="brand-name">FaraFlow</div>
-        <div className="brand-caption">AUTOMATION CONTROL</div>
+        <div className="brand-caption">AI 工作台</div>
       </div>
     </div>
   );
@@ -145,7 +162,7 @@ function CreateTask({
   );
 }
 
-function EmptyState({ onCreate }: { onCreate: () => void }) {
+function EmptyState({ onChat, onCreate }: { onChat: () => void; onCreate: () => void }) {
   return (
     <main className="empty-state">
       <div className="empty-visual" aria-hidden="true">
@@ -153,12 +170,173 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
         <div className="orbit orbit-b" />
         <div className="core">F</div>
       </div>
-      <div className="eyebrow">READY FOR FIRST RUN</div>
-      <h1>让浏览器流程变得可控、可恢复、可审计</h1>
-      <p>创建一个自然语言任务，FaraFlow 会在隔离浏览器中执行，并在关键操作前停下来等待你。</p>
-      <button className="button primary large" onClick={onCreate}>
-        创建第一个任务 <span>↗</span>
-      </button>
+      <div className="eyebrow">CONVERSATION FIRST · BROWSER ON DEMAND</div>
+      <h1>先聊清楚，需要网页时再让浏览器行动</h1>
+      <p>普通问题直接回答；需要实时网页信息或页面操作时，FaraFlow 会自动创建受控浏览器任务。</p>
+      <div className="empty-actions">
+        <button className="button primary large" onClick={onChat}>
+          开始对话 <span>→</span>
+        </button>
+        <button className="button secondary large" onClick={onCreate}>
+          直接创建自动化
+        </button>
+      </div>
+    </main>
+  );
+}
+
+function taskResult(task?: Task): string | undefined {
+  if (!task?.final_result) return undefined;
+  const answer = task.final_result.answer;
+  if (typeof answer === "string") return answer;
+  const reason = task.final_result.reason;
+  if (typeof reason === "string") return reason;
+  return JSON.stringify(task.final_result);
+}
+
+function ChatPanel({
+  chat,
+  tasks,
+  sending,
+  onSend,
+  onOpenTask,
+}: {
+  chat: Chat;
+  tasks: Task[];
+  sending: boolean;
+  onSend: (content: string) => Promise<void>;
+  onOpenTask: (taskId: string) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const endRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chat.messages, sending]);
+
+  async function submit() {
+    const content = draft.trim();
+    if (!content || sending) return;
+    setDraft("");
+    await onSend(content);
+  }
+
+  return (
+    <main className="chat-page">
+      <header className="chat-header">
+        <div>
+          <div className="breadcrumb">
+            CHAT <span>/</span> {chat.chat_id.slice(0, 13)}
+          </div>
+          <h1>{chat.title}</h1>
+          <p>普通问题由模型直接回答；需要实时信息时自动接管浏览器。</p>
+        </div>
+        <div className="chat-route-legend">
+          <span><i className="route-dot direct" />直接回答</span>
+          <span><i className="route-dot browser" />浏览器任务</span>
+        </div>
+      </header>
+
+      <section className="chat-surface">
+        <div className="chat-messages">
+          {chat.messages.length === 0 && (
+            <div className="chat-welcome">
+              <div className="assistant-avatar">F</div>
+              <div>
+                <h2>你好，我是 FaraFlow</h2>
+                <p>可以直接问我问题，也可以让我查询网页。只有确实需要时，我才会启动浏览器。</p>
+                <div className="prompt-suggestions">
+                  <button onClick={() => setDraft("介绍一下这个项目的主要功能")}>介绍这个项目</button>
+                  <button onClick={() => setDraft("帮我搜索最新的 vLLM 文档并总结")}>查询最新文档</button>
+                  <button onClick={() => setDraft("设计一个安全的网页自动化测试任务")}>设计测试任务</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {chat.messages.map((message) => {
+            const linkedTask = message.task_id
+              ? tasks.find((item) => item.task_id === message.task_id)
+              : undefined;
+            const result = taskResult(linkedTask);
+            return (
+              <article className={`chat-message ${message.role}`} key={message.message_id}>
+                <div className="message-avatar">{message.role === "assistant" ? "F" : "U"}</div>
+                <div className="message-content">
+                  <div className="message-meta">
+                    <strong>{message.role === "assistant" ? "FaraFlow" : "你"}</strong>
+                    <time>{formatTime(message.created_at)}</time>
+                  </div>
+                  <p>{message.content}</p>
+                  {message.mode === "automation" && message.task_id && (
+                    <div className="automation-message-card">
+                      <div className="automation-card-head">
+                        <div>
+                          <span className="automation-icon">◎</span>
+                          <div>
+                            <small>BROWSER AUTOMATION</small>
+                            <strong>{linkedTask?.task_name ?? "浏览器任务"}</strong>
+                          </div>
+                        </div>
+                        {linkedTask && <StatusBadge state={linkedTask.status} />}
+                      </div>
+                      {linkedTask && (
+                        <div className="automation-card-detail">
+                          <span>{linkedTask.allowed_domains.join(" · ")}</span>
+                          <span>{Number(linkedTask.session.runtime_state.action_count ?? 0)} actions</span>
+                        </div>
+                      )}
+                      {result && <p className="automation-result">{result}</p>}
+                      <button className="button secondary" onClick={() => onOpenTask(message.task_id!)}>
+                        查看执行过程 <span>↗</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+
+          {sending && (
+            <article className="chat-message assistant pending">
+              <div className="message-avatar">F</div>
+              <div className="message-content typing-indicator">
+                <span />
+                <span />
+                <span />
+              </div>
+            </article>
+          )}
+          <div ref={endRef} />
+        </div>
+
+        <form
+          className="chat-composer"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
+          <textarea
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                void submit();
+              }
+            }}
+            rows={3}
+            placeholder="输入问题。需要实时网页信息时，我会自动启动浏览器…"
+          />
+          <div className="composer-footer">
+            <span>Enter 发送 · Shift + Enter 换行</span>
+            <button className="button primary" disabled={sending || !draft.trim()}>
+              {sending ? "处理中…" : "发送"}
+            </button>
+          </div>
+        </form>
+      </section>
     </main>
   );
 }
@@ -375,27 +553,41 @@ function TaskDetail({
 
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [chats, setChats] = useState<ChatSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [selected, setSelected] = useState<Task>();
+  const [selectedChatId, setSelectedChatId] = useState<string>();
+  const [selectedChat, setSelectedChat] = useState<Chat>();
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [actions, setActions] = useState<BrowserAction[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [sendingChat, setSendingChat] = useState(false);
   const [error, setError] = useState("");
+  const [theme, setTheme] = useState<Theme>(initialTheme);
 
-  const loadTasks = useCallback(async () => {
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("faraflow-theme", theme);
+  }, [theme]);
+
+  const loadNavigation = useCallback(async () => {
     try {
-      const rows = await api.listTasks();
-      setTasks(rows);
-      if (!selectedId && rows.length > 0) setSelectedId(rows[0].task_id);
+      const [taskRows, chatRows] = await Promise.all([api.listTasks(), api.listChats()]);
+      setTasks(taskRows);
+      setChats(chatRows);
+      if (!selectedId && !selectedChatId) {
+        if (chatRows.length > 0) setSelectedChatId(chatRows[0].chat_id);
+        else if (taskRows.length > 0) setSelectedId(taskRows[0].task_id);
+      }
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "无法加载任务");
+      setError(reason instanceof Error ? reason.message : "无法加载工作区");
     } finally {
       setLoading(false);
     }
-  }, [selectedId]);
+  }, [selectedChatId, selectedId]);
 
   const loadDetail = useCallback(async (taskId: string) => {
     const [task, eventRows, actionRows, approvalRows] = await Promise.all([
@@ -412,8 +604,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    void loadTasks();
-  }, [loadTasks]);
+    void loadNavigation();
+  }, [loadNavigation]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -425,6 +617,27 @@ export default function App() {
     }, 4000);
     return () => window.clearInterval(timer);
   }, [loadDetail, selectedId]);
+
+  useEffect(() => {
+    if (!selectedChatId) return;
+    const refresh = async () => {
+      const [chat, taskRows, chatRows] = await Promise.all([
+        api.getChat(selectedChatId),
+        api.listTasks(),
+        api.listChats(),
+      ]);
+      setSelectedChat(chat);
+      setTasks(taskRows);
+      setChats(chatRows);
+    };
+    void refresh().catch((reason: unknown) =>
+      setError(reason instanceof Error ? reason.message : "无法加载对话"),
+    );
+    const timer = window.setInterval(() => {
+      void refresh().catch(() => undefined);
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [selectedChatId]);
 
   useEffect(() => {
     if (!selected?.session_id) return;
@@ -456,6 +669,76 @@ export default function App() {
     [tasks],
   );
 
+  function selectTask(taskId: string) {
+    setSelectedChatId(undefined);
+    setSelectedChat(undefined);
+    setSelectedId(taskId);
+  }
+
+  function selectChat(chatId: string) {
+    setSelectedId(undefined);
+    setSelected(undefined);
+    setSelectedChatId(chatId);
+  }
+
+  async function createChat() {
+    setBusy(true);
+    setError("");
+    try {
+      const chat = await api.createChat({ title: "新对话" });
+      setChats((current) => [chat, ...current]);
+      setSelectedId(undefined);
+      setSelected(undefined);
+      setSelectedChatId(chat.chat_id);
+      setSelectedChat(chat);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "创建对话失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function sendChat(content: string) {
+    if (!selectedChat) return;
+    const before = selectedChat;
+    const optimistic: ChatMessage = {
+      message_id: `pending-${Date.now()}`,
+      chat_id: selectedChat.chat_id,
+      role: "user",
+      content,
+      mode: "chat",
+      metadata: {},
+      created_at: new Date().toISOString(),
+    };
+    setSelectedChat({ ...selectedChat, messages: [...selectedChat.messages, optimistic] });
+    setSendingChat(true);
+    setError("");
+    try {
+      const response = await api.sendChatMessage(selectedChat.chat_id, content);
+      setSelectedChat(response.chat);
+      const summary: ChatSummary = {
+        chat_id: response.chat.chat_id,
+        tenant_id: response.chat.tenant_id,
+        user_id: response.chat.user_id,
+        title: response.chat.title,
+        created_at: response.chat.created_at,
+        updated_at: response.chat.updated_at,
+      };
+      setChats((current) => [summary, ...current.filter((item) => item.chat_id !== summary.chat_id)]);
+      if (response.task) {
+        setTasks((current) => [
+          response.task!,
+          ...current.filter((item) => item.task_id !== response.task!.task_id),
+        ]);
+      }
+    } catch (reason) {
+      setSelectedChat(before);
+      setError(reason instanceof Error ? reason.message : "发送消息失败");
+    } finally {
+      setSendingChat(false);
+    }
+  }
+
   async function command(commandName: string, payload?: string) {
     if (!selected) return;
     setBusy(true);
@@ -485,34 +768,70 @@ export default function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <Logo />
-        <button className="new-task" onClick={() => setShowCreate(true)}>
-          <span>＋</span> 新建自动化
-        </button>
-        <div className="nav-label">任务会话</div>
-        <nav className="task-list">
-          {tasks.map((task) => (
-            <button
-              key={task.task_id}
-              className={`task-nav ${selectedId === task.task_id ? "active" : ""}`}
-              onClick={() => setSelectedId(task.task_id)}
-            >
-              <span className={`task-state-dot dot-${task.status.toLowerCase()}`} />
-              <span className="task-nav-copy">
-                <strong>{task.task_name}</strong>
-                <small>{formatTime(task.created_at)}</small>
-              </span>
-            </button>
-          ))}
-          {!loading && tasks.length === 0 && <div className="no-tasks">还没有任务</div>}
-        </nav>
-        <div className="sidebar-status">
-          <div>
-            <span className="pulse" />
-            CONTROL PLANE ONLINE
+        <div className="sidebar-actions">
+          <button className="new-task new-chat" disabled={busy} onClick={() => void createChat()}>
+            <span>＋</span> 新建对话
+          </button>
+          <button className="new-task secondary-action" onClick={() => setShowCreate(true)}>
+            <span>◎</span> 新建自动化
+          </button>
+        </div>
+        <div className="sidebar-scroll">
+          <div className="nav-label">对话</div>
+          <nav className="task-list">
+            {chats.map((chat) => (
+              <button
+                key={chat.chat_id}
+                className={`task-nav ${selectedChatId === chat.chat_id ? "active" : ""}`}
+                onClick={() => selectChat(chat.chat_id)}
+              >
+                <span className="chat-state-icon">◇</span>
+                <span className="task-nav-copy">
+                  <strong>{chat.title}</strong>
+                  <small>{formatTime(chat.updated_at)}</small>
+                </span>
+              </button>
+            ))}
+            {!loading && chats.length === 0 && <div className="no-tasks">还没有对话</div>}
+          </nav>
+
+          <div className="nav-label">自动化任务</div>
+          <nav className="task-list">
+            {tasks.map((task) => (
+              <button
+                key={task.task_id}
+                className={`task-nav ${selectedId === task.task_id ? "active" : ""}`}
+                onClick={() => selectTask(task.task_id)}
+              >
+                <span className={`task-state-dot dot-${task.status.toLowerCase()}`} />
+                <span className="task-nav-copy">
+                  <strong>{task.task_name}</strong>
+                  <small>{formatTime(task.created_at)}</small>
+                </span>
+              </button>
+            ))}
+            {!loading && tasks.length === 0 && <div className="no-tasks">还没有任务</div>}
+          </nav>
+        </div>
+        <div className="sidebar-footer">
+          <button
+            className="theme-toggle"
+            type="button"
+            aria-label={theme === "dark" ? "切换到浅色界面" : "切换到深色界面"}
+            onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+          >
+            <span aria-hidden="true">{theme === "dark" ? "☀" : "☾"}</span>
+            {theme === "dark" ? "浅色界面" : "深色界面"}
+          </button>
+          <div className="sidebar-status">
+            <div>
+              <span className="pulse" />
+              服务在线
+            </div>
+            <small>
+              {stats.running} 个执行中 · {stats.waiting} 个等待中
+            </small>
           </div>
-          <small>
-            {stats.running} running · {stats.waiting} waiting
-          </small>
         </div>
       </aside>
 
@@ -523,7 +842,15 @@ export default function App() {
             <button onClick={() => setError("")}>×</button>
           </div>
         )}
-        {selected ? (
+        {selectedChat ? (
+          <ChatPanel
+            chat={selectedChat}
+            tasks={tasks}
+            sending={sendingChat}
+            onSend={sendChat}
+            onOpenTask={selectTask}
+          />
+        ) : selected ? (
           <TaskDetail
             task={selected}
             events={events}
@@ -534,7 +861,7 @@ export default function App() {
             onRefresh={() => void loadDetail(selected.task_id)}
           />
         ) : (
-          <EmptyState onCreate={() => setShowCreate(true)} />
+          <EmptyState onChat={() => void createChat()} onCreate={() => setShowCreate(true)} />
         )}
       </section>
 
@@ -543,6 +870,8 @@ export default function App() {
           onClose={() => setShowCreate(false)}
           onCreated={(task) => {
             setTasks((current) => [task, ...current]);
+            setSelectedChatId(undefined);
+            setSelectedChat(undefined);
             setSelectedId(task.task_id);
             setSelected(task);
             setShowCreate(false);

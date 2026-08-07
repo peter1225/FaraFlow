@@ -22,6 +22,11 @@ from faraflow.config import Settings, get_settings
 from faraflow.domain.schemas import (
     ApprovalDecision,
     ApprovalView,
+    ChatCreate,
+    ChatMessageCreate,
+    ChatReply,
+    ChatSummary,
+    ChatView,
     SessionEvent,
     SkillManifest,
     TaskCreate,
@@ -34,6 +39,7 @@ from faraflow.infra.events import EventBus
 from faraflow.infra.repository import ConflictError, NotFoundError, Repository
 from faraflow.model.fara_adapter import FaraAdapter
 from faraflow.runtime.agent_runtime import AgentRuntime
+from faraflow.runtime.chat_service import ChatService
 from faraflow.runtime.task_service import TaskService
 
 logger = logging.getLogger(__name__)
@@ -50,6 +56,7 @@ class Container:
     fara: FaraAdapter
     runtime: AgentRuntime
     tasks: TaskService
+    chat: ChatService
 
 
 def build_container(settings: Settings) -> Container:
@@ -61,6 +68,7 @@ def build_container(settings: Settings) -> Container:
     fara = FaraAdapter(settings)
     runtime = AgentRuntime(repository, browser_pool, fara, event_bus)
     tasks = TaskService(repository, runtime)
+    chat = ChatService(repository, fara, tasks)
     return Container(
         settings=settings,
         database=database,
@@ -71,6 +79,7 @@ def build_container(settings: Settings) -> Container:
         fara=fara,
         runtime=runtime,
         tasks=tasks,
+        chat=chat,
     )
 
 
@@ -132,6 +141,34 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "database": "ok",
             "model_endpoint": model,
         }
+
+    @app.post(
+        "/v1/chats",
+        response_model=ChatView,
+        status_code=status.HTTP_201_CREATED,
+        tags=["chat"],
+    )
+    async def create_chat(payload: ChatCreate, request: Request) -> ChatView:
+        return await get_container(request).chat.create(payload)
+
+    @app.get("/v1/chats", response_model=List[ChatSummary], tags=["chat"])
+    async def list_chats(
+        request: Request,
+        tenant_id: Optional[str] = Query(default=None),
+    ) -> List[ChatSummary]:
+        return await get_container(request).chat.list(tenant_id)
+
+    @app.get("/v1/chats/{chat_id}", response_model=ChatView, tags=["chat"])
+    async def get_chat(chat_id: str, request: Request) -> ChatView:
+        return await get_container(request).chat.get(chat_id)
+
+    @app.post("/v1/chats/{chat_id}/messages", response_model=ChatReply, tags=["chat"])
+    async def send_chat_message(
+        chat_id: str,
+        payload: ChatMessageCreate,
+        request: Request,
+    ) -> ChatReply:
+        return await get_container(request).chat.respond(chat_id, payload)
 
     @app.post(
         "/v1/tasks",

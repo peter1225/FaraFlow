@@ -88,6 +88,17 @@ class FaraAdapter:
             result.append(copy)
         return list(reversed(result))
 
+    @staticmethod
+    def _response_content(data: Dict[str, Any]) -> str:
+        content = data["choices"][0]["message"]["content"]
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "") for part in content if isinstance(part, dict)
+            )
+        if not isinstance(content, str):
+            raise ModelProtocolError("model response content was not text")
+        return content
+
     async def next_action(self, conversation: List[Dict[str, Any]]) -> ModelDecision:
         messages = [{"role": "system", "content": self.system_prompt}]
         messages.extend(self._trim_screenshots(conversation))
@@ -102,14 +113,7 @@ class FaraAdapter:
             try:
                 response = await self._client.post("/chat/completions", json=payload)
                 response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                if isinstance(content, list):
-                    content = "".join(
-                        part.get("text", "") for part in content if isinstance(part, dict)
-                    )
-                if not isinstance(content, str):
-                    raise ModelProtocolError("model response content was not text")
+                content = self._response_content(response.json())
                 try:
                     return parse_tool_call(content)
                 except ModelProtocolError as exc:
@@ -138,6 +142,32 @@ class FaraAdapter:
                 if attempt < 2:
                     await asyncio.sleep(2**attempt)
         raise ModelEndpointError(f"Fara endpoint call failed after 3 attempts: {last_error}")
+
+    async def complete_chat(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        system_prompt: str,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        payload = {
+            "model": self.settings.fara_model,
+            "messages": [{"role": "system", "content": system_prompt}, *messages],
+            "temperature": temperature,
+            "max_tokens": max_tokens or self.settings.fara_max_tokens,
+        }
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                response = await self._client.post("/chat/completions", json=payload)
+                response.raise_for_status()
+                return self._response_content(response.json()).strip()
+            except (httpx.HTTPError, KeyError, IndexError, ValueError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(2**attempt)
+        raise ModelEndpointError(f"Fara chat call failed after 3 attempts: {last_error}")
 
     async def health(self) -> Dict[str, Any]:
         try:

@@ -41,7 +41,12 @@ class Settings(BaseSettings):
     allow_private_networks: bool = False
     max_concurrent_sessions: int = 2
     cors_origins: List[str] = Field(
-        default_factory=lambda: ["http://localhost:5173", "http://localhost:3000"]
+        default_factory=lambda: [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+        ]
     )
 
     def prepare_directories(self) -> None:

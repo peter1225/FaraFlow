@@ -46,6 +46,17 @@ class TaskCreate(BaseModel):
         return normalized
 
 
+class ChatCreate(BaseModel):
+    tenant_id: str = Field(default="default", min_length=1, max_length=100)
+    user_id: str = Field(default="local-user", min_length=1, max_length=100)
+    title: str = Field(default="新对话", min_length=1, max_length=200)
+
+
+class ChatMessageCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=10_000)
+    auto_start: bool = True
+
+
 class PlanStep(BaseModel):
     step_id: str
     order: int
@@ -87,6 +98,36 @@ class TaskView(BaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     session: Optional[SessionSummary] = None
+
+
+class ChatMessageView(BaseModel):
+    message_id: str
+    chat_id: str
+    role: Literal["user", "assistant"]
+    content: str
+    mode: Literal["chat", "automation"] = "chat"
+    task_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class ChatSummary(BaseModel):
+    chat_id: str
+    tenant_id: str
+    user_id: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatView(ChatSummary):
+    messages: List[ChatMessageView] = Field(default_factory=list)
+
+
+class ChatReply(BaseModel):
+    route: Literal["chat", "automation"]
+    chat: ChatView
+    task: Optional[TaskView] = None
 
 
 class SessionEvent(BaseModel):

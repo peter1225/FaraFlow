@@ -19,6 +19,36 @@ class Base(DeclarativeBase):
     pass
 
 
+class ChatThreadRecord(Base):
+    __tablename__ = "ff_chat_threads"
+
+    chat_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    user_id: Mapped[str] = mapped_column(String(100))
+    title: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True
+    )
+
+
+class ChatMessageRecord(Base):
+    __tablename__ = "ff_chat_messages"
+
+    message_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    chat_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_chat_threads.chat_id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[str] = mapped_column(Text)
+    mode: Mapped[str] = mapped_column(String(20), default="chat")
+    task_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("ff_tasks.task_id", ondelete="SET NULL"), nullable=True
+    )
+    message_metadata: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class TaskRecord(Base):
     __tablename__ = "ff_tasks"
 

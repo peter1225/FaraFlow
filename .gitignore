@@ -24,6 +24,7 @@ browser-state/
 playwright-report/
 test-results/
 auth.json
+/log/
 .api-dev*.log
 .web-dev*.log
 
