@@ -36,3 +36,14 @@ class ExecutorRoute(str, Enum):
     FARA = "fara"
     APPROVAL = "approval"
     HUMAN = "human_takeover"
+
+
+class CodeRunStatus(str, Enum):
+    CREATED = "CREATED"
+    RUNNING = "RUNNING"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
+    APPLIED = "APPLIED"
+    DISCARDED = "DISCARDED"
+    REVERTED = "REVERTED"
+    FAILED = "FAILED"
+    INTERRUPTED = "INTERRUPTED"

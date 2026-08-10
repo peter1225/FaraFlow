@@ -1,16 +1,21 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api, artifactUrl, eventWebSocketUrl } from "./api";
+import { CodeWorkspace } from "./CodeWorkspace";
 import type {
   Approval,
   BrowserAction,
   Chat,
   ChatMessage,
   ChatSummary,
+  CodeRun,
+  RequestedMode,
   SessionEvent,
   SessionState,
   Task,
+  Workspace,
 } from "./types";
+import { WorkspaceModal } from "./WorkspaceModal";
 
 const STATUS_LABELS: Record<SessionState, string> = {
   CREATED: "已创建",
@@ -194,31 +199,110 @@ function taskResult(task?: Task): string | undefined {
   return JSON.stringify(task.final_result);
 }
 
-function ChatPanel({
+function ReasoningDisclosure({
+  reasoning,
+  streaming,
+  hasAnswer,
+}: {
+  reasoning: string;
+  streaming: boolean;
+  hasAnswer: boolean;
+}) {
+  const [open, setOpen] = useState(streaming && !hasAnswer);
+  const previousHasAnswer = useRef(hasAnswer);
+
+  useEffect(() => {
+    if (streaming && !hasAnswer) {
+      setOpen(true);
+    } else if (!previousHasAnswer.current && hasAnswer) {
+      setOpen(false);
+    }
+    previousHasAnswer.current = hasAnswer;
+  }, [hasAnswer, streaming]);
+
+  return (
+    <details
+      className="reasoning-disclosure"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <span className="reasoning-chevron" aria-hidden="true">›</span>
+        <span>思考过程</span>
+        <small>{streaming && !hasAnswer ? "思考中…" : open ? "收起" : "展开"}</small>
+      </summary>
+      <pre className="reasoning-body">{reasoning}</pre>
+    </details>
+  );
+}
+
+export function ChatPanel({
   chat,
   tasks,
+  codeRuns,
   sending,
   onSend,
   onOpenTask,
+  onOpenWorkspace,
 }: {
   chat: Chat;
   tasks: Task[];
+  codeRuns: CodeRun[];
   sending: boolean;
-  onSend: (content: string) => Promise<void>;
+  onSend: (content: string, mode: RequestedMode, enableThinking: boolean) => Promise<void>;
   onOpenTask: (taskId: string) => void;
+  onOpenWorkspace: (workspaceId: string) => void;
 }) {
   const [draft, setDraft] = useState("");
+  const [mode, setMode] = useState<RequestedMode>(chat.workspace_id ? "code" : "auto");
+  const [thinkingEnabled, setThinkingEnabled] = useState(false);
+  const messagesRef = useRef<HTMLDivElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    stickToBottomRef.current = true;
+    setShowScrollToBottom(false);
+    endRef.current?.scrollIntoView({ behavior, block: "end" });
+  }, []);
+
+  const updateScrollPosition = useCallback(() => {
+    const container = messagesRef.current;
+    if (!container) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const isNearBottom = distanceFromBottom <= 48;
+    stickToBottomRef.current = isNearBottom;
+    setShowScrollToBottom(!isNearBottom);
+  }, []);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chat.messages, sending]);
+    setMode(chat.workspace_id ? "code" : "auto");
+    setThinkingEnabled(false);
+    stickToBottomRef.current = true;
+    setShowScrollToBottom(false);
+    window.requestAnimationFrame(() => scrollToBottom("auto"));
+  }, [chat.chat_id, chat.workspace_id, scrollToBottom]);
+
+  useEffect(() => {
+    if (stickToBottomRef.current) {
+      window.requestAnimationFrame(() => scrollToBottom("auto"));
+    } else {
+      setShowScrollToBottom(true);
+    }
+  }, [chat.messages, sending, scrollToBottom]);
 
   async function submit() {
     const content = draft.trim();
     if (!content || sending) return;
+    stickToBottomRef.current = true;
+    setShowScrollToBottom(false);
     setDraft("");
-    await onSend(content);
+    await onSend(
+      content,
+      mode,
+      thinkingEnabled && (mode === "auto" || mode === "chat"),
+    );
   }
 
   return (
@@ -234,11 +318,18 @@ function ChatPanel({
         <div className="chat-route-legend">
           <span><i className="route-dot direct" />直接回答</span>
           <span><i className="route-dot browser" />浏览器任务</span>
+          {chat.workspace_id && <span><i className="route-dot code" />本地代码</span>}
         </div>
       </header>
 
       <section className="chat-surface">
-        <div className="chat-messages">
+        <div className="chat-scroll-region">
+          <div
+            className="chat-messages"
+            data-testid="chat-messages"
+            ref={messagesRef}
+            onScroll={updateScrollPosition}
+          >
           {chat.messages.length === 0 && (
             <div className="chat-welcome">
               <div className="assistant-avatar">F</div>
@@ -259,15 +350,31 @@ function ChatPanel({
               ? tasks.find((item) => item.task_id === message.task_id)
               : undefined;
             const result = taskResult(linkedTask);
+            const linkedCodeRun = message.code_run_id
+              ? codeRuns.find((item) => item.code_run_id === message.code_run_id)
+              : undefined;
+            const reasoning = typeof message.metadata.reasoning === "string"
+              ? message.metadata.reasoning
+              : "";
             return (
-              <article className={`chat-message ${message.role}`} key={message.message_id}>
+              <article
+                className={`chat-message ${message.role}${message.metadata.streaming === true ? " streaming" : ""}`}
+                key={message.message_id}
+              >
                 <div className="message-avatar">{message.role === "assistant" ? "F" : "U"}</div>
                 <div className="message-content">
                   <div className="message-meta">
                     <strong>{message.role === "assistant" ? "FaraFlow" : "你"}</strong>
                     <time>{formatTime(message.created_at)}</time>
                   </div>
-                  <p>{message.content}</p>
+                  {reasoning && (
+                    <ReasoningDisclosure
+                      reasoning={reasoning}
+                      streaming={message.metadata.streaming === true}
+                      hasAnswer={message.content.trim().length > 0}
+                    />
+                  )}
+                  {message.content && <p>{message.content}</p>}
                   {message.mode === "automation" && message.task_id && (
                     <div className="automation-message-card">
                       <div className="automation-card-head">
@@ -292,22 +399,70 @@ function ChatPanel({
                       </button>
                     </div>
                   )}
+                  {message.mode === "code" && message.code_run_id && (
+                    <div className="automation-message-card code-message-card">
+                      <div className="automation-card-head">
+                        <div>
+                          <span className="automation-icon">⌘</span>
+                          <div>
+                            <small>LOCAL CODE RUN</small>
+                            <strong>{linkedCodeRun?.final_summary ?? "正在隔离工作区执行"}</strong>
+                          </div>
+                        </div>
+                        <span className={`code-status state-${linkedCodeRun?.status.toLowerCase() ?? "created"}`}>
+                          {linkedCodeRun?.status ?? "CREATED"}
+                        </span>
+                      </div>
+                      {linkedCodeRun?.changed_paths.length ? (
+                        <div className="automation-card-detail">
+                          <span>{linkedCodeRun.changed_paths.length} 个文件有变化</span>
+                          <span>原目录尚未自动覆盖</span>
+                        </div>
+                      ) : null}
+                      {chat.workspace_id && (
+                        <button className="button secondary" onClick={() => onOpenWorkspace(chat.workspace_id!)}>
+                          查看工具步骤与 Diff <span>↗</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </article>
             );
           })}
 
-          {sending && (
-            <article className="chat-message assistant pending">
-              <div className="message-avatar">F</div>
-              <div className="message-content typing-indicator">
-                <span />
-                <span />
-                <span />
-              </div>
-            </article>
+          {sending && !chat.messages.some((message) => message.metadata.streaming === true) && (
+              <article className="chat-message assistant pending">
+                <div className="message-avatar">F</div>
+                {thinkingEnabled && (mode === "auto" || mode === "chat") ? (
+                  <div className="message-content thinking-status">
+                    <span aria-hidden="true">✦</span>
+                    <span>正在深度思考…</span>
+                  </div>
+                ) : (
+                  <div className="message-content typing-indicator">
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                )}
+              </article>
+            )}
+            <div ref={endRef} />
+          </div>
+          {showScrollToBottom && (
+            <button
+              type="button"
+              className="chat-scroll-to-bottom"
+              aria-label="跳到最新消息"
+              title="跳到最新消息"
+              onClick={() => scrollToBottom("smooth")}
+            >
+              <span />
+              <span />
+              <span />
+            </button>
           )}
-          <div ref={endRef} />
         </div>
 
         <form
@@ -330,7 +485,36 @@ function ChatPanel({
             placeholder="输入问题。需要实时网页信息时，我会自动启动浏览器…"
           />
           <div className="composer-footer">
-            <span>Enter 发送 · Shift + Enter 换行</span>
+            <label className="mode-select">
+              <span>模式</span>
+              <select
+                value={mode}
+                onChange={(event) => {
+                  const nextMode = event.target.value as RequestedMode;
+                  setMode(nextMode);
+                  if (nextMode === "automation" || nextMode === "code") {
+                    setThinkingEnabled(false);
+                  }
+                }}
+              >
+                <option value="auto">自动</option>
+                <option value="chat">聊天</option>
+                <option value="automation">浏览器</option>
+                <option value="code" disabled={!chat.workspace_id}>代码</option>
+              </select>
+            </label>
+            <button
+              type="button"
+              className={`thinking-toggle${thinkingEnabled ? " active" : ""}`}
+              aria-pressed={thinkingEnabled}
+              disabled={sending || (mode !== "auto" && mode !== "chat")}
+              title="开启后模型会先进行深度思考，再输出最终回答"
+              onClick={() => setThinkingEnabled((current) => !current)}
+            >
+              <span aria-hidden="true">✦</span>
+              深度思考
+            </button>
+            <span className="composer-hint">Enter 发送 · Shift + Enter 换行</span>
             <button className="button primary" disabled={sending || !draft.trim()}>
               {sending ? "处理中…" : "发送"}
             </button>
@@ -554,17 +738,22 @@ function TaskDetail({
 export default function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [chats, setChats] = useState<ChatSummary[]>([]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [codeRuns, setCodeRuns] = useState<CodeRun[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [selected, setSelected] = useState<Task>();
   const [selectedChatId, setSelectedChatId] = useState<string>();
   const [selectedChat, setSelectedChat] = useState<Chat>();
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>();
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [actions, setActions] = useState<BrowserAction[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [showCreate, setShowCreate] = useState(false);
+  const [showWorkspaceCreate, setShowWorkspaceCreate] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [sendingChat, setSendingChat] = useState(false);
+  const sendingChatRef = useRef(false);
   const [error, setError] = useState("");
   const [theme, setTheme] = useState<Theme>(initialTheme);
 
@@ -575,19 +764,29 @@ export default function App() {
 
   const loadNavigation = useCallback(async () => {
     try {
-      const [taskRows, chatRows] = await Promise.all([api.listTasks(), api.listChats()]);
+      const [taskRows, chatRows, workspaceRows] = await Promise.all([
+        api.listTasks(),
+        api.listChats(),
+        api.listWorkspaces().catch(() => [] as Workspace[]),
+      ]);
+      const runRows = workspaceRows.length
+        ? await api.listCodeRuns().catch(() => [] as CodeRun[])
+        : [];
       setTasks(taskRows);
       setChats(chatRows);
-      if (!selectedId && !selectedChatId) {
+      setWorkspaces(workspaceRows);
+      setCodeRuns(runRows);
+      if (!selectedId && !selectedChatId && !selectedWorkspaceId) {
         if (chatRows.length > 0) setSelectedChatId(chatRows[0].chat_id);
         else if (taskRows.length > 0) setSelectedId(taskRows[0].task_id);
+        else if (workspaceRows.length > 0) setSelectedWorkspaceId(workspaceRows[0].workspace_id);
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法加载工作区");
     } finally {
       setLoading(false);
     }
-  }, [selectedChatId, selectedId]);
+  }, [selectedChatId, selectedId, selectedWorkspaceId]);
 
   const loadDetail = useCallback(async (taskId: string) => {
     const [task, eventRows, actionRows, approvalRows] = await Promise.all([
@@ -621,14 +820,17 @@ export default function App() {
   useEffect(() => {
     if (!selectedChatId) return;
     const refresh = async () => {
-      const [chat, taskRows, chatRows] = await Promise.all([
+      const [chat, taskRows, chatRows, runRows] = await Promise.all([
         api.getChat(selectedChatId),
         api.listTasks(),
         api.listChats(),
+        api.listCodeRuns().catch(() => [] as CodeRun[]),
       ]);
+      if (sendingChatRef.current) return;
       setSelectedChat(chat);
       setTasks(taskRows);
       setChats(chatRows);
+      setCodeRuns(runRows);
     };
     void refresh().catch((reason: unknown) =>
       setError(reason instanceof Error ? reason.message : "无法加载对话"),
@@ -669,26 +871,61 @@ export default function App() {
     [tasks],
   );
 
+  const selectedWorkspace = useMemo(
+    () => workspaces.find((item) => item.workspace_id === selectedWorkspaceId),
+    [selectedWorkspaceId, workspaces],
+  );
+
+  async function deleteWorkspace(workspaceId: string) {
+    if (!window.confirm("只取消注册，不会删除原文件夹。确定继续吗？")) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.deleteWorkspace(workspaceId);
+      setWorkspaces((current) => current.filter((item) => item.workspace_id !== workspaceId));
+      setSelectedWorkspaceId(undefined);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "取消工作区注册失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function selectTask(taskId: string) {
+    setSelectedWorkspaceId(undefined);
     setSelectedChatId(undefined);
     setSelectedChat(undefined);
     setSelectedId(taskId);
   }
 
   function selectChat(chatId: string) {
+    setSelectedWorkspaceId(undefined);
     setSelectedId(undefined);
     setSelected(undefined);
     setSelectedChatId(chatId);
   }
 
-  async function createChat() {
+  function selectWorkspace(workspaceId: string) {
+    setSelectedId(undefined);
+    setSelected(undefined);
+    setSelectedChatId(undefined);
+    setSelectedChat(undefined);
+    setSelectedWorkspaceId(workspaceId);
+  }
+
+  async function createChat(workspaceId?: string) {
     setBusy(true);
     setError("");
     try {
-      const chat = await api.createChat({ title: "新对话" });
+      const workspace = workspaces.find((item) => item.workspace_id === workspaceId);
+      const chat = await api.createChat({
+        title: workspace ? `${workspace.name} · 代码对话` : "新对话",
+        workspace_id: workspaceId,
+      });
       setChats((current) => [chat, ...current]);
       setSelectedId(undefined);
       setSelected(undefined);
+      setSelectedWorkspaceId(undefined);
       setSelectedChatId(chat.chat_id);
       setSelectedChat(chat);
     } catch (reason) {
@@ -698,11 +935,16 @@ export default function App() {
     }
   }
 
-  async function sendChat(content: string) {
+  async function sendChat(
+    content: string,
+    mode: RequestedMode,
+    enableThinking: boolean,
+  ) {
     if (!selectedChat) return;
     const before = selectedChat;
+    const turnId = Date.now();
     const optimistic: ChatMessage = {
-      message_id: `pending-${Date.now()}`,
+      message_id: `pending-${turnId}`,
       chat_id: selectedChat.chat_id,
       role: "user",
       content,
@@ -711,10 +953,60 @@ export default function App() {
       created_at: new Date().toISOString(),
     };
     setSelectedChat({ ...selectedChat, messages: [...selectedChat.messages, optimistic] });
+    sendingChatRef.current = true;
     setSendingChat(true);
     setError("");
     try {
-      const response = await api.sendChatMessage(selectedChat.chat_id, content);
+      let streamedContent = "";
+      let reasoningContent = "";
+      let reasoningDone = false;
+      const updateStreamingMessage = () => {
+        setSelectedChat((current) => {
+          if (!current || current.chat_id !== selectedChat.chat_id) return current;
+          const streamingId = `streaming-${turnId}`;
+          const existing = current.messages.findIndex(
+            (message) => message.message_id === streamingId,
+          );
+          const streamingMessage: ChatMessage = {
+            message_id: streamingId,
+            chat_id: selectedChat.chat_id,
+            role: "assistant",
+            content: streamedContent,
+            mode: "chat",
+            metadata: {
+              streaming: true,
+              thinking_enabled: enableThinking,
+              reasoning: reasoningContent,
+              reasoning_done: reasoningDone,
+            },
+            created_at: new Date().toISOString(),
+          };
+          if (existing < 0) {
+            return { ...current, messages: [...current.messages, streamingMessage] };
+          }
+          const messages = [...current.messages];
+          messages[existing] = streamingMessage;
+          return { ...current, messages };
+        });
+      };
+      const response = await api.streamChatMessage(
+        selectedChat.chat_id,
+        content,
+        mode,
+        true,
+        enableThinking,
+        (delta) => {
+          streamedContent += delta;
+          updateStreamingMessage();
+        },
+        (delta) => {
+          reasoningContent += delta;
+          updateStreamingMessage();
+        },
+        () => {
+          reasoningDone = true;
+        },
+      );
       setSelectedChat(response.chat);
       const summary: ChatSummary = {
         chat_id: response.chat.chat_id,
@@ -731,10 +1023,17 @@ export default function App() {
           ...current.filter((item) => item.task_id !== response.task!.task_id),
         ]);
       }
+      if (response.code_run) {
+        setCodeRuns((current) => [
+          response.code_run!,
+          ...current.filter((item) => item.code_run_id !== response.code_run!.code_run_id),
+        ]);
+      }
     } catch (reason) {
       setSelectedChat(before);
       setError(reason instanceof Error ? reason.message : "发送消息失败");
     } finally {
+      sendingChatRef.current = false;
       setSendingChat(false);
     }
   }
@@ -775,8 +1074,29 @@ export default function App() {
           <button className="new-task secondary-action" onClick={() => setShowCreate(true)}>
             <span>◎</span> 新建自动化
           </button>
+          <button className="new-task secondary-action" onClick={() => setShowWorkspaceCreate(true)}>
+            <span>⌘</span> 添加本机文件夹
+          </button>
         </div>
         <div className="sidebar-scroll">
+          <div className="nav-label">代码工作区</div>
+          <nav className="task-list">
+            {workspaces.map((workspace) => (
+              <button
+                key={workspace.workspace_id}
+                className={`task-nav ${selectedWorkspaceId === workspace.workspace_id ? "active" : ""}`}
+                onClick={() => selectWorkspace(workspace.workspace_id)}
+              >
+                <span className="chat-state-icon">⌘</span>
+                <span className="task-nav-copy">
+                  <strong>{workspace.name}</strong>
+                  <small>{workspace.repository_kind === "git" ? workspace.branch ?? "Git" : "文件夹"}</small>
+                </span>
+              </button>
+            ))}
+            {!loading && workspaces.length === 0 && <div className="no-tasks">未启用或尚未添加</div>}
+          </nav>
+
           <div className="nav-label">对话</div>
           <nav className="task-list">
             {chats.map((chat) => (
@@ -842,13 +1162,21 @@ export default function App() {
             <button onClick={() => setError("")}>×</button>
           </div>
         )}
-        {selectedChat ? (
+        {selectedWorkspace ? (
+          <CodeWorkspace
+            workspace={selectedWorkspace}
+            onCreateChat={createChat}
+            onDelete={deleteWorkspace}
+          />
+        ) : selectedChat ? (
           <ChatPanel
             chat={selectedChat}
             tasks={tasks}
+            codeRuns={codeRuns}
             sending={sendingChat}
             onSend={sendChat}
             onOpenTask={selectTask}
+            onOpenWorkspace={selectWorkspace}
           />
         ) : selected ? (
           <TaskDetail
@@ -875,6 +1203,16 @@ export default function App() {
             setSelectedId(task.task_id);
             setSelected(task);
             setShowCreate(false);
+          }}
+        />
+      )}
+      {showWorkspaceCreate && (
+        <WorkspaceModal
+          onClose={() => setShowWorkspaceCreate(false)}
+          onCreated={(workspace) => {
+            setWorkspaces((current) => [workspace, ...current]);
+            setShowWorkspaceCreate(false);
+            selectWorkspace(workspace.workspace_id);
           }}
         />
       )}

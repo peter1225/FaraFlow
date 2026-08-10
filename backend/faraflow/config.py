@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///./data/faraflow.db"
     artifact_root: Path = Path("./artifacts")
     browser_state_root: Path = Path("./browser-state")
+    code_work_root: Path = Path("./data/code-workspaces")
+
+    enable_local_workspaces: bool = False
+    workspace_allowed_roots: List[Path] = Field(default_factory=list)
 
     browser_headless: bool = True
     browser_channel: str = "chromium"
@@ -36,6 +40,23 @@ class Settings(BaseSettings):
     fara_max_tokens: int = 2048
     fara_max_screenshots: int = 3
     fara_coordinate_space: int = 1000
+
+    # Leave both URL and model empty to reuse the Fara endpoint for chat.
+    chat_base_url: str = ""
+    chat_api_key: str = ""
+    chat_model: str = ""
+    chat_timeout_seconds: float = Field(default=120.0, gt=0)
+    chat_max_tokens: int = Field(default=2048, ge=1)
+    chat_disable_thinking: bool = False
+
+    code_base_url: str = ""
+    code_api_key: str = "not-needed"
+    code_model: str = ""
+    code_timeout_seconds: float = Field(default=120.0, gt=0)
+    code_max_tokens: int = Field(default=4096, ge=1)
+    code_max_steps: int = Field(default=50, ge=1)
+    code_max_runtime_minutes: int = Field(default=20, ge=1)
+    code_max_concurrent_runs: int = Field(default=1, ge=1)
 
     default_allowed_domains: List[str] = Field(default_factory=lambda: ["bing.com"])
     allow_private_networks: bool = False
@@ -52,6 +73,23 @@ class Settings(BaseSettings):
     def prepare_directories(self) -> None:
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         self.browser_state_root.mkdir(parents=True, exist_ok=True)
+        self.code_work_root.mkdir(parents=True, exist_ok=True)
+        self.workspace_allowed_roots = [
+            path.expanduser().resolve() for path in self.workspace_allowed_roots
+        ]
+        if self.enable_local_workspaces and not self.workspace_allowed_roots:
+            raise ValueError(
+                "FARAFLOW_WORKSPACE_ALLOWED_ROOTS must not be empty when "
+                "local workspaces are enabled"
+            )
+        if self.enable_local_workspaces and self.api_host not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            raise ValueError(
+                "FARAFLOW_API_HOST must be a loopback address when local workspaces are enabled"
+            )
         if self.database_url.startswith("sqlite"):
             database_path = self.database_url.rsplit("///", 1)[-1]
             Path(database_path).parent.mkdir(parents=True, exist_ok=True)

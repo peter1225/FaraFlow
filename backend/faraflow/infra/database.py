@@ -1,7 +1,17 @@
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    event,
+)
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -19,6 +29,25 @@ class Base(DeclarativeBase):
     pass
 
 
+class WorkspaceRecord(Base):
+    __tablename__ = "ff_workspaces"
+    __table_args__ = (UniqueConstraint("tenant_id", "root_path"),)
+
+    workspace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(100), index=True)
+    user_id: Mapped[str] = mapped_column(String(100))
+    name: Mapped[str] = mapped_column(String(200))
+    root_path: Mapped[str] = mapped_column(Text)
+    repository_kind: Mapped[str] = mapped_column(String(20))
+    git_root: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    branch: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
 class ChatThreadRecord(Base):
     __tablename__ = "ff_chat_threads"
 
@@ -26,6 +55,9 @@ class ChatThreadRecord(Base):
     tenant_id: Mapped[str] = mapped_column(String(100), index=True)
     user_id: Mapped[str] = mapped_column(String(100))
     title: Mapped[str] = mapped_column(String(200))
+    workspace_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("ff_workspaces.workspace_id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True
@@ -44,6 +76,9 @@ class ChatMessageRecord(Base):
     mode: Mapped[str] = mapped_column(String(20), default="chat")
     task_id: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("ff_tasks.task_id", ondelete="SET NULL"), nullable=True
+    )
+    code_run_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("ff_code_runs.code_run_id", ondelete="SET NULL"), nullable=True
     )
     message_metadata: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -141,6 +176,55 @@ class EventRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class CodeRunRecord(Base):
+    __tablename__ = "ff_code_runs"
+
+    code_run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_workspaces.workspace_id", ondelete="CASCADE"), index=True
+    )
+    chat_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("ff_chat_threads.chat_id", ondelete="SET NULL"), nullable=True
+    )
+    session_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    instruction: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    isolation_kind: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    isolated_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    base_revision: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    baseline_manifest: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    applied_manifest: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    final_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    changed_paths: Mapped[List[str]] = mapped_column(JSON, default=list)
+    diff_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ToolCallRecord(Base):
+    __tablename__ = "ff_tool_calls"
+    __table_args__ = (UniqueConstraint("code_run_id", "step_no"),)
+
+    tool_call_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_code_runs.code_run_id", ondelete="CASCADE"), index=True
+    )
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    step_no: Mapped[int] = mapped_column(Integer)
+    tool_name: Mapped[str] = mapped_column(String(60))
+    arguments: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(30))
+    result_excerpt: Mapped[str] = mapped_column(Text, default="")
+    affected_paths: Mapped[List[str]] = mapped_column(JSON, default=list)
+    diff_summary: Mapped[List[str]] = mapped_column(JSON, default=list)
+    before_hashes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    after_hashes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    unified_diff: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class SkillRecord(Base):
     __tablename__ = "ff_skills"
     __table_args__ = (UniqueConstraint("skill_name", "version"),)
@@ -157,6 +241,14 @@ class SkillRecord(Base):
 class Database:
     def __init__(self, url: str) -> None:
         self.engine: AsyncEngine = create_async_engine(url, pool_pre_ping=True)
+        if url.startswith("sqlite"):
+
+            @event.listens_for(self.engine.sync_engine, "connect")
+            def enable_sqlite_foreign_keys(dbapi_connection: Any, _: Any) -> None:
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.close()
+
         self.session_factory = async_sessionmaker(
             bind=self.engine,
             class_=AsyncSession,

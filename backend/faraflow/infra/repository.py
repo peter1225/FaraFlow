@@ -3,21 +3,24 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import Select, desc, select
+from sqlalchemy import Select, desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from faraflow.domain.enums import ApprovalStatus, SessionState
-from faraflow.domain.schemas import ChatCreate, SkillManifest, TaskCreate
+from faraflow.domain.enums import ApprovalStatus, CodeRunStatus, SessionState
+from faraflow.domain.schemas import ChatCreate, SkillManifest, TaskCreate, WorkspaceCreate
 
 from .database import (
     ActionRecord,
     ApprovalRecord,
     ChatMessageRecord,
     ChatThreadRecord,
+    CodeRunRecord,
     EventRecord,
     SessionRecord,
     SkillRecord,
     TaskRecord,
+    ToolCallRecord,
+    WorkspaceRecord,
 )
 
 
@@ -43,11 +46,16 @@ class Repository:
 
     async def create_chat(self, request: ChatCreate) -> ChatThreadRecord:
         async with self._session_factory() as db:
+            if request.workspace_id is not None:
+                workspace = await db.get(WorkspaceRecord, request.workspace_id)
+                if workspace is None or not workspace.active:
+                    raise NotFoundError(f"workspace {request.workspace_id} not found")
             chat = ChatThreadRecord(
                 chat_id=new_id("chat"),
                 tenant_id=request.tenant_id,
                 user_id=request.user_id,
                 title=request.title,
+                workspace_id=request.workspace_id,
             )
             db.add(chat)
             await db.commit()
@@ -90,6 +98,7 @@ class Repository:
         content: str,
         mode: str = "chat",
         task_id: Optional[str] = None,
+        code_run_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ChatMessageRecord:
         async with self._session_factory() as db:
@@ -103,6 +112,7 @@ class Repository:
                 content=content,
                 mode=mode,
                 task_id=task_id,
+                code_run_id=code_run_id,
                 message_metadata=metadata or {},
             )
             chat.updated_at = now_utc()
@@ -121,6 +131,276 @@ class Repository:
                 .where(ChatMessageRecord.chat_id == chat_id)
                 .order_by(ChatMessageRecord.created_at)
                 .limit(limit)
+            )
+            return list(rows.all())
+
+    async def create_workspace(
+        self,
+        request: WorkspaceCreate,
+        *,
+        root_path: str,
+        repository_kind: str,
+        git_root: Optional[str],
+        branch: Optional[str],
+        tenant_id: str = "default",
+        user_id: str = "local-user",
+    ) -> WorkspaceRecord:
+        async with self._session_factory() as db:
+            existing = await db.scalar(
+                select(WorkspaceRecord).where(
+                    WorkspaceRecord.tenant_id == tenant_id,
+                    WorkspaceRecord.root_path == root_path,
+                )
+            )
+            if existing is not None:
+                if existing.active:
+                    raise ConflictError("workspace path is already registered")
+                existing.active = True
+                existing.name = request.name
+                existing.repository_kind = repository_kind
+                existing.git_root = git_root
+                existing.branch = branch
+                existing.updated_at = now_utc()
+                await db.commit()
+                await db.refresh(existing)
+                return existing
+            workspace = WorkspaceRecord(
+                workspace_id=new_id("ws"),
+                tenant_id=tenant_id,
+                user_id=user_id,
+                name=request.name,
+                root_path=root_path,
+                repository_kind=repository_kind,
+                git_root=git_root,
+                branch=branch,
+            )
+            db.add(workspace)
+            await db.commit()
+            await db.refresh(workspace)
+            return workspace
+
+    async def list_workspaces(
+        self, tenant_id: Optional[str] = None, limit: int = 100
+    ) -> List[WorkspaceRecord]:
+        statement = (
+            select(WorkspaceRecord)
+            .where(WorkspaceRecord.active.is_(True))
+            .order_by(desc(WorkspaceRecord.updated_at))
+            .limit(limit)
+        )
+        if tenant_id:
+            statement = statement.where(WorkspaceRecord.tenant_id == tenant_id)
+        async with self._session_factory() as db:
+            return list((await db.scalars(statement)).all())
+
+    async def get_workspace(
+        self, workspace_id: str, *, active_only: bool = True
+    ) -> WorkspaceRecord:
+        async with self._session_factory() as db:
+            workspace = await db.get(WorkspaceRecord, workspace_id)
+            if workspace is None or (active_only and not workspace.active):
+                raise NotFoundError(f"workspace {workspace_id} not found")
+            return workspace
+
+    async def deactivate_workspace(self, workspace_id: str) -> None:
+        async with self._session_factory() as db:
+            workspace = await db.get(WorkspaceRecord, workspace_id)
+            if workspace is None or not workspace.active:
+                raise NotFoundError(f"workspace {workspace_id} not found")
+            active_run = await db.scalar(
+                select(CodeRunRecord.code_run_id).where(
+                    CodeRunRecord.workspace_id == workspace_id,
+                    CodeRunRecord.status.in_(
+                        [
+                            CodeRunStatus.CREATED.value,
+                            CodeRunStatus.RUNNING.value,
+                            CodeRunStatus.REVIEW_REQUIRED.value,
+                        ]
+                    ),
+                )
+            )
+            if active_run is not None:
+                raise ConflictError(
+                    "workspace has an active code run; apply or discard it before unregistering"
+                )
+            workspace.active = False
+            workspace.updated_at = now_utc()
+            await db.execute(
+                update(ChatThreadRecord)
+                .where(ChatThreadRecord.workspace_id == workspace_id)
+                .values(workspace_id=None, updated_at=now_utc())
+            )
+            await db.commit()
+
+    async def create_code_run(
+        self,
+        *,
+        workspace_id: str,
+        instruction: str,
+        chat_id: Optional[str] = None,
+    ) -> CodeRunRecord:
+        async with self._session_factory() as db:
+            workspace = await db.get(WorkspaceRecord, workspace_id)
+            if workspace is None or not workspace.active:
+                raise NotFoundError(f"workspace {workspace_id} not found")
+            if chat_id is not None:
+                chat = await db.get(ChatThreadRecord, chat_id)
+                if chat is None:
+                    raise NotFoundError(f"chat {chat_id} not found")
+                if chat.workspace_id != workspace_id:
+                    raise ConflictError("chat is not bound to this workspace")
+            record = CodeRunRecord(
+                code_run_id=new_id("code"),
+                workspace_id=workspace_id,
+                chat_id=chat_id,
+                session_id=new_id("sess"),
+                instruction=instruction,
+                status=CodeRunStatus.CREATED.value,
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def get_code_run(self, code_run_id: str) -> CodeRunRecord:
+        async with self._session_factory() as db:
+            record = await db.get(CodeRunRecord, code_run_id)
+            if record is None:
+                raise NotFoundError(f"code run {code_run_id} not found")
+            return record
+
+    async def get_code_run_by_session(self, session_id: str) -> CodeRunRecord:
+        async with self._session_factory() as db:
+            record = await db.scalar(
+                select(CodeRunRecord).where(CodeRunRecord.session_id == session_id)
+            )
+            if record is None:
+                raise NotFoundError(f"code run session {session_id} not found")
+            return record
+
+    async def list_code_runs(
+        self, workspace_id: Optional[str] = None, limit: int = 100
+    ) -> List[CodeRunRecord]:
+        statement = select(CodeRunRecord).order_by(desc(CodeRunRecord.created_at)).limit(limit)
+        if workspace_id:
+            statement = statement.where(CodeRunRecord.workspace_id == workspace_id)
+        async with self._session_factory() as db:
+            return list((await db.scalars(statement)).all())
+
+    async def update_code_run(
+        self,
+        code_run_id: str,
+        *,
+        status: Optional[CodeRunStatus] = None,
+        isolation_kind: Optional[str] = None,
+        isolated_path: Optional[str] = None,
+        base_revision: Optional[str] = None,
+        baseline_manifest: Optional[Dict[str, Any]] = None,
+        applied_manifest: Optional[Dict[str, Any]] = None,
+        final_summary: Optional[str] = None,
+        changed_paths: Optional[List[str]] = None,
+        diff_ref: Optional[str] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> CodeRunRecord:
+        async with self._session_factory() as db:
+            record = await db.get(CodeRunRecord, code_run_id)
+            if record is None:
+                raise NotFoundError(f"code run {code_run_id} not found")
+            if status is not None:
+                record.status = status.value
+                if status == CodeRunStatus.RUNNING and record.started_at is None:
+                    record.started_at = now_utc()
+                if status in {
+                    CodeRunStatus.APPLIED,
+                    CodeRunStatus.DISCARDED,
+                    CodeRunStatus.REVERTED,
+                    CodeRunStatus.FAILED,
+                    CodeRunStatus.INTERRUPTED,
+                }:
+                    record.finished_at = now_utc()
+            if isolation_kind is not None:
+                record.isolation_kind = isolation_kind
+            if isolated_path is not None:
+                record.isolated_path = isolated_path
+            if base_revision is not None:
+                record.base_revision = base_revision
+            if baseline_manifest is not None:
+                record.baseline_manifest = baseline_manifest
+            if applied_manifest is not None:
+                record.applied_manifest = applied_manifest
+            if final_summary is not None:
+                record.final_summary = final_summary
+            if changed_paths is not None:
+                record.changed_paths = changed_paths
+            if diff_ref is not None:
+                record.diff_ref = diff_ref
+            if error is not None:
+                record.error = error
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def interrupt_running_code_runs(self) -> int:
+        async with self._session_factory() as db:
+            rows = list(
+                (
+                    await db.scalars(
+                        select(CodeRunRecord).where(
+                            CodeRunRecord.status == CodeRunStatus.RUNNING.value
+                        )
+                    )
+                ).all()
+            )
+            for record in rows:
+                record.status = CodeRunStatus.INTERRUPTED.value
+                record.finished_at = now_utc()
+                record.error = {"reason": "server_restarted"}
+            await db.commit()
+            return len(rows)
+
+    async def append_tool_call(
+        self,
+        *,
+        code_run_id: str,
+        session_id: str,
+        step_no: int,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        status: str,
+        result_excerpt: str,
+        affected_paths: List[str],
+        diff_summary: List[str],
+        before_hashes: Dict[str, Optional[str]],
+        after_hashes: Dict[str, Optional[str]],
+        unified_diff: str,
+    ) -> ToolCallRecord:
+        async with self._session_factory() as db:
+            record = ToolCallRecord(
+                tool_call_id=new_id("tool"),
+                code_run_id=code_run_id,
+                session_id=session_id,
+                step_no=step_no,
+                tool_name=tool_name,
+                arguments=arguments,
+                status=status,
+                result_excerpt=result_excerpt,
+                affected_paths=affected_paths,
+                diff_summary=diff_summary,
+                before_hashes=before_hashes,
+                after_hashes=after_hashes,
+                unified_diff=unified_diff,
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def list_tool_calls(self, code_run_id: str) -> List[ToolCallRecord]:
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(ToolCallRecord)
+                .where(ToolCallRecord.code_run_id == code_run_id)
+                .order_by(ToolCallRecord.step_no)
             )
             return list(rows.all())
 
@@ -160,7 +440,12 @@ class Repository:
                     "last_observation": "",
                 },
             )
-            db.add_all([task, session])
+            # There is intentionally no ORM relationship between these records.
+            # Flush the parent explicitly so SQLite foreign-key enforcement does
+            # not depend on unit-of-work mapper ordering.
+            db.add(task)
+            await db.flush()
+            db.add(session)
             await db.commit()
             await db.refresh(task)
             await db.refresh(session)

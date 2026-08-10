@@ -2,45 +2,34 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional, cast
+from typing import Any, AsyncIterator, Dict, Optional
 
 import uvicorn
-from fastapi import (
-    FastAPI,
-    HTTPException,
-    Query,
-    Request,
-    WebSocket,
-    WebSocketDisconnect,
-    status,
-)
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, ORJSONResponse
 
 from faraflow.browser.playwright_runner import BrowserPool
+from faraflow.code import CodeAdapter, CodeRunService, CodeRuntime
 from faraflow.config import Settings, get_settings
-from faraflow.domain.schemas import (
-    ApprovalDecision,
-    ApprovalView,
-    ChatCreate,
-    ChatMessageCreate,
-    ChatReply,
-    ChatSummary,
-    ChatView,
-    SessionEvent,
-    SkillManifest,
-    TaskCreate,
-    TaskView,
-    UserResponse,
-)
+from faraflow.domain.schemas import SessionEvent
 from faraflow.infra.artifacts import ArtifactStore
-from faraflow.infra.database import ActionRecord, Database
+from faraflow.infra.database import Database
 from faraflow.infra.events import EventBus
 from faraflow.infra.repository import ConflictError, NotFoundError, Repository
+from faraflow.model.chat_adapter import ChatAdapter
 from faraflow.model.fara_adapter import FaraAdapter
 from faraflow.runtime.agent_runtime import AgentRuntime
 from faraflow.runtime.chat_service import ChatService
 from faraflow.runtime.task_service import TaskService
+from faraflow.workspace import CodeRunStore, WorkspaceService
+
+from . import chats, code_runs, tasks, workspaces
+from .dependencies import (
+    get_container,
+    is_loopback_host,
+    require_local_workspace_request,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +43,13 @@ class Container:
     event_bus: EventBus
     browser_pool: BrowserPool
     fara: FaraAdapter
+    chat_model: ChatAdapter
     runtime: AgentRuntime
     tasks: TaskService
+    code_adapter: CodeAdapter
+    code_runtime: CodeRuntime
+    code_runs: CodeRunService
+    workspaces: WorkspaceService
     chat: ChatService
 
 
@@ -66,9 +60,24 @@ def build_container(settings: Settings) -> Container:
     event_bus = EventBus()
     browser_pool = BrowserPool(settings, artifacts)
     fara = FaraAdapter(settings)
+    chat_model = ChatAdapter(settings)
     runtime = AgentRuntime(repository, browser_pool, fara, event_bus)
-    tasks = TaskService(repository, runtime)
-    chat = ChatService(repository, fara, tasks)
+    task_service = TaskService(repository, runtime)
+    code_adapter = CodeAdapter(settings)
+    code_run_store = CodeRunStore(artifacts.root)
+    workspace_service = WorkspaceService(settings, repository, code_run_store)
+    code_runtime = CodeRuntime(
+        settings,
+        repository,
+        workspace_service,
+        code_run_store,
+        code_adapter,
+        event_bus,
+    )
+    code_run_service = CodeRunService(
+        repository, workspace_service, code_run_store, code_runtime
+    )
+    chat_service = ChatService(repository, chat_model, task_service, code_run_service)
     return Container(
         settings=settings,
         database=database,
@@ -77,38 +86,44 @@ def build_container(settings: Settings) -> Container:
         event_bus=event_bus,
         browser_pool=browser_pool,
         fara=fara,
+        chat_model=chat_model,
         runtime=runtime,
-        tasks=tasks,
-        chat=chat,
+        tasks=task_service,
+        code_adapter=code_adapter,
+        code_runtime=code_runtime,
+        code_runs=code_run_service,
+        workspaces=workspace_service,
+        chat=chat_service,
     )
-
-
-def get_container(request: Request) -> Container:
-    return cast(Container, request.app.state.container)
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     active_settings = settings or get_settings()
+    active_settings.prepare_directories()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         container = build_container(active_settings)
         app.state.container = container
         await container.database.create_schema()
+        await container.repository.interrupt_running_code_runs()
         await container.tasks.seed_skills()
         logger.info("FaraFlow API started")
         try:
             yield
         finally:
             await container.runtime.close()
+            await container.code_runtime.close()
             await container.browser_pool.close()
+            await container.chat_model.close()
             await container.fara.close()
+            await container.code_adapter.close()
             await container.database.dispose()
 
     app = FastAPI(
         title="FaraFlow API",
         version="0.1.0",
-        description="Enterprise browser automation platform powered by Microsoft Fara1.5",
+        description="Controlled chat, browser automation, and local coding workspace platform",
         default_response_class=ORJSONResponse,
         lifespan=lifespan,
     )
@@ -128,6 +143,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def conflict_handler(_: Request, exc: ConflictError) -> ORJSONResponse:
         return ORJSONResponse(status_code=409, content={"detail": str(exc)})
 
+    @app.exception_handler(PermissionError)
+    async def permission_handler(_: Request, exc: PermissionError) -> ORJSONResponse:
+        return ORJSONResponse(status_code=403, content={"detail": str(exc)})
+
+    @app.exception_handler(ValueError)
+    async def value_handler(_: Request, exc: ValueError) -> ORJSONResponse:
+        return ORJSONResponse(status_code=422, content={"detail": str(exc)})
+
+    app.include_router(chats.router)
+    app.include_router(tasks.router)
+    app.include_router(workspaces.router)
+    app.include_router(code_runs.router)
+
     @app.get("/health/live", tags=["health"])
     async def health_live() -> Dict[str, str]:
         return {"status": "ok"}
@@ -135,138 +163,44 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/health/ready", tags=["health"])
     async def health_ready(request: Request) -> Dict[str, Any]:
         container = get_container(request)
-        model = await container.fara.health()
+        model, chat_model, coding_model = await asyncio.gather(
+            container.fara.health(),
+            container.chat_model.health(),
+            container.code_adapter.health(),
+        )
+        code_ready = (
+            not container.settings.enable_local_workspaces
+            or coding_model["status"] == "ok"
+        )
+        chat_ready = chat_model["status"] == "ok"
         return {
-            "status": "ok" if model["status"] == "ok" else "degraded",
+            "status": (
+                "ok"
+                if model["status"] == "ok" and chat_ready and code_ready
+                else "degraded"
+            ),
             "database": "ok",
             "model_endpoint": model,
+            "chat_model_endpoint": chat_model,
+            "coding_model_endpoint": coding_model,
+            "local_workspaces": {
+                "enabled": container.settings.enable_local_workspaces,
+                "allowed_roots": [
+                    str(path) for path in container.settings.workspace_allowed_roots
+                ],
+            },
         }
-
-    @app.post(
-        "/v1/chats",
-        response_model=ChatView,
-        status_code=status.HTTP_201_CREATED,
-        tags=["chat"],
-    )
-    async def create_chat(payload: ChatCreate, request: Request) -> ChatView:
-        return await get_container(request).chat.create(payload)
-
-    @app.get("/v1/chats", response_model=List[ChatSummary], tags=["chat"])
-    async def list_chats(
-        request: Request,
-        tenant_id: Optional[str] = Query(default=None),
-    ) -> List[ChatSummary]:
-        return await get_container(request).chat.list(tenant_id)
-
-    @app.get("/v1/chats/{chat_id}", response_model=ChatView, tags=["chat"])
-    async def get_chat(chat_id: str, request: Request) -> ChatView:
-        return await get_container(request).chat.get(chat_id)
-
-    @app.post("/v1/chats/{chat_id}/messages", response_model=ChatReply, tags=["chat"])
-    async def send_chat_message(
-        chat_id: str,
-        payload: ChatMessageCreate,
-        request: Request,
-    ) -> ChatReply:
-        return await get_container(request).chat.respond(chat_id, payload)
-
-    @app.post(
-        "/v1/tasks",
-        response_model=TaskView,
-        status_code=status.HTTP_201_CREATED,
-        tags=["tasks"],
-    )
-    async def create_task(payload: TaskCreate, request: Request) -> TaskView:
-        return await get_container(request).tasks.create(payload)
-
-    @app.get("/v1/tasks", response_model=List[TaskView], tags=["tasks"])
-    async def list_tasks(
-        request: Request,
-        tenant_id: Optional[str] = Query(default=None),
-    ) -> List[TaskView]:
-        return await get_container(request).tasks.list(tenant_id)
-
-    @app.get("/v1/tasks/{task_id}", response_model=TaskView, tags=["tasks"])
-    async def get_task(task_id: str, request: Request) -> TaskView:
-        return await get_container(request).tasks.get(task_id)
-
-    @app.post("/v1/tasks/{task_id}/start", response_model=TaskView, tags=["tasks"])
-    async def start_task(task_id: str, request: Request) -> TaskView:
-        return await get_container(request).tasks.start(task_id)
-
-    @app.post("/v1/tasks/{task_id}/pause", response_model=TaskView, tags=["tasks"])
-    async def pause_task(task_id: str, request: Request) -> TaskView:
-        return await get_container(request).tasks.pause(task_id)
-
-    @app.post("/v1/tasks/{task_id}/terminate", response_model=TaskView, tags=["tasks"])
-    async def terminate_task(task_id: str, request: Request) -> TaskView:
-        return await get_container(request).tasks.terminate(task_id)
-
-    @app.post("/v1/tasks/{task_id}/respond", response_model=TaskView, tags=["tasks"])
-    async def respond_to_task(task_id: str, payload: UserResponse, request: Request) -> TaskView:
-        return await get_container(request).tasks.respond(task_id, payload)
-
-    @app.get(
-        "/v1/tasks/{task_id}/events",
-        response_model=List[SessionEvent],
-        tags=["events"],
-    )
-    async def list_task_events(task_id: str, request: Request) -> List[SessionEvent]:
-        return await get_container(request).tasks.events(task_id)
-
-    @app.get(
-        "/v1/tasks/{task_id}/actions",
-        response_model=List[Dict[str, Any]],
-        tags=["events"],
-    )
-    async def list_task_actions(task_id: str, request: Request) -> List[Dict[str, Any]]:
-        container = get_container(request)
-        task = await container.repository.get_task(task_id)
-        records = await container.repository.list_actions(task.session_id)
-        return [serialize_action(item) for item in records]
-
-    @app.get(
-        "/v1/tasks/{task_id}/approvals",
-        response_model=List[ApprovalView],
-        tags=["approvals"],
-    )
-    async def list_task_approvals(task_id: str, request: Request) -> List[ApprovalView]:
-        return await get_container(request).tasks.approvals(task_id)
-
-    @app.post(
-        "/v1/tasks/{task_id}/approvals/{approval_id}",
-        response_model=ApprovalView,
-        tags=["approvals"],
-    )
-    async def decide_task_approval(
-        task_id: str,
-        approval_id: str,
-        payload: ApprovalDecision,
-        request: Request,
-    ) -> ApprovalView:
-        return await get_container(request).tasks.decide_approval(task_id, approval_id, payload)
-
-    @app.get("/v1/skills", response_model=List[SkillManifest], tags=["skills"])
-    async def list_skills(
-        request: Request,
-        category: Optional[str] = Query(default=None),
-        enabled: Optional[bool] = Query(default=True),
-    ) -> List[SkillManifest]:
-        return await get_container(request).tasks.skills(category, enabled)
-
-    @app.post(
-        "/v1/skills",
-        response_model=SkillManifest,
-        status_code=status.HTTP_201_CREATED,
-        tags=["skills"],
-    )
-    async def register_skill(payload: SkillManifest, request: Request) -> SkillManifest:
-        return await get_container(request).tasks.register_skill(payload)
 
     @app.get("/v1/artifacts/{artifact_path:path}", tags=["artifacts"])
     async def get_artifact(artifact_path: str, request: Request) -> FileResponse:
+        normalized = artifact_path.replace("\\", "/").strip("/")
+        if normalized.startswith("code-runs/"):
+            parts = normalized.split("/")
+            if len(parts) != 3 or parts[-1] != "diff.patch":
+                raise HTTPException(status_code=404, detail="artifact not found")
+            require_local_workspace_request(request, get_container(request).settings)
         try:
-            path = get_container(request).artifacts.resolve_public_path(artifact_path)
+            path = get_container(request).artifacts.resolve_public_path(normalized)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not path.is_file():
@@ -275,16 +209,29 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             ".png": "image/png",
             ".zip": "application/zip",
             ".json": "application/json",
+            ".patch": "text/plain; charset=utf-8",
         }.get(path.suffix.lower(), "application/octet-stream")
         return FileResponse(path, media_type=media_type, filename=path.name)
 
     @app.websocket("/v1/sessions/{session_id}/events")
     async def session_events(websocket: WebSocket, session_id: str) -> None:
         container: Container = websocket.app.state.container
+        is_code_session = False
         try:
             await container.repository.get_session(session_id)
         except NotFoundError:
-            await websocket.close(code=4404, reason="session not found")
+            try:
+                await container.repository.get_code_run_by_session(session_id)
+                is_code_session = True
+            except NotFoundError:
+                await websocket.close(code=4404, reason="session not found")
+                return
+        host = websocket.client.host if websocket.client else ""
+        if is_code_session and not (
+            is_loopback_host(host)
+            or (container.settings.environment == "test" and host == "testclient")
+        ):
+            await websocket.close(code=4403, reason="code events require loopback access")
             return
         await websocket.accept()
         existing = await container.repository.list_events(session_id)
@@ -310,24 +257,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             await container.event_bus.unsubscribe(session_id, queue)
 
     return app
-
-
-def serialize_action(record: ActionRecord) -> Dict[str, Any]:
-    return {
-        "action_id": record.action_id,
-        "task_id": record.task_id,
-        "session_id": record.session_id,
-        "step_no": record.step_no,
-        "action_type": record.action_type,
-        "action_parameters": record.action_parameters,
-        "page_url": record.page_url,
-        "executor_type": record.executor_type,
-        "screenshot_before": record.screenshot_before,
-        "screenshot_after": record.screenshot_after,
-        "execution_result": record.execution_result,
-        "verification_result": record.verification_result,
-        "created_at": record.created_at,
-    }
 
 
 app = create_app()

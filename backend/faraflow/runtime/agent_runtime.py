@@ -38,7 +38,7 @@ class AgentRuntime:
         self.event_bus = event_bus
         self.critical_policy = CriticalActionPolicy()
         self.injection_guard = PromptInjectionGuard()
-        self._jobs: Dict[str, asyncio.Task[None]] = {}
+        self._jobs: Dict[str, asyncio.Task] = {}
         self._conversations: Dict[str, List[Dict[str, Any]]] = {}
         self._pause_requests: Set[str] = set()
         self._job_lock = asyncio.Lock()

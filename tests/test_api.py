@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -81,7 +82,7 @@ def test_chat_routes_between_direct_answer_and_browser_task(tmp_path: Path) -> N
     )
     app = create_app(settings)
     with TestClient(app) as client:
-        app.state.container.fara.complete_chat = AsyncMock(
+        app.state.container.chat_model.complete_chat = AsyncMock(
             side_effect=[
                 '{"mode":"chat","reply":"FaraFlow 是一个受控浏览器自动化平台。"}',
                 (
@@ -131,7 +132,7 @@ def test_chat_returns_actionable_message_when_model_is_unavailable(tmp_path: Pat
     )
     app = create_app(settings)
     with TestClient(app) as client:
-        app.state.container.fara.complete_chat = AsyncMock(
+        app.state.container.chat_model.complete_chat = AsyncMock(
             side_effect=ModelEndpointError("connection failed")
         )
         created = client.post("/v1/chats", json={"title": "新对话"})
@@ -149,3 +150,66 @@ def test_chat_returns_actionable_message_when_model_is_unavailable(tmp_path: Pat
         assert body["chat"]["messages"][-1]["metadata"] == {
             "error": "model_unavailable"
         }
+
+
+def test_chat_streams_deltas_and_persists_the_final_answer(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path.as_posix()}/test.db",
+        artifact_root=tmp_path / "artifacts",
+        browser_state_root=tmp_path / "browser-state",
+    )
+    app = create_app(settings)
+
+    streamed_arguments = {}
+
+    async def stream_chat_events(*args, **kwargs):
+        del args
+        streamed_arguments.update(kwargs)
+        yield {"type": "reasoning_delta", "content": "先分析"}
+        yield {"type": "reasoning_done", "content": ""}
+        yield {"type": "content_delta", "content": "流式"}
+        yield {"type": "content_delta", "content": "回答"}
+
+    with TestClient(app) as client:
+        app.state.container.chat_model.complete_chat = AsyncMock(
+            return_value='{"mode":"chat","reply":"ignored in favor of streaming"}'
+        )
+        app.state.container.chat_model.stream_chat_events = stream_chat_events
+        created = client.post("/v1/chats", json={"title": "新对话"})
+        chat_id = created.json()["chat_id"]
+
+        with client.stream(
+            "POST",
+            f"/v1/chats/{chat_id}/messages/stream",
+            json={
+                "content": "测试流式输出",
+                "requested_mode": "auto",
+                "enable_thinking": True,
+            },
+        ) as response:
+            assert response.status_code == 200, response.text
+            events = [json.loads(line) for line in response.iter_lines() if line]
+
+        assert events[0] == {"type": "route", "route": "chat"}
+        assert [
+            event["content"]
+            for event in events
+            if event["type"] == "reasoning_delta"
+        ] == ["先分析"]
+        assert any(event["type"] == "reasoning_done" for event in events)
+        assert [event["content"] for event in events if event["type"] == "delta"] == [
+            "流式",
+            "回答",
+        ]
+        done = events[-1]
+        assert done["type"] == "done"
+        assert done["reply"]["route"] == "chat"
+        final_message = done["reply"]["chat"]["messages"][-1]
+        assert final_message["content"] == "流式回答"
+        assert final_message["metadata"] == {
+            "streamed": True,
+            "thinking_enabled": True,
+            "reasoning": "先分析",
+        }
+        assert streamed_arguments["enable_thinking"] is True

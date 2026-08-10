@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .enums import ApprovalStatus, RiskLevel, SessionState
+from .enums import ApprovalStatus, CodeRunStatus, RiskLevel, SessionState
 
 
 class ApprovalPolicy(BaseModel):
@@ -50,11 +50,98 @@ class ChatCreate(BaseModel):
     tenant_id: str = Field(default="default", min_length=1, max_length=100)
     user_id: str = Field(default="local-user", min_length=1, max_length=100)
     title: str = Field(default="新对话", min_length=1, max_length=200)
+    workspace_id: Optional[str] = None
 
 
 class ChatMessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=10_000)
     auto_start: bool = True
+    requested_mode: Literal["auto", "chat", "automation", "code"] = "auto"
+    enable_thinking: bool = False
+
+
+class WorkspaceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    root_path: str = Field(min_length=1, max_length=2000)
+
+
+class WorkspaceDirectorySelection(BaseModel):
+    path: Optional[str] = None
+    name: Optional[str] = None
+
+
+class WorkspaceView(BaseModel):
+    workspace_id: str
+    name: str
+    root_path: str
+    repository_kind: Literal["git", "directory"]
+    git_root: Optional[str] = None
+    branch: Optional[str] = None
+    is_dirty: bool = False
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkspaceTreeEntry(BaseModel):
+    path: str
+    name: str
+    kind: Literal["file", "directory"]
+    size: Optional[int] = None
+
+
+class WorkspaceFileView(BaseModel):
+    path: str
+    content: str
+    start_line: int
+    end_line: int
+    total_lines: int
+
+
+class CodeRunCreate(BaseModel):
+    workspace_id: str
+    instruction: str = Field(min_length=1, max_length=10_000)
+    chat_id: Optional[str] = None
+    auto_start: bool = True
+
+
+class ToolCallView(BaseModel):
+    tool_call_id: str
+    step_no: int
+    tool_name: str
+    status: str
+    affected_paths: List[str] = Field(default_factory=list)
+    diff_summary: List[str] = Field(default_factory=list)
+    before_hashes: Dict[str, Optional[str]] = Field(default_factory=dict)
+    after_hashes: Dict[str, Optional[str]] = Field(default_factory=dict)
+    unified_diff: str = ""
+    result_excerpt: str = ""
+    created_at: datetime
+
+
+class CodeRunView(BaseModel):
+    code_run_id: str
+    workspace_id: str
+    chat_id: Optional[str] = None
+    session_id: str
+    instruction: str
+    status: CodeRunStatus
+    isolation_kind: Optional[Literal["worktree", "snapshot"]] = None
+    base_revision: Optional[str] = None
+    final_summary: Optional[str] = None
+    changed_paths: List[str] = Field(default_factory=list)
+    diff_ref: Optional[str] = None
+    error: Optional[Dict[str, Any]] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    tool_calls: List[ToolCallView] = Field(default_factory=list)
+
+
+class CodeDiffView(BaseModel):
+    code_run_id: str
+    status: CodeRunStatus
+    changed_paths: List[str] = Field(default_factory=list)
+    diff: str = ""
 
 
 class PlanStep(BaseModel):
@@ -105,8 +192,9 @@ class ChatMessageView(BaseModel):
     chat_id: str
     role: Literal["user", "assistant"]
     content: str
-    mode: Literal["chat", "automation"] = "chat"
+    mode: Literal["chat", "automation", "code"] = "chat"
     task_id: Optional[str] = None
+    code_run_id: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
@@ -116,6 +204,7 @@ class ChatSummary(BaseModel):
     tenant_id: str
     user_id: str
     title: str
+    workspace_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -125,9 +214,10 @@ class ChatView(ChatSummary):
 
 
 class ChatReply(BaseModel):
-    route: Literal["chat", "automation"]
+    route: Literal["chat", "automation", "code"]
     chat: ChatView
     task: Optional[TaskView] = None
+    code_run: Optional[CodeRunView] = None
 
 
 class SessionEvent(BaseModel):
