@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .enums import ApprovalStatus, CodeRunStatus, RiskLevel, SessionState
+from .enums import ApprovalStatus, CodeRunStatus, DesktopRunStatus, RiskLevel, SessionState
 
 
 class ApprovalPolicy(BaseModel):
@@ -56,7 +56,7 @@ class ChatCreate(BaseModel):
 class ChatMessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=10_000)
     auto_start: bool = True
-    requested_mode: Literal["auto", "chat", "automation", "code"] = "auto"
+    requested_mode: Literal["auto", "chat", "automation", "code", "desktop"] = "auto"
     enable_thinking: bool = False
 
 
@@ -144,6 +144,76 @@ class CodeDiffView(BaseModel):
     diff: str = ""
 
 
+class DesktopRunCreate(BaseModel):
+    instruction: str = Field(min_length=1, max_length=10_000)
+    chat_id: Optional[str] = None
+    auto_start: bool = True
+    target_window_id: Optional[int] = Field(default=None, ge=1)
+
+
+class DesktopActionView(BaseModel):
+    action_id: str
+    step_no: int
+    action_name: str
+    status: str
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    screenshot_before: Optional[str] = None
+    screenshot_after: Optional[str] = None
+    execution_result: Dict[str, Any] = Field(default_factory=dict)
+    approval_required: bool = False
+    created_at: datetime
+
+
+class DesktopRunView(BaseModel):
+    desktop_run_id: str
+    chat_id: Optional[str] = None
+    session_id: str
+    instruction: str
+    status: DesktopRunStatus
+    target_window_id: Optional[int] = None
+    target_title: Optional[str] = None
+    target_process: Optional[str] = None
+    final_summary: Optional[str] = None
+    last_screenshot_ref: Optional[str] = None
+    error: Optional[Dict[str, Any]] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    actions: List[DesktopActionView] = Field(default_factory=list)
+
+
+class DesktopWindowView(BaseModel):
+    window_id: int
+    title: str
+    process_name: str = ""
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+class DesktopWindowSelection(BaseModel):
+    window_id: int = Field(ge=1)
+
+
+class DesktopApprovalView(BaseModel):
+    approval_id: str
+    desktop_run_id: str
+    session_id: str
+    action_summary: str
+    risk_description: str
+    status: ApprovalStatus
+    pending_payload: Dict[str, Any] = Field(default_factory=dict)
+    requested_at: datetime
+    decided_at: Optional[datetime] = None
+    comment: Optional[str] = None
+
+
+class DesktopApprovalDecision(BaseModel):
+    decision: Literal["approve", "reject"]
+    comment: Optional[str] = Field(default=None, max_length=1000)
+
+
 class PlanStep(BaseModel):
     step_id: str
     order: int
@@ -192,9 +262,10 @@ class ChatMessageView(BaseModel):
     chat_id: str
     role: Literal["user", "assistant"]
     content: str
-    mode: Literal["chat", "automation", "code"] = "chat"
+    mode: Literal["chat", "automation", "code", "desktop"] = "chat"
     task_id: Optional[str] = None
     code_run_id: Optional[str] = None
+    desktop_run_id: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
 
@@ -214,10 +285,11 @@ class ChatView(ChatSummary):
 
 
 class ChatReply(BaseModel):
-    route: Literal["chat", "automation", "code"]
+    route: Literal["chat", "automation", "code", "desktop"]
     chat: ChatView
     task: Optional[TaskView] = None
     code_run: Optional[CodeRunView] = None
+    desktop_run: Optional[DesktopRunView] = None
 
 
 class SessionEvent(BaseModel):

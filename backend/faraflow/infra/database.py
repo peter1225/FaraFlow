@@ -80,6 +80,9 @@ class ChatMessageRecord(Base):
     code_run_id: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("ff_code_runs.code_run_id", ondelete="SET NULL"), nullable=True
     )
+    desktop_run_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("ff_desktop_runs.desktop_run_id", ondelete="SET NULL"), nullable=True
+    )
     message_metadata: Mapped[Dict[str, Any]] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -223,6 +226,65 @@ class ToolCallRecord(Base):
     after_hashes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     unified_diff: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DesktopRunRecord(Base):
+    __tablename__ = "ff_desktop_runs"
+
+    desktop_run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    chat_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("ff_chat_threads.chat_id", ondelete="SET NULL"), nullable=True
+    )
+    session_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    instruction: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    target_window_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    target_title: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    target_process: Mapped[Optional[str]] = mapped_column(String(260), nullable=True)
+    target_rect: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    pending_action: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    final_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_screenshot_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DesktopActionRecord(Base):
+    __tablename__ = "ff_desktop_actions"
+
+    action_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    desktop_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_desktop_runs.desktop_run_id", ondelete="CASCADE"), index=True
+    )
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    step_no: Mapped[int] = mapped_column(Integer)
+    action_name: Mapped[str] = mapped_column(String(60))
+    arguments: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(30))
+    screenshot_before: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    screenshot_after: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    execution_result: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    approval_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class DesktopApprovalRecord(Base):
+    __tablename__ = "ff_desktop_approvals"
+
+    approval_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    desktop_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_desktop_runs.desktop_run_id", ondelete="CASCADE"), index=True
+    )
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    action_summary: Mapped[str] = mapped_column(Text)
+    risk_description: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), index=True)
+    pending_payload: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class SkillRecord(Base):

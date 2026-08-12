@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy import Select, desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from faraflow.domain.enums import ApprovalStatus, CodeRunStatus, SessionState
+from faraflow.domain.enums import ApprovalStatus, CodeRunStatus, DesktopRunStatus, SessionState
 from faraflow.domain.schemas import ChatCreate, SkillManifest, TaskCreate, WorkspaceCreate
 
 from .database import (
@@ -15,6 +15,9 @@ from .database import (
     ChatMessageRecord,
     ChatThreadRecord,
     CodeRunRecord,
+    DesktopActionRecord,
+    DesktopApprovalRecord,
+    DesktopRunRecord,
     EventRecord,
     SessionRecord,
     SkillRecord,
@@ -99,6 +102,7 @@ class Repository:
         mode: str = "chat",
         task_id: Optional[str] = None,
         code_run_id: Optional[str] = None,
+        desktop_run_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> ChatMessageRecord:
         async with self._session_factory() as db:
@@ -113,6 +117,7 @@ class Repository:
                 mode=mode,
                 task_id=task_id,
                 code_run_id=code_run_id,
+                desktop_run_id=desktop_run_id,
                 message_metadata=metadata or {},
             )
             chat.updated_at = now_utc()
@@ -403,6 +408,259 @@ class Repository:
                 .order_by(ToolCallRecord.step_no)
             )
             return list(rows.all())
+
+    async def create_desktop_run(
+        self,
+        *,
+        instruction: str,
+        chat_id: Optional[str] = None,
+        target_window_id: Optional[int] = None,
+    ) -> DesktopRunRecord:
+        async with self._session_factory() as db:
+            if chat_id is not None:
+                chat = await db.get(ChatThreadRecord, chat_id)
+                if chat is None:
+                    raise NotFoundError(f"chat {chat_id} not found")
+            record = DesktopRunRecord(
+                desktop_run_id=new_id("desktop"),
+                chat_id=chat_id,
+                session_id=new_id("sess"),
+                instruction=instruction,
+                status=DesktopRunStatus.CREATED.value,
+                target_window_id=target_window_id,
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def get_desktop_run(self, desktop_run_id: str) -> DesktopRunRecord:
+        async with self._session_factory() as db:
+            record = await db.get(DesktopRunRecord, desktop_run_id)
+            if record is None:
+                raise NotFoundError(f"desktop run {desktop_run_id} not found")
+            return record
+
+    async def get_desktop_run_by_session(self, session_id: str) -> DesktopRunRecord:
+        async with self._session_factory() as db:
+            record = await db.scalar(
+                select(DesktopRunRecord).where(DesktopRunRecord.session_id == session_id)
+            )
+            if record is None:
+                raise NotFoundError(f"desktop run session {session_id} not found")
+            return record
+
+    async def list_desktop_runs(
+        self, chat_id: Optional[str] = None, limit: int = 100
+    ) -> List[DesktopRunRecord]:
+        statement = (
+            select(DesktopRunRecord)
+            .order_by(desc(DesktopRunRecord.created_at))
+            .limit(limit)
+        )
+        if chat_id:
+            statement = statement.where(DesktopRunRecord.chat_id == chat_id)
+        async with self._session_factory() as db:
+            return list((await db.scalars(statement)).all())
+
+    async def update_desktop_run(
+        self,
+        desktop_run_id: str,
+        *,
+        status: Optional[DesktopRunStatus] = None,
+        target_window_id: Optional[int] = None,
+        target_title: Optional[str] = None,
+        target_process: Optional[str] = None,
+        target_rect: Optional[Dict[str, Any]] = None,
+        pending_action: Optional[Dict[str, Any]] = None,
+        final_summary: Optional[str] = None,
+        last_screenshot_ref: Optional[str] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> DesktopRunRecord:
+        async with self._session_factory() as db:
+            record = await db.get(DesktopRunRecord, desktop_run_id)
+            if record is None:
+                raise NotFoundError(f"desktop run {desktop_run_id} not found")
+            if status is not None:
+                record.status = status.value
+                if status == DesktopRunStatus.RUNNING:
+                    record.started_at = now_utc()
+                    record.finished_at = None
+                    record.error = None
+                    record.pending_action = None
+                    record.final_summary = None
+                if status in {
+                    DesktopRunStatus.COMPLETED,
+                    DesktopRunStatus.FAILED,
+                    DesktopRunStatus.TERMINATED,
+                    DesktopRunStatus.INTERRUPTED,
+                }:
+                    record.finished_at = now_utc()
+            if target_window_id is not None:
+                record.target_window_id = target_window_id
+            if target_title is not None:
+                record.target_title = target_title
+            if target_process is not None:
+                record.target_process = target_process
+            if target_rect is not None:
+                record.target_rect = target_rect
+            if pending_action is not None:
+                record.pending_action = pending_action
+            if final_summary is not None:
+                record.final_summary = final_summary
+            if last_screenshot_ref is not None:
+                record.last_screenshot_ref = last_screenshot_ref
+            if error is not None:
+                record.error = error
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def interrupt_running_desktop_runs(self) -> int:
+        async with self._session_factory() as db:
+            rows = list(
+                (
+                    await db.scalars(
+                        select(DesktopRunRecord).where(
+                            DesktopRunRecord.status.in_(
+                                [
+                                    DesktopRunStatus.RUNNING.value,
+                                    DesktopRunStatus.WAITING_APPROVAL.value,
+                                    DesktopRunStatus.WAITING_CAPTURE_CONSENT.value,
+                                ]
+                            )
+                        )
+                    )
+                ).all()
+            )
+            for record in rows:
+                record.status = DesktopRunStatus.INTERRUPTED.value
+                record.finished_at = now_utc()
+                record.error = {"reason": "server_restarted"}
+            await db.commit()
+            return len(rows)
+
+    async def append_desktop_action(
+        self,
+        *,
+        desktop_run_id: str,
+        session_id: str,
+        step_no: int,
+        action_name: str,
+        arguments: Dict[str, Any],
+        status: str,
+        screenshot_before: Optional[str],
+        screenshot_after: Optional[str],
+        execution_result: Dict[str, Any],
+        approval_required: bool = False,
+    ) -> DesktopActionRecord:
+        async with self._session_factory() as db:
+            record = DesktopActionRecord(
+                action_id=new_id("dact"),
+                desktop_run_id=desktop_run_id,
+                session_id=session_id,
+                step_no=step_no,
+                action_name=action_name,
+                arguments=arguments,
+                status=status,
+                screenshot_before=screenshot_before,
+                screenshot_after=screenshot_after,
+                execution_result=execution_result,
+                approval_required=approval_required,
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def list_desktop_actions(self, desktop_run_id: str) -> List[DesktopActionRecord]:
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(DesktopActionRecord)
+                .where(DesktopActionRecord.desktop_run_id == desktop_run_id)
+                .order_by(DesktopActionRecord.step_no)
+            )
+            return list(rows.all())
+
+    async def update_desktop_action(
+        self,
+        action_id: str,
+        *,
+        status: str,
+        screenshot_before: Optional[str] = None,
+        screenshot_after: Optional[str] = None,
+        execution_result: Optional[Dict[str, Any]] = None,
+    ) -> DesktopActionRecord:
+        async with self._session_factory() as db:
+            record = await db.get(DesktopActionRecord, action_id)
+            if record is None:
+                raise NotFoundError(f"desktop action {action_id} not found")
+            record.status = status
+            if screenshot_before is not None:
+                record.screenshot_before = screenshot_before
+            if screenshot_after is not None:
+                record.screenshot_after = screenshot_after
+            if execution_result is not None:
+                record.execution_result = execution_result
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def create_desktop_approval(
+        self,
+        *,
+        desktop_run_id: str,
+        session_id: str,
+        action_summary: str,
+        risk_description: str,
+        pending_payload: Dict[str, Any],
+    ) -> DesktopApprovalRecord:
+        async with self._session_factory() as db:
+            record = DesktopApprovalRecord(
+                approval_id=new_id("dapproval"),
+                desktop_run_id=desktop_run_id,
+                session_id=session_id,
+                action_summary=action_summary,
+                risk_description=risk_description,
+                status=ApprovalStatus.PENDING.value,
+                pending_payload=pending_payload,
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def get_desktop_approval(self, approval_id: str) -> DesktopApprovalRecord:
+        async with self._session_factory() as db:
+            record = await db.get(DesktopApprovalRecord, approval_id)
+            if record is None:
+                raise NotFoundError(f"desktop approval {approval_id} not found")
+            return record
+
+    async def list_desktop_approvals(self, desktop_run_id: str) -> List[DesktopApprovalRecord]:
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(DesktopApprovalRecord)
+                .where(DesktopApprovalRecord.desktop_run_id == desktop_run_id)
+                .order_by(DesktopApprovalRecord.requested_at)
+            )
+            return list(rows.all())
+
+    async def decide_desktop_approval(
+        self, approval_id: str, status: ApprovalStatus, comment: Optional[str]
+    ) -> DesktopApprovalRecord:
+        async with self._session_factory() as db:
+            record = await db.get(DesktopApprovalRecord, approval_id)
+            if record is None:
+                raise NotFoundError(f"desktop approval {approval_id} not found")
+            if record.status != ApprovalStatus.PENDING.value:
+                raise ConflictError("desktop approval is no longer pending")
+            record.status = status.value
+            record.comment = comment
+            record.decided_at = now_utc()
+            await db.commit()
+            await db.refresh(record)
+            return record
 
     async def create_task(
         self, request: TaskCreate, plan: List[Dict[str, Any]]

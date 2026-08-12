@@ -58,6 +58,21 @@ class Settings(BaseSettings):
     code_max_runtime_minutes: int = Field(default=20, ge=1)
     code_max_concurrent_runs: int = Field(default=1, ge=1)
 
+    # Desktop control is opt-in and intentionally separate from browser automation.
+    enable_desktop_control: bool = False
+    desktop_base_url: str = ""
+    desktop_api_key: str = "not-needed"
+    desktop_model: str = ""
+    desktop_timeout_seconds: float = Field(default=120.0, gt=0)
+    desktop_max_tokens: int = Field(default=2048, ge=1)
+    desktop_max_screenshots: int = Field(default=3, ge=1)
+    desktop_max_steps: int = Field(default=50, ge=1)
+    desktop_max_runtime_minutes: int = Field(default=15, ge=1)
+    desktop_max_concurrent_runs: int = Field(default=1, ge=1)
+    desktop_capture_mode: str = "window"
+    desktop_allowed_apps: List[str] = Field(default_factory=list)
+    desktop_require_confirmation: bool = True
+
     default_allowed_domains: List[str] = Field(default_factory=lambda: ["bing.com"])
     allow_private_networks: bool = False
     max_concurrent_sessions: int = 2

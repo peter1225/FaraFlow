@@ -7,6 +7,9 @@ import type {
   ChatSummary,
   CodeDiff,
   CodeRun,
+  DesktopApproval,
+  DesktopRun,
+  DesktopWindow,
   RequestedMode,
   SessionEvent,
   Task,
@@ -167,6 +170,39 @@ export const api = {
     request<CodeRun>(`/v1/code-runs/${codeRunId}/revert`, { method: "POST" }),
   discardCodeRun: (codeRunId: string) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/discard`, { method: "POST" }),
+  listDesktopRuns: (chatId?: string) =>
+    request<DesktopRun[]>(
+      `/v1/desktop-runs${chatId ? `?chat_id=${encodeURIComponent(chatId)}` : ""}`,
+    ),
+  getDesktopRun: (desktopRunId: string) =>
+    request<DesktopRun>(`/v1/desktop-runs/${desktopRunId}`),
+  listDesktopWindows: () => request<DesktopWindow[]>("/v1/desktop-runs/windows"),
+  selectDesktopWindow: (desktopRunId: string, windowId: number) =>
+    request<DesktopRun>(`/v1/desktop-runs/${desktopRunId}/select-window`, {
+      method: "POST",
+      body: JSON.stringify({ window_id: windowId }),
+    }),
+  startDesktopRun: (desktopRunId: string) =>
+    request<DesktopRun>(`/v1/desktop-runs/${desktopRunId}/start`, { method: "POST" }),
+  pauseDesktopRun: (desktopRunId: string) =>
+    request<DesktopRun>(`/v1/desktop-runs/${desktopRunId}/pause`, { method: "POST" }),
+  terminateDesktopRun: (desktopRunId: string) =>
+    request<DesktopRun>(`/v1/desktop-runs/${desktopRunId}/terminate`, { method: "POST" }),
+  desktopApprovals: (desktopRunId: string) =>
+    request<DesktopApproval[]>(`/v1/desktop-runs/${desktopRunId}/approvals`),
+  decideDesktopApproval: (
+    desktopRunId: string,
+    approvalId: string,
+    decision: "approve" | "reject",
+    comment?: string,
+  ) =>
+    request<DesktopApproval>(
+      `/v1/desktop-runs/${desktopRunId}/approvals/${approvalId}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ decision, comment }),
+      },
+    ),
   listTasks: () => request<Task[]>("/v1/tasks"),
   getTask: (taskId: string) => request<Task>(`/v1/tasks/${taskId}`),
   createTask: (payload: Record<string, unknown>) =>

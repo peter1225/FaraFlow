@@ -9,6 +9,9 @@ import type {
   ChatMessage,
   ChatSummary,
   CodeRun,
+  DesktopApproval,
+  DesktopRun,
+  DesktopWindow,
   RequestedMode,
   SessionEvent,
   SessionState,
@@ -236,22 +239,256 @@ function ReasoningDisclosure({
   );
 }
 
+const desktopStatusLabels: Record<DesktopRun["status"], string> = {
+  CREATED: "准备中",
+  WAITING_CAPTURE_CONSENT: "请选择要控制的窗口",
+  RUNNING: "正在执行",
+  WAITING_APPROVAL: "等待你的确认",
+  PAUSED: "已暂停",
+  HANDOFF: "需要人工接管",
+  COMPLETED: "已完成",
+  FAILED: "执行失败",
+  TERMINATED: "已停止",
+  INTERRUPTED: "执行被中断",
+};
+
+function desktopTargetLabel(title?: string, processName?: string) {
+  if (title === "Program Manager" && processName?.toLowerCase() === "explorer.exe") {
+    return "Windows 桌面";
+  }
+  return title ?? "等待选择要控制的窗口";
+}
+
+function desktopErrorMessage(error?: Record<string, unknown>) {
+  const message = typeof error?.message === "string" ? error.message : "";
+  if (message.includes("did not contain a desktop action or final block")) {
+    return "模型没有返回可执行的桌面动作。请点击“重新尝试”；如果仍失败，请检查桌面模型输出协议。";
+  }
+  if (message.includes("invalid desktop action JSON")) {
+    return "模型返回的桌面动作 JSON 不完整。系统现已启用结构化输出，请点击“重新尝试”。";
+  }
+  if (message.includes("validation error for DesktopAction")) {
+    return "模型返回的桌面动作缺少必要参数。系统已增强动作参数约束，请点击“重新尝试”。";
+  }
+  if (message.includes("HTTP 400 from desktop model")) {
+    return `桌面模型拒绝了请求：${message}`;
+  }
+  if (message.includes("repeated the same")) {
+    return "模型连续返回了相同桌面动作，系统已停止重复操作以保护桌面。请检查目标图标是否可见后重新尝试。";
+  }
+  if (message.includes("desktop model call failed")) {
+    return `桌面模型调用失败：${message}`;
+  }
+  return message || "桌面任务执行失败，请重新尝试。";
+}
+
+function DesktopRunCard({
+  run,
+  onChanged,
+  onTerminate,
+}: {
+  run: DesktopRun;
+  onChanged: (run: DesktopRun) => void;
+  onTerminate?: (desktopRunId: string) => Promise<void>;
+}) {
+  const [windows, setWindows] = useState<DesktopWindow[]>([]);
+  const [approvals, setApprovals] = useState<DesktopApproval[]>([]);
+  const [showWindows, setShowWindows] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function loadWindows() {
+    setBusy(true);
+    setError("");
+    try {
+      setWindows(await api.listDesktopWindows());
+      setShowWindows(true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法读取可控窗口");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function selectWindow(windowId: number) {
+    setBusy(true);
+    setError("");
+    try {
+      const selected = await api.selectDesktopWindow(run.desktop_run_id, windowId);
+      onChanged(selected);
+      const started = await api.startDesktopRun(run.desktop_run_id);
+      onChanged(started);
+      setShowWindows(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "选择窗口失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function retryRun() {
+    setBusy(true);
+    setError("");
+    try {
+      const started = await api.startDesktopRun(run.desktop_run_id);
+      onChanged(started);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "重新启动桌面任务失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadApprovals() {
+    try {
+      setApprovals(await api.desktopApprovals(run.desktop_run_id));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法读取审批状态");
+    }
+  }
+
+  async function decide(approval: DesktopApproval, decision: "approve" | "reject") {
+    setBusy(true);
+    setError("");
+    try {
+      await api.decideDesktopApproval(run.desktop_run_id, approval.approval_id, decision);
+      await loadApprovals();
+      onChanged(await api.getDesktopRun(run.desktop_run_id));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "审批操作失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (run.status === "WAITING_APPROVAL") void loadApprovals();
+  }, [run.desktop_run_id, run.status]);
+
+  const pendingApproval = approvals.find((item) => item.status === "pending");
+  return (
+    <div className="automation-message-card desktop-message-card">
+      <div className="automation-card-head">
+        <div>
+          <span className="automation-icon">▣</span>
+          <div>
+            <small>LOCAL DESKTOP RUN</small>
+            <strong>{desktopTargetLabel(run.target_title, run.target_process)}</strong>
+          </div>
+        </div>
+        <span className={`code-status state-${run.status.toLowerCase()}`}>
+          {desktopStatusLabels[run.status]}
+        </span>
+      </div>
+      <div className="automation-card-detail">
+        <span>{run.actions.length} 个桌面动作</span>
+        <span>{run.target_process ?? "未绑定进程"}</span>
+      </div>
+      {run.last_screenshot_ref && (
+        <img
+          className="desktop-screenshot"
+          src={artifactUrl(run.last_screenshot_ref)}
+          alt="最近一次桌面截图"
+        />
+      )}
+      {run.status === "WAITING_CAPTURE_CONSENT" && !showWindows && (
+        <p className="desktop-guidance">
+          第 1 步：点击“选择应用窗口”；第 2 步：选择要授权的窗口。选择后任务会自动开始。
+        </p>
+      )}
+      {run.status === "FAILED" && (
+        <div className="desktop-error" role="alert">
+          <strong>为什么失败？</strong>
+          <p>{desktopErrorMessage(run.error)}</p>
+        </div>
+      )}
+      {pendingApproval && (
+        <div className="desktop-approval">
+          <strong>{pendingApproval.action_summary}</strong>
+          <p>{pendingApproval.risk_description}</p>
+          <div className="modal-actions">
+            <button
+              className="button secondary"
+              disabled={busy}
+              onClick={() => void decide(pendingApproval, "reject")}
+            >
+              拒绝
+            </button>
+            <button
+              className="button primary"
+              disabled={busy}
+              onClick={() => void decide(pendingApproval, "approve")}
+            >
+              允许执行
+            </button>
+          </div>
+        </div>
+      )}
+      {showWindows && (
+        <div className="desktop-window-list">
+          {windows.length === 0 && <p>当前没有检测到可见窗口。</p>}
+          {windows.map((window) => (
+            <button
+              className="button secondary"
+              key={window.window_id}
+              disabled={busy}
+              onClick={() => void selectWindow(window.window_id)}
+            >
+              {desktopTargetLabel(window.title, window.process_name)} ·{" "}
+              {window.process_name || "未知进程"}
+            </button>
+          ))}
+        </div>
+      )}
+      {error && <p className="automation-result">{error}</p>}
+      <div className="desktop-card-actions">
+        {run.status === "WAITING_CAPTURE_CONSENT" && (
+          <button className="button secondary" disabled={busy} onClick={() => void loadWindows()}>
+            选择应用窗口
+          </button>
+        )}
+        {run.status === "FAILED" && run.target_window_id && (
+          <button className="button primary" disabled={busy} onClick={() => void retryRun()}>
+            重新尝试
+          </button>
+        )}
+        {onTerminate &&
+          ["RUNNING", "WAITING_APPROVAL", "WAITING_CAPTURE_CONSENT"].includes(run.status) && (
+            <button
+              className="button secondary"
+              disabled={busy}
+              onClick={() => void onTerminate(run.desktop_run_id)}
+            >
+              停止桌面任务
+            </button>
+          )}
+      </div>
+    </div>
+  );
+}
+
 export function ChatPanel({
   chat,
   tasks,
   codeRuns,
+  desktopRuns = [],
   sending,
   onSend,
   onOpenTask,
   onOpenWorkspace,
+  onTerminateDesktopRun,
+  onDesktopRunChanged,
 }: {
   chat: Chat;
   tasks: Task[];
   codeRuns: CodeRun[];
+  desktopRuns?: DesktopRun[];
   sending: boolean;
   onSend: (content: string, mode: RequestedMode, enableThinking: boolean) => Promise<void>;
   onOpenTask: (taskId: string) => void;
   onOpenWorkspace: (workspaceId: string) => void;
+  onTerminateDesktopRun?: (desktopRunId: string) => Promise<void>;
+  onDesktopRunChanged?: (run: DesktopRun) => void;
 }) {
   const [draft, setDraft] = useState("");
   const [mode, setMode] = useState<RequestedMode>(chat.workspace_id ? "code" : "auto");
@@ -353,6 +590,9 @@ export function ChatPanel({
             const linkedCodeRun = message.code_run_id
               ? codeRuns.find((item) => item.code_run_id === message.code_run_id)
               : undefined;
+            const linkedDesktopRun = message.desktop_run_id
+              ? desktopRuns.find((item) => item.desktop_run_id === message.desktop_run_id)
+              : undefined;
             const reasoning = typeof message.metadata.reasoning === "string"
               ? message.metadata.reasoning
               : "";
@@ -426,6 +666,13 @@ export function ChatPanel({
                       )}
                     </div>
                   )}
+                  {message.mode === "desktop" && linkedDesktopRun && (
+                    <DesktopRunCard
+                      run={linkedDesktopRun}
+                      onChanged={(next) => onDesktopRunChanged?.(next)}
+                      onTerminate={onTerminateDesktopRun}
+                    />
+                  )}
                 </div>
               </article>
             );
@@ -492,7 +739,11 @@ export function ChatPanel({
                 onChange={(event) => {
                   const nextMode = event.target.value as RequestedMode;
                   setMode(nextMode);
-                  if (nextMode === "automation" || nextMode === "code") {
+                  if (
+                    nextMode === "automation" ||
+                    nextMode === "code" ||
+                    nextMode === "desktop"
+                  ) {
                     setThinkingEnabled(false);
                   }
                 }}
@@ -501,6 +752,7 @@ export function ChatPanel({
                 <option value="chat">聊天</option>
                 <option value="automation">浏览器</option>
                 <option value="code" disabled={!chat.workspace_id}>代码</option>
+                <option value="desktop">桌面控制</option>
               </select>
             </label>
             <button
@@ -740,6 +992,7 @@ export default function App() {
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [codeRuns, setCodeRuns] = useState<CodeRun[]>([]);
+  const [desktopRuns, setDesktopRuns] = useState<DesktopRun[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [selected, setSelected] = useState<Task>();
   const [selectedChatId, setSelectedChatId] = useState<string>();
@@ -772,10 +1025,12 @@ export default function App() {
       const runRows = workspaceRows.length
         ? await api.listCodeRuns().catch(() => [] as CodeRun[])
         : [];
+      const desktopRows = await api.listDesktopRuns().catch(() => [] as DesktopRun[]);
       setTasks(taskRows);
       setChats(chatRows);
       setWorkspaces(workspaceRows);
       setCodeRuns(runRows);
+      setDesktopRuns(desktopRows);
       if (!selectedId && !selectedChatId && !selectedWorkspaceId) {
         if (chatRows.length > 0) setSelectedChatId(chatRows[0].chat_id);
         else if (taskRows.length > 0) setSelectedId(taskRows[0].task_id);
@@ -820,17 +1075,19 @@ export default function App() {
   useEffect(() => {
     if (!selectedChatId) return;
     const refresh = async () => {
-      const [chat, taskRows, chatRows, runRows] = await Promise.all([
+      const [chat, taskRows, chatRows, runRows, desktopRows] = await Promise.all([
         api.getChat(selectedChatId),
         api.listTasks(),
         api.listChats(),
         api.listCodeRuns().catch(() => [] as CodeRun[]),
+        api.listDesktopRuns(selectedChatId).catch(() => [] as DesktopRun[]),
       ]);
       if (sendingChatRef.current) return;
       setSelectedChat(chat);
       setTasks(taskRows);
       setChats(chatRows);
       setCodeRuns(runRows);
+      setDesktopRuns(desktopRows);
     };
     void refresh().catch((reason: unknown) =>
       setError(reason instanceof Error ? reason.message : "无法加载对话"),
@@ -1029,6 +1286,14 @@ export default function App() {
           ...current.filter((item) => item.code_run_id !== response.code_run!.code_run_id),
         ]);
       }
+      if (response.desktop_run) {
+        setDesktopRuns((current) => [
+          response.desktop_run!,
+          ...current.filter(
+            (item) => item.desktop_run_id !== response.desktop_run!.desktop_run_id,
+          ),
+        ]);
+      }
     } catch (reason) {
       setSelectedChat(before);
       setError(reason instanceof Error ? reason.message : "发送消息失败");
@@ -1060,6 +1325,17 @@ export default function App() {
       setError(reason instanceof Error ? reason.message : "操作失败");
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function terminateDesktopRun(desktopRunId: string) {
+    try {
+      const run = await api.terminateDesktopRun(desktopRunId);
+      setDesktopRuns((current) =>
+        current.map((item) => (item.desktop_run_id === run.desktop_run_id ? run : item)),
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "停止桌面任务失败");
     }
   }
 
@@ -1173,10 +1449,19 @@ export default function App() {
             chat={selectedChat}
             tasks={tasks}
             codeRuns={codeRuns}
+            desktopRuns={desktopRuns}
             sending={sendingChat}
             onSend={sendChat}
             onOpenTask={selectTask}
             onOpenWorkspace={selectWorkspace}
+            onTerminateDesktopRun={terminateDesktopRun}
+            onDesktopRunChanged={(run) =>
+              setDesktopRuns((current) =>
+                current.map((item) =>
+                  item.desktop_run_id === run.desktop_run_id ? run : item,
+                ),
+              )
+            }
           />
         ) : selected ? (
           <TaskDetail

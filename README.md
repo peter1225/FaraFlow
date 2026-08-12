@@ -1,16 +1,17 @@
 # FaraFlow
 
 FaraFlow 是一个带安全边界的本地 Agent 工作台。它将普通聊天、Microsoft Fara1.5
-浏览器自动化和本地代码工作区放进独立执行平面，并统一提供会话、审批、Diff 审核、
+浏览器自动化、本地代码工作区和 Windows 桌面控制放进独立执行平面，并统一提供会话、审批、Diff 审核、
 安全策略和审计记录。
 
 当前仓库实现的是可运行 MVP，已经包含以下框架：
 
 - Fara1.5-9B/27B + vLLM OpenAI-compatible 推理适配，可连接本机或远程模型服务器；
 - React 19 + Vite 对话工作区，支持普通问答与自动化请求的统一入口；
-- `ChatService` 三路意图路由：普通聊天、浏览器自动化和本地代码任务；
+- `ChatService` 四路意图路由：普通聊天、浏览器自动化、本地代码任务和 Windows 桌面控制；
 - 本机文件夹注册与工作区绑定对话，支持自动/聊天/浏览器/代码模式切换；
 - 独立 `CodeRuntime` + OpenAI-compatible CodingModel，不回退到 Fara 浏览器模型；
+- 独立 `DesktopRuntime` + OpenAI-compatible DesktopModel，通过 Windows DesktopBridge 执行受控截图、鼠标和键盘动作；
 - 干净 Git 仓库使用 detached worktree，脏仓库或普通文件夹使用托管快照；
 - 代码文件树、工具时间线、统一 Diff，以及人工应用、丢弃和撤销；
 - 代码工具仅允许受控文件读写与 Git 状态/Diff，不开放任意 Shell、commit 或 push；
@@ -29,22 +30,41 @@ FaraFlow 是一个带安全边界的本地 Agent 工作台。它将普通聊天�
 
 ## 系统架构
 
-![FaraFlow 企业级浏览器智能自动化 Agent 平台系统架构图](<./docs/imgs/FaraFlow — 企业级浏览器智能自动化 Agent 平台（系统架构图）-v3.png>)
+![FaraFlow 企业级浏览器智能自动化 Agent 平台系统架构图](<./docs/imgs/FaraFlow — 企业级浏览器智能自动化 Agent 平台（系统架构图）-v4.png>)
 
 当前请求路由与执行边界如下：
 
 ```mermaid
 flowchart LR
-    UI["React 工作台"] --> Chat["ChatService"]
-    Chat -->|chat| Fara["普通对话模型"]
+    UI["React 工作台\n对话、任务、代码、桌面卡片"] --> API["FastAPI REST / WebSocket"]
+    API --> Chat["ChatService\n意图路由与会话持久化"]
+
+    Chat -->|chat| ChatAdapter["ChatAdapter"]
+    ChatAdapter --> ChatModel["ChatModel\nOpenAI-compatible"]
+
     Chat -->|automation| Agent["AgentRuntime"]
-    Agent --> Browser["Fara + Playwright"]
+    Agent --> FaraAdapter["FaraAdapter"]
+    FaraAdapter --> FaraModel["Fara1.5\nvLLM / 远程模型"]
+    Agent --> Browser["BrowserPool + Playwright"]
+
     Chat -->|code| Code["CodeRuntime"]
-    Code --> Model["独立 CodingModel"]
-    Code --> Tools["受控 Workspace 工具"]
-    Tools --> Isolation["Git Worktree / 托管快照"]
-    Isolation --> Review["Diff 人工审核"]
-    Review -->|应用 / 撤销| Source["用户原目录"]
+    Code --> CodeAdapter["CodeAdapter"]
+    CodeAdapter --> CodeModel["CodingModel\nvLLM / 远程模型"]
+    Code --> CodeTools["ToolRegistry + ToolExecutor"]
+    CodeTools --> Isolation["Git Worktree / 托管快照"]
+    Isolation --> Diff["Diff / 审核 / 应用 / 撤销"]
+    Diff --> Source["用户原目录"]
+
+    Chat -->|desktop| Desktop["DesktopRuntime"]
+    Desktop --> DesktopAdapter["DesktopAdapter"]
+    DesktopAdapter --> DesktopModel["DesktopModel\n视觉模型 / vLLM"]
+    Desktop --> Bridge["Windows DesktopBridge\n截图、窗口、鼠标、键盘"]
+    Desktop --> DesktopPolicy["DesktopPolicy\n权限、敏感动作、审批"]
+
+    API --> Store["SQLite / PostgreSQL\n任务、消息、审批、审计"]
+    Agent --> Artifacts["artifacts/\n截图、trace、运行证据"]
+    Desktop --> Artifacts
+    Code --> Artifacts
 ```
 
 ## 目录结构
@@ -56,8 +76,9 @@ backend/faraflow/
   domain/            API 请求/响应模型与任务状态枚举
   infra/             SQLAlchemy、Repository、工件与事件设施
   model/             Fara1.5 协议解析和 vLLM 适配器
-  runtime/           ChatService、TaskService、AgentRuntime
+  runtime/           ChatService、TaskService、AgentRuntime、路由编排
   code/              CodeAdapter、CodeRuntime、工具协议和执行器
+  desktop/           Windows 桌面桥接、截图、动作策略、审批和 DesktopRuntime
   workspace/         路径安全、隔离副本、Diff、备份和应用/撤销
   security/          域名白名单、关键动作审批、注入检测
 frontend/
@@ -88,12 +109,13 @@ tests/               单元、API、浏览器和 Agent 运行时测试
 5. 任务完成、暂停、等待用户输入、等待审批、触发安全接管或失败时，状态通过 REST 和 WebSocket 同步到前端。
 6. 绑定工作区的代码请求交给独立 `CodeRuntime`；模型只能在隔离目录调用显式注册的文件工具。
 7. 代码运行结束后生成统一 Diff 并进入 `REVIEW_REQUIRED`，确认前不修改原目录；应用和撤销都会执行哈希冲突检查。
+8. 明确要求控制本机桌面时，消息进入 `DesktopRuntime`；用户先选择目标窗口，模型根据截图生成受控动作，`DesktopPolicy` 在执行前检查敏感操作并按需请求审批。
 
 当前开发环境可以把 `.env` 中的模型配置指向远程 vLLM OpenAI API，例如：
 
 ```dotenv
-FARAFLOW_FARA_BASE_URL=http://127.0.0.1:5000/v1
-FARAFLOW_FARA_MODEL=microsoft/Fara1.5-9B
+FARAFLOW_FARA_BASE_URL=http://10.65.1.110:8003/v1
+FARAFLOW_FARA_MODEL=microsoft/Fara1.5-27B
 FARAFLOW_FARA_API_KEY=not-needed
 ```
 
@@ -109,7 +131,20 @@ FARAFLOW_CHAT_MODEL=
 ```
 
 只有同时配置 `FARAFLOW_CHAT_BASE_URL` 和 `FARAFLOW_CHAT_MODEL` 时，才会启用独立
-对话模型。`/health/ready` 会分别显示浏览器模型、对话模型和代码模型状态。
+对话模型；否则普通聊天会复用 `FARAFLOW_FARA_*`。`/health/ready` 会分别显示浏览器模型、
+对话模型、代码模型和桌面模型状态。
+
+当前内网部署可以将普通聊天和代码模型指向 110 服务器上的 Qwen vLLM，将浏览器和桌面
+控制指向 27B Fara vLLM（端口和模型名按服务器实际状态调整）：
+
+```dotenv
+FARAFLOW_CHAT_BASE_URL=http://10.65.1.110:8002/v1
+FARAFLOW_CHAT_MODEL=qwen-27b-int4
+FARAFLOW_CODE_BASE_URL=http://10.65.1.110:8002/v1
+FARAFLOW_CODE_MODEL=qwen-27b-int4
+FARAFLOW_FARA_BASE_URL=http://10.65.1.110:8003/v1
+FARAFLOW_FARA_MODEL=microsoft/Fara1.5-27B
+```
 普通聊天使用 NDJSON 流式接口逐段更新前端；对支持 thinking 开关的 Qwen/vLLM
 部署，可以设置 `FARAFLOW_CHAT_DISABLE_THINKING=true` 作为默认值。聊天输入区的“深度
 思考”按钮允许用户为单条消息覆盖默认值；开启后，模型返回的思考文本会实时显示在
@@ -125,7 +160,7 @@ FARAFLOW_WORKSPACE_ALLOWED_ROOTS=["C:/Users/Peter/Desktop"]
 FARAFLOW_CODE_WORK_ROOT=./data/code-workspaces
 FARAFLOW_CODE_BASE_URL=http://10.65.1.110:8002/v1
 FARAFLOW_CODE_API_KEY=not-needed
-FARAFLOW_CODE_MODEL=<实际模型名称>
+FARAFLOW_CODE_MODEL=qwen-27b-int4
 FARAFLOW_CODE_MAX_STEPS=50
 FARAFLOW_CODE_MAX_RUNTIME_MINUTES=20
 FARAFLOW_CODE_MAX_CONCURRENT_RUNS=1
@@ -136,6 +171,34 @@ FARAFLOW_CODE_MAX_CONCURRENT_RUNS=1
 浏览器模型。在 Windows 本机模式下，“添加本机文件夹”可以直接打开系统文件夹选择器；
 选择结果仍必须位于 `FARAFLOW_WORKSPACE_ALLOWED_ROOTS` 配置的目录内，也可以继续手动
 输入绝对路径。
+
+桌面控制是独立的本机执行平面，默认关闭。启用后 API 必须绑定 `127.0.0.1`，并为视觉
+模型单独配置 OpenAI-compatible 端点；浏览器自动化和桌面控制可以共用 Fara 模型，但运行
+时仍使用不同的 Runtime、会话和安全策略：
+
+```dotenv
+FARAFLOW_API_HOST=127.0.0.1
+FARAFLOW_ENABLE_DESKTOP_CONTROL=true
+FARAFLOW_DESKTOP_BASE_URL=http://10.65.1.110:8003/v1
+FARAFLOW_DESKTOP_API_KEY=not-needed
+FARAFLOW_DESKTOP_MODEL=microsoft/Fara1.5-27B
+FARAFLOW_DESKTOP_CAPTURE_MODE=window
+FARAFLOW_DESKTOP_REQUIRE_CONFIRMATION=true
+FARAFLOW_DESKTOP_MAX_STEPS=50
+FARAFLOW_DESKTOP_MAX_RUNTIME_MINUTES=15
+FARAFLOW_DESKTOP_MAX_CONCURRENT_RUNS=1
+```
+
+Windows 本机首次启用时，先安装截图依赖：
+
+```powershell
+python -m pip install -e ".[desktop]"
+```
+
+桌面任务不会启动进程、提权、处理 UAC 或执行任意 Shell；首版只控制用户选择的可见
+Windows 窗口，并在截图前后记录审计证据。涉及输入、拖动、右键和系统快捷键的动作会
+按策略暂停等待确认。Windows 11 桌面图标操作通过 `FolderView` 桥接执行，目标窗口
+不可见或桌面截图不可用时任务会安全失败。
 
 ## 本地开发
 
@@ -205,6 +268,10 @@ npm run build
 - `POST|GET /v1/code-runs`：创建或查看隔离代码运行；
 - `GET /v1/code-runs/{id}/diff`：查看统一 Diff；
 - `POST /v1/code-runs/{id}/apply|revert|discard`：应用、撤销或丢弃修改；
+- `POST|GET /v1/desktop-runs`：创建或查看本机桌面控制运行；
+- `GET /v1/desktop-runs/windows`、`POST /v1/desktop-runs/{id}/select-window`：枚举并选择目标窗口；
+- `POST /v1/desktop-runs/{id}/start|pause|terminate`：控制桌面运行生命周期；
+- `GET /v1/desktop-runs/{id}/approvals`、`POST /v1/desktop-runs/{id}/approvals/{approval_id}`：查看和处理敏感动作审批；
 - `POST /v1/tasks`：直接创建自动化任务；
 - `POST /v1/tasks/{task_id}/start|pause|terminate|respond`：控制任务生命周期；
 - `POST /v1/tasks/{task_id}/approvals/{approval_id}`：处理高风险动作审批；

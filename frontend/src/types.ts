@@ -87,9 +87,10 @@ export interface ChatMessage {
   chat_id: string;
   role: "user" | "assistant";
   content: string;
-  mode: "chat" | "automation" | "code";
+  mode: "chat" | "automation" | "code" | "desktop";
   task_id?: string;
   code_run_id?: string;
+  desktop_run_id?: string;
   metadata: Record<string, unknown>;
   created_at: string;
 }
@@ -109,21 +110,88 @@ export interface Chat extends ChatSummary {
 }
 
 export interface ChatReply {
-  route: "chat" | "automation" | "code";
+  route: "chat" | "automation" | "code" | "desktop";
   chat: Chat;
   task?: Task;
   code_run?: CodeRun;
+  desktop_run?: DesktopRun;
 }
 
 export type ChatStreamEvent =
-  | { type: "route"; route: "chat" | "automation" | "code" }
+  | { type: "route"; route: "chat" | "automation" | "code" | "desktop" }
   | { type: "reasoning_delta"; content: string }
   | { type: "reasoning_done" }
   | { type: "delta"; content: string }
   | { type: "done"; reply: ChatReply }
   | { type: "error"; message: string };
 
-export type RequestedMode = "auto" | "chat" | "automation" | "code";
+export type RequestedMode = "auto" | "chat" | "automation" | "code" | "desktop";
+
+export type DesktopRunStatus =
+  | "CREATED"
+  | "WAITING_CAPTURE_CONSENT"
+  | "RUNNING"
+  | "WAITING_APPROVAL"
+  | "PAUSED"
+  | "HANDOFF"
+  | "COMPLETED"
+  | "FAILED"
+  | "TERMINATED"
+  | "INTERRUPTED";
+
+export interface DesktopWindow {
+  window_id: number;
+  title: string;
+  process_name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface DesktopAction {
+  action_id: string;
+  step_no: number;
+  action_name: string;
+  status: string;
+  arguments: Record<string, unknown>;
+  screenshot_before?: string;
+  screenshot_after?: string;
+  execution_result: Record<string, unknown>;
+  approval_required: boolean;
+  created_at: string;
+}
+
+export interface DesktopApproval {
+  approval_id: string;
+  desktop_run_id: string;
+  session_id: string;
+  action_summary: string;
+  risk_description: string;
+  status: "pending" | "approved" | "rejected" | "expired";
+  pending_payload: Record<string, unknown>;
+  requested_at: string;
+  decided_at?: string;
+  comment?: string;
+}
+
+export interface DesktopRun {
+  desktop_run_id: string;
+  chat_id?: string;
+  session_id: string;
+  instruction: string;
+  status: DesktopRunStatus;
+  target_window_id?: number;
+  target_title?: string;
+  target_process?: string;
+  final_summary?: string;
+  last_screenshot_ref?: string;
+  error?: Record<string, unknown>;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+  actions: DesktopAction[];
+}
 
 export interface Workspace {
   workspace_id: string;

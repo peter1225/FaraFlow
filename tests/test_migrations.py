@@ -26,6 +26,9 @@ def test_alembic_creates_fresh_database(tmp_path: Path) -> None:
             "ff_workspaces",
             "ff_code_runs",
             "ff_tool_calls",
+            "ff_desktop_runs",
+            "ff_desktop_actions",
+            "ff_desktop_approvals",
         } <= tables
         tool_columns = {
             item["name"] for item in inspect(engine).get_columns("ff_tool_calls")
@@ -70,6 +73,9 @@ def test_alembic_preserves_existing_chat_data(tmp_path: Path) -> None:
             item["name"] for item in inspector.get_columns("ff_chat_threads")
         }
         assert "code_run_id" in {
+            item["name"] for item in inspector.get_columns("ff_chat_messages")
+        }
+        assert "desktop_run_id" in {
             item["name"] for item in inspector.get_columns("ff_chat_messages")
         }
         with engine.connect() as connection:

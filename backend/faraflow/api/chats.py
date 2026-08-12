@@ -12,7 +12,7 @@ from faraflow.domain.schemas import (
     ChatView,
 )
 
-from .dependencies import get_container, require_local_workspace_request
+from .dependencies import get_container, require_desktop_request, require_local_workspace_request
 
 router = APIRouter(prefix="/v1/chats", tags=["chat"])
 
@@ -46,7 +46,11 @@ async def send_chat_message(
 ) -> ChatReply:
     container = get_container(request)
     chat = await container.repository.get_chat(chat_id)
-    if payload.requested_mode == "code" or chat.workspace_id is not None:
+    if payload.requested_mode == "desktop":
+        require_desktop_request(request, container.settings)
+    if payload.requested_mode == "code" or (
+        chat.workspace_id is not None and payload.requested_mode != "desktop"
+    ):
         if chat.workspace_id is None:
             raise HTTPException(status_code=422, detail="code mode requires a workspace")
         require_local_workspace_request(request, container.settings)
@@ -61,7 +65,11 @@ async def stream_chat_message(
 ) -> StreamingResponse:
     container = get_container(request)
     chat = await container.repository.get_chat(chat_id)
-    if payload.requested_mode == "code" or chat.workspace_id is not None:
+    if payload.requested_mode == "desktop":
+        require_desktop_request(request, container.settings)
+    if payload.requested_mode == "code" or (
+        chat.workspace_id is not None and payload.requested_mode != "desktop"
+    ):
         if chat.workspace_id is None:
             raise HTTPException(status_code=422, detail="code mode requires a workspace")
         require_local_workspace_request(request, container.settings)

@@ -28,6 +28,7 @@ dependencies = [
 [project.optional-dependencies]
 temporal = ["temporalio>=1.9,<2"]
 s3 = ["minio>=7.2,<8"]
+desktop = ["Pillow>=10,<12"]
 observability = [
   "opentelemetry-api>=1.29,<2",
   "opentelemetry-sdk>=1.29,<2",

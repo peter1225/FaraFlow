@@ -12,6 +12,13 @@ from fastapi.responses import FileResponse, ORJSONResponse
 from faraflow.browser.playwright_runner import BrowserPool
 from faraflow.code import CodeAdapter, CodeRunService, CodeRuntime
 from faraflow.config import Settings, get_settings
+from faraflow.desktop import (
+    DesktopAdapter,
+    DesktopBridge,
+    DesktopPolicy,
+    DesktopRunService,
+    DesktopRuntime,
+)
 from faraflow.domain.schemas import SessionEvent
 from faraflow.infra.artifacts import ArtifactStore
 from faraflow.infra.database import Database
@@ -24,10 +31,11 @@ from faraflow.runtime.chat_service import ChatService
 from faraflow.runtime.task_service import TaskService
 from faraflow.workspace import CodeRunStore, WorkspaceService
 
-from . import chats, code_runs, tasks, workspaces
+from . import chats, code_runs, desktop_runs, tasks, workspaces
 from .dependencies import (
     get_container,
     is_loopback_host,
+    require_desktop_request,
     require_local_workspace_request,
 )
 
@@ -50,6 +58,9 @@ class Container:
     code_runtime: CodeRuntime
     code_runs: CodeRunService
     workspaces: WorkspaceService
+    desktop_adapter: DesktopAdapter
+    desktop_runtime: DesktopRuntime
+    desktop_runs: DesktopRunService
     chat: ChatService
 
 
@@ -77,7 +88,28 @@ def build_container(settings: Settings) -> Container:
     code_run_service = CodeRunService(
         repository, workspace_service, code_run_store, code_runtime
     )
-    chat_service = ChatService(repository, chat_model, task_service, code_run_service)
+    desktop_adapter = DesktopAdapter(settings)
+    desktop_bridge = DesktopBridge()
+    desktop_policy = DesktopPolicy(
+        allowed_apps=settings.desktop_allowed_apps,
+        max_actions=settings.desktop_max_steps,
+        require_confirmation=settings.desktop_require_confirmation,
+    )
+    desktop_runtime = DesktopRuntime(
+        settings,
+        repository,
+        artifacts,
+        desktop_adapter,
+        desktop_bridge,
+        desktop_policy,
+        event_bus,
+    )
+    desktop_run_service = DesktopRunService(
+        settings, repository, desktop_runtime, desktop_bridge, desktop_policy
+    )
+    chat_service = ChatService(
+        repository, chat_model, task_service, code_run_service, desktop_run_service
+    )
     return Container(
         settings=settings,
         database=database,
@@ -93,6 +125,9 @@ def build_container(settings: Settings) -> Container:
         code_runtime=code_runtime,
         code_runs=code_run_service,
         workspaces=workspace_service,
+        desktop_adapter=desktop_adapter,
+        desktop_runtime=desktop_runtime,
+        desktop_runs=desktop_run_service,
         chat=chat_service,
     )
 
@@ -107,6 +142,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         app.state.container = container
         await container.database.create_schema()
         await container.repository.interrupt_running_code_runs()
+        await container.repository.interrupt_running_desktop_runs()
         await container.tasks.seed_skills()
         logger.info("FaraFlow API started")
         try:
@@ -114,10 +150,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         finally:
             await container.runtime.close()
             await container.code_runtime.close()
+            await container.desktop_runtime.close()
             await container.browser_pool.close()
             await container.chat_model.close()
             await container.fara.close()
             await container.code_adapter.close()
+            await container.desktop_adapter.close()
             await container.database.dispose()
 
     app = FastAPI(
@@ -155,6 +193,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(tasks.router)
     app.include_router(workspaces.router)
     app.include_router(code_runs.router)
+    app.include_router(desktop_runs.router)
 
     @app.get("/health/live", tags=["health"])
     async def health_live() -> Dict[str, str]:
@@ -163,26 +202,38 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/health/ready", tags=["health"])
     async def health_ready(request: Request) -> Dict[str, Any]:
         container = get_container(request)
-        model, chat_model, coding_model = await asyncio.gather(
+        model, chat_model, coding_model, desktop_model = await asyncio.gather(
             container.fara.health(),
             container.chat_model.health(),
             container.code_adapter.health(),
+            container.desktop_adapter.health(),
         )
         code_ready = (
             not container.settings.enable_local_workspaces
             or coding_model["status"] == "ok"
         )
         chat_ready = chat_model["status"] == "ok"
+        desktop_ready = (
+            not container.settings.enable_desktop_control
+            or desktop_model["status"] == "ok"
+        )
         return {
             "status": (
                 "ok"
-                if model["status"] == "ok" and chat_ready and code_ready
+                if model["status"] == "ok" and chat_ready and code_ready and desktop_ready
                 else "degraded"
             ),
             "database": "ok",
             "model_endpoint": model,
             "chat_model_endpoint": chat_model,
             "coding_model_endpoint": coding_model,
+            "desktop_model_endpoint": desktop_model,
+            "desktop_control": {
+                "enabled": container.settings.enable_desktop_control,
+                "capture_mode": container.settings.desktop_capture_mode,
+                "allowed_apps": container.settings.desktop_allowed_apps,
+                "require_confirmation": container.settings.desktop_require_confirmation,
+            },
             "local_workspaces": {
                 "enabled": container.settings.enable_local_workspaces,
                 "allowed_roots": [
@@ -199,6 +250,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             if len(parts) != 3 or parts[-1] != "diff.patch":
                 raise HTTPException(status_code=404, detail="artifact not found")
             require_local_workspace_request(request, get_container(request).settings)
+        elif len(normalized.split("/")) >= 2 and normalized.split("/")[1] == "desktop":
+            require_desktop_request(request, get_container(request).settings)
         try:
             path = get_container(request).artifacts.resolve_public_path(normalized)
         except ValueError as exc:
@@ -224,8 +277,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 await container.repository.get_code_run_by_session(session_id)
                 is_code_session = True
             except NotFoundError:
-                await websocket.close(code=4404, reason="session not found")
-                return
+                try:
+                    await container.repository.get_desktop_run_by_session(session_id)
+                    is_code_session = True
+                except NotFoundError:
+                    await websocket.close(code=4404, reason="session not found")
+                    return
         host = websocket.client.host if websocket.client else ""
         if is_code_session and not (
             is_loopback_host(host)

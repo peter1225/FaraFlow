@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from pydantic import BaseModel, Field, ValidationError
 
 from faraflow.code.service import CodeRunService
+from faraflow.desktop.service import DesktopRunService
 from faraflow.domain.schemas import (
     ChatCreate,
     ChatMessageCreate,
@@ -14,6 +15,7 @@ from faraflow.domain.schemas import (
     ChatSummary,
     ChatView,
     CodeRunCreate,
+    DesktopRunCreate,
     TaskCreate,
 )
 from faraflow.infra.repository import Repository
@@ -38,9 +40,14 @@ subject to FaraFlow's approval policy.
 Use mode=code when the user asks to inspect, explain, create, modify, delete, or refactor files in
 the workspace associated with this chat. Code mode is only available when a workspace is bound.
 
+Use mode=desktop only when the user explicitly asks to control the local desktop, such as clicking
+or typing in a selected application window. Desktop mode is available only when local desktop
+control is enabled and always requires the user to select a window; risky actions require approval.
+Never use desktop mode for ordinary questions or web browsing.
+
 Return exactly one JSON object and no markdown, XML, tool call, or surrounding commentary:
 {
-  "mode": "chat" | "automation" | "code",
+  "mode": "chat" | "automation" | "code" | "desktop",
   "reply": "answer or acknowledgement",
   "task_name": "short title when mode is automation",
   "description": "complete browser goal when mode is automation",
@@ -71,10 +78,15 @@ _CODE_HINT = re.compile(
     r"code|source|repository|repo|refactor|modify.{0,12}file|fix.{0,12}bug)",
     re.IGNORECASE,
 )
+_DESKTOP_HINT = re.compile(
+    r"(控制(?:我的)?(?:电脑|桌面)|桌面操作|鼠标|键盘|打开应用|点击屏幕|"
+    r"computer use|control (?:my )?(?:computer|desktop)|click the screen|type into)",
+    re.IGNORECASE,
+)
 
 
 class ChatRouteDecision(BaseModel):
-    mode: Literal["chat", "automation", "code"]
+    mode: Literal["chat", "automation", "code", "desktop"]
     reply: str = ""
     task_name: str = ""
     description: str = ""
@@ -89,11 +101,20 @@ class ChatService:
         chat_model: ChatAdapter,
         tasks: TaskService,
         code_runs: Optional[CodeRunService] = None,
+        desktop_runs: Optional[DesktopRunService] = None,
     ) -> None:
         self.repository = repository
         self.chat_model = chat_model
         self.tasks = tasks
         self.code_runs = code_runs
+        self.desktop_runs = desktop_runs
+
+    @property
+    def _desktop_enabled(self) -> bool:
+        return bool(
+            self.desktop_runs is not None
+            and self.desktop_runs.settings.enable_desktop_control
+        )
 
     async def create(self, request: ChatCreate) -> ChatView:
         chat = await self.repository.create_chat(request)
@@ -137,6 +158,8 @@ class ChatService:
         chat, conversation = await self._begin_turn(chat_id, request)
         if request.requested_mode == "code":
             return await self._respond_code(chat, chat_id, request)
+        if request.requested_mode == "desktop":
+            return await self._respond_desktop(chat_id, request)
         if request.requested_mode == "automation":
             decision = ChatRouteDecision(
                 mode="automation",
@@ -167,7 +190,10 @@ class ChatService:
             )
         except ModelEndpointError:
             decision = self.parse_route(
-                "", request.content, has_workspace=chat.workspace_id is not None
+                "",
+                request.content,
+                has_workspace=chat.workspace_id is not None,
+                has_desktop=self._desktop_enabled,
             )
             if decision.mode == "chat":
                 await self.repository.append_chat_message(
@@ -182,11 +208,16 @@ class ChatService:
                 return ChatReply(route="chat", chat=await self.get(chat_id), task=None)
         else:
             decision = self.parse_route(
-                raw, request.content, has_workspace=chat.workspace_id is not None
+                raw,
+                request.content,
+                has_workspace=chat.workspace_id is not None,
+                has_desktop=self._desktop_enabled,
             )
 
         if decision.mode == "code":
             return await self._respond_code(chat, chat_id, request)
+        if decision.mode == "desktop":
+            return await self._respond_desktop(chat_id, request)
 
         task = None
         if decision.mode == "automation":
@@ -204,7 +235,7 @@ class ChatService:
     async def respond_stream(
         self, chat_id: str, request: ChatMessageCreate
     ) -> AsyncIterator[Dict[str, Any]]:
-        if request.requested_mode in {"automation", "code"}:
+        if request.requested_mode in {"automation", "code", "desktop"}:
             reply = await self.respond(chat_id, request)
             yield {"type": "done", "reply": reply.model_dump(mode="json")}
             return
@@ -221,7 +252,10 @@ class ChatService:
                 )
             except ModelEndpointError:
                 decision = self.parse_route(
-                    "", request.content, has_workspace=chat.workspace_id is not None
+                    "",
+                    request.content,
+                    has_workspace=chat.workspace_id is not None,
+                    has_desktop=self._desktop_enabled,
                 )
                 if decision.mode == "chat":
                     await self.repository.append_chat_message(
@@ -238,11 +272,18 @@ class ChatService:
                     return
             else:
                 decision = self.parse_route(
-                    raw, request.content, has_workspace=chat.workspace_id is not None
+                    raw,
+                    request.content,
+                    has_workspace=chat.workspace_id is not None,
+                    has_desktop=self._desktop_enabled,
                 )
 
             if decision.mode == "code":
                 reply = await self._respond_code(chat, chat_id, request)
+                yield {"type": "done", "reply": reply.model_dump(mode="json")}
+                return
+            if decision.mode == "desktop":
+                reply = await self._respond_desktop(chat_id, request)
                 yield {"type": "done", "reply": reply.model_dump(mode="json")}
                 return
             if decision.mode == "automation":
@@ -346,6 +387,34 @@ class ChatService:
         )
         return ChatReply(route="code", chat=await self.get(chat_id), code_run=code_run)
 
+    async def _respond_desktop(
+        self, chat_id: str, request: ChatMessageCreate
+    ) -> ChatReply:
+        if self.desktop_runs is None:
+            raise RuntimeError("desktop runtime is unavailable")
+        desktop_run = await self.desktop_runs.create(
+            DesktopRunCreate(
+                instruction=request.content,
+                chat_id=chat_id,
+                auto_start=request.auto_start,
+            )
+        )
+        reply = (
+            "已创建桌面控制任务。请先选择一个允许控制的应用窗口；"
+            "涉及输入、拖动或快捷键时会在执行前请求确认。"
+        )
+        await self.repository.append_chat_message(
+            chat_id=chat_id,
+            role="assistant",
+            content=reply,
+            mode="desktop",
+            desktop_run_id=desktop_run.desktop_run_id,
+            metadata={"desktop_run_id": desktop_run.desktop_run_id},
+        )
+        return ChatReply(
+            route="desktop", chat=await self.get(chat_id), desktop_run=desktop_run
+        )
+
     async def _respond_automation(
         self,
         chat: Any,
@@ -376,7 +445,12 @@ class ChatService:
 
     @classmethod
     def parse_route(
-        cls, raw: str, user_message: str, *, has_workspace: bool = False
+        cls,
+        raw: str,
+        user_message: str,
+        *,
+        has_workspace: bool = False,
+        has_desktop: bool = False,
     ) -> ChatRouteDecision:
         decoder = json.JSONDecoder()
         for index, character in enumerate(raw):
@@ -386,12 +460,16 @@ class ChatService:
                 value, _ = decoder.raw_decode(raw[index:])
                 if isinstance(value, dict):
                     decision = ChatRouteDecision.model_validate(value)
-                    if decision.mode != "code" or has_workspace:
+                    if (decision.mode != "code" or has_workspace) and (
+                        decision.mode != "desktop" or has_desktop
+                    ):
                         return decision
             except (json.JSONDecodeError, ValidationError):
                 continue
         if has_workspace and _CODE_HINT.search(user_message):
             return ChatRouteDecision(mode="code", reply="已创建代码任务。")
+        if has_desktop and _DESKTOP_HINT.search(user_message):
+            return ChatRouteDecision(mode="desktop", reply="已创建桌面控制任务。")
         if _BROWSER_HINT.search(user_message) and not _BROWSER_NEGATION.search(user_message):
             return ChatRouteDecision(
                 mode="automation",
@@ -474,6 +552,7 @@ class ChatService:
             mode=record.mode,
             task_id=record.task_id,
             code_run_id=record.code_run_id,
+            desktop_run_id=record.desktop_run_id,
             metadata=record.message_metadata,
             created_at=record.created_at,
         )

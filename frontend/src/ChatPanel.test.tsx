@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ChatPanel } from "./App";
-import type { Chat } from "./types";
+import type { Chat, DesktopRun } from "./types";
 
 const scrollIntoView = vi.fn();
 
@@ -154,5 +154,49 @@ describe("ChatPanel scrolling", () => {
     fireEvent.click(screen.getByRole("button", { name: "发送" }));
 
     expect(onSend).toHaveBeenCalledWith("请认真分析这个问题", "auto", true);
+  });
+
+  it("explains failed desktop runs in Chinese and offers retry", () => {
+    const chat = makeChat(1);
+    chat.messages[0] = {
+      ...chat.messages[0],
+      role: "assistant",
+      mode: "desktop",
+      desktop_run_id: "desktop_failed",
+      content: "已创建桌面控制任务。",
+    };
+    const desktopRun: DesktopRun = {
+      desktop_run_id: "desktop_failed",
+      chat_id: chat.chat_id,
+      session_id: "session_failed",
+      instruction: "创建文件夹",
+      status: "FAILED",
+      target_window_id: 100,
+      target_title: "Program Manager",
+      target_process: "explorer.exe",
+      error: {
+        message: "desktop response did not contain a desktop action or final block",
+      },
+      created_at: "2026-08-12T00:00:00Z",
+      actions: [],
+    };
+
+    render(
+      <ChatPanel
+        chat={chat}
+        tasks={[]}
+        codeRuns={[]}
+        desktopRuns={[desktopRun]}
+        sending={false}
+        onSend={vi.fn().mockResolvedValue(undefined)}
+        onOpenTask={vi.fn()}
+        onOpenWorkspace={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Windows 桌面")).toBeInTheDocument();
+    expect(screen.getByText("执行失败")).toBeInTheDocument();
+    expect(screen.getByText("为什么失败？")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新尝试" })).toBeInTheDocument();
   });
 });
