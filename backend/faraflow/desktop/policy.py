@@ -17,6 +17,10 @@ class DesktopPolicy:
         r"WIN(?:\s*\+\s*[A-Z0-9]+)?|CTRL\s*\+\s*ALT\s*\+\s*DELETE)",
         re.IGNORECASE,
     )
+    _blocked_keys = re.compile(
+        r"(?:WIN\s*\+\s*(?:R|L)|CTRL\s*\+\s*ALT\s*\+\s*DELETE)",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -24,10 +28,12 @@ class DesktopPolicy:
         allowed_apps: Iterable[str] = (),
         max_actions: int = 50,
         require_confirmation: bool = True,
+        unattended_mode: bool = False,
     ) -> None:
         self.allowed_apps = {item.strip().lower() for item in allowed_apps if item.strip()}
         self.max_actions = max_actions
         self.require_confirmation = require_confirmation
+        self.unattended_mode = unattended_mode
 
     def validate_target(self, target: Optional[WindowInfo]) -> WindowInfo:
         if target is None:
@@ -51,6 +57,10 @@ class DesktopPolicy:
             return
         if action.action == "key_press":
             keys = "+".join(action.keys)
+            if self._blocked_keys.search(keys):
+                raise DesktopPolicyError(
+                    f"system shortcut {keys} is not available to desktop automation"
+                )
             if self._dangerous_keys.search(keys):
                 return
         if action.action in {
@@ -72,7 +82,34 @@ class DesktopPolicy:
         }:
             raise DesktopPolicyError("focus_window cannot escape the selected target window")
 
+    @staticmethod
+    def validate_focus_transition(current: WindowInfo, candidate: WindowInfo) -> None:
+        """Permit a model-selected window only inside the active app boundary."""
+        if DesktopPolicy._is_desktop(current):
+            return
+        if (
+            current.process_name
+            and candidate.process_name
+            and current.process_name.casefold() == candidate.process_name.casefold()
+        ):
+            return
+        raise DesktopPolicyError(
+            "focus_window can only switch between windows of the selected application"
+        )
+
+    @staticmethod
+    def _is_desktop(target: WindowInfo) -> bool:
+        return (
+            target.process_name.casefold() == "explorer.exe"
+            and target.title.casefold() in {"program manager", "windows desktop", "desktop"}
+        )
+
     def requires_approval(self, action: DesktopAction) -> bool:
+        # Unattended mode is an explicit local opt-in. It removes approval
+        # pauses for the finite desktop action set, while check_action still
+        # rejects shortcuts that can open a command runner or security desktop.
+        if self.unattended_mode:
+            return False
         if action.sensitive:
             return True
         # System-level shortcuts can escape the selected application, expose

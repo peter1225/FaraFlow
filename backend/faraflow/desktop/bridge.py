@@ -4,7 +4,7 @@ import io
 import os
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .protocol import DesktopAction
 
@@ -68,6 +68,24 @@ class DesktopBridge:
         "F11": 0x7A,
         "F12": 0x7B,
     }
+    _KEY_ALIASES = {
+        "ESCAPE": "ESC",
+        "RETURN": "ENTER",
+        "CONTROL": "CTRL",
+        "WINDOWS": "WIN",
+        "WINDOWSKEY": "WIN",
+        "META": "WIN",
+        "SUPER": "WIN",
+        "SPACEBAR": "SPACE",
+        "PGUP": "PAGEUP",
+        "PGDN": "PAGEDOWN",
+        "DEL": "DELETE",
+        "INS": "INSERT",
+        "ARROWLEFT": "LEFT",
+        "ARROWRIGHT": "RIGHT",
+        "ARROWUP": "UP",
+        "ARROWDOWN": "DOWN",
+    }
 
     def __init__(self) -> None:
         self._user32 = None
@@ -121,6 +139,88 @@ class DesktopBridge:
             if window.window_id == window_id:
                 return window
         raise DesktopBridgeError(f"window {window_id} is not visible")
+
+    def foreground_window(self) -> Optional[WindowInfo]:
+        """Return the visible top-level foreground window, when it is controllable."""
+        self._require_windows()
+        window_id = int(self._user32.GetForegroundWindow() or 0)
+        if not window_id or not self._user32.IsWindowVisible(window_id):
+            return None
+        length = self._user32.GetWindowTextLengthW(window_id)
+        if length <= 0:
+            return None
+        title_buffer = ctypes.create_unicode_buffer(length + 1)
+        self._user32.GetWindowTextW(window_id, title_buffer, length + 1)
+        title = title_buffer.value.strip()
+        rect = self._rect(window_id)
+        if not title or rect[2] <= 0 or rect[3] <= 0:
+            return None
+        return WindowInfo(
+            window_id=window_id,
+            title=title,
+            process_name=self._process_name(window_id),
+            x=rect[0],
+            y=rect[1],
+            width=rect[2],
+            height=rect[3],
+        )
+
+    def followup_window(
+        self,
+        current: WindowInfo,
+        *,
+        previous_foreground_id: Optional[int],
+        known_window_ids: Iterable[int],
+    ) -> Optional[WindowInfo]:
+        """Find an app window opened or activated by the most recent action.
+
+        A foreground transition is preferred because it also handles an existing
+        minimized application. If Windows does not grant foreground focus, a new
+        sufficiently large top-level window is used as a conservative fallback.
+        """
+        if not self._is_desktop_target(current):
+            # Stay inside the selected application process, but follow a new
+            # main window that replaces a launcher/splash window.
+            same_process = [
+                window
+                for window in self.list_windows()
+                if window.window_id != current.window_id
+                and current.process_name
+                and window.process_name.casefold() == current.process_name.casefold()
+            ]
+            foreground = self.foreground_window()
+            if foreground is not None and any(
+                window.window_id == foreground.window_id for window in same_process
+            ):
+                return foreground
+            if not same_process:
+                return None
+            largest = max(same_process, key=lambda window: window.width * window.height)
+            if largest.width * largest.height > current.width * current.height:
+                return largest
+            return None
+        foreground = self.foreground_window()
+        if (
+            foreground is not None
+            and foreground.window_id != current.window_id
+            and foreground.window_id != previous_foreground_id
+            and not self._is_desktop_target(foreground)
+        ):
+            return foreground
+
+        known = set(known_window_ids)
+        candidates = [
+            window
+            for window in self.list_windows()
+            if window.window_id not in known
+            and window.window_id != current.window_id
+            and not self._is_desktop_target(window)
+            and window.width >= 240
+            and window.height >= 160
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda window: window.width * window.height)
 
     def capture(self, window: WindowInfo) -> bytes:
         self._require_windows()
@@ -183,8 +283,21 @@ class DesktopBridge:
             if (
                 action.action != "drag"
                 and self._is_desktop_target(target)
-                and self._desktop_surface_is_foreground()
             ):
+                # ``Program Manager`` is the explicitly selected target. Do not
+                # gate its FolderView path on GetForegroundWindow(): Windows 11
+                # frequently reports the desktop list view, WorkerW, the taskbar,
+                # or a transient shell menu here even though the desktop is the
+                # visible capture target. That caused desktop double-clicks to
+                # fall back to unreliable generic mouse injection.
+                self._focus_desktop_icons(target.window_id)
+                if action.action == "double_click":
+                    self._open_desktop_item(start)
+                    return {
+                        "coordinate": list(start),
+                        "status": "executed",
+                        "method": "desktop_context_open",
+                    }
                 self._post_desktop_pointer(action.action, start)
                 return {"coordinate": list(start), "status": "executed"}
             if action.action == "drag":
@@ -213,7 +326,14 @@ class DesktopBridge:
             self._type_text(action.text or "")
             return {"characters": len(action.text or ""), "status": "executed"}
         if action.action == "key_press":
-            self._key_press(action.keys)
+            if self._is_desktop_target(target) and self._is_escape(action.keys):
+                self._dismiss_desktop_menu(target.window_id)
+            else:
+                if self._is_desktop_target(target):
+                    # Explorer must own keyboard focus for ENTER and navigation
+                    # keys to activate the icon selected by pointer messages.
+                    self._focus_desktop_icons(target.window_id)
+                self._key_press(action.keys)
             return {"keys": list(action.keys), "status": "executed"}
         if action.action == "wait":
             time.sleep(action.seconds or 0)
@@ -235,6 +355,46 @@ class DesktopBridge:
         buffer = ctypes.create_unicode_buffer(256)
         self._user32.GetClassNameW(foreground, buffer, len(buffer))
         return buffer.value in {"WorkerW", "Progman"}
+
+    def _is_escape(self, keys: List[str]) -> bool:
+        expanded = [part for key in keys for part in key.split("+") if part.strip()]
+        return len(expanded) == 1 and self._virtual_key(expanded[0]) == self._KEYS["ESC"]
+
+    def _dismiss_desktop_menu(self, program_manager_id: int) -> None:
+        """Close an Explorer desktop context menu even when FolderView lost focus."""
+        foreground = int(self._user32.GetForegroundWindow() or 0)
+        view = int(self._desktop_list_view() or 0)
+        recipients = []
+        for window_id in (foreground, view, int(program_manager_id)):
+            if window_id and window_id not in recipients:
+                recipients.append(window_id)
+        # WM_CANCELMODE asks the menu owner to leave its modal menu loop. The
+        # explicit Escape messages cover modern shell surfaces whose popup menu
+        # is implemented outside the classic FolderView window.
+        for window_id in recipients:
+            self._user32.PostMessageW(window_id, 0x001F, 0, 0)
+            self._user32.PostMessageW(window_id, 0x0100, self._KEYS["ESC"], 0)
+            self._user32.PostMessageW(window_id, 0x0101, self._KEYS["ESC"], 0)
+        self._key_press(["ESC"])
+
+    def _open_desktop_item(self, screen_point: Tuple[int, int]) -> None:
+        """Select a desktop icon and invoke it inside Explorer's FolderView.
+
+        Context menus are implemented differently across Windows 10/11 builds
+        and may not expose a detectable top-level menu window. Explorer's icon
+        list itself has stable semantics: select the model-chosen item, then
+        deliver Return directly to that control.
+        """
+        view = self._desktop_list_view()
+        if not view:
+            raise DesktopBridgeError("Windows desktop icon view is not available")
+        self._post_desktop_pointer("click", screen_point)
+        time.sleep(0.08)
+        # WM_KEYDOWN/WM_KEYUP are posted directly to FolderView, so activation
+        # does not depend on Windows granting keyboard focus to the backend.
+        for message in (0x0100, 0x0101):
+            if not self._user32.PostMessageW(view, message, self._KEYS["ENTER"], 0):
+                raise DesktopBridgeError("Explorer rejected the desktop open command")
 
     def _post_desktop_pointer(
         self, action_name: str, screen_point: Tuple[int, int]
@@ -416,16 +576,22 @@ class DesktopBridge:
             self._send_key(0, ord(char), unicode=True, key_up=True)
 
     def _key_press(self, keys: List[str]) -> None:
-        virtual_keys = [self._virtual_key(key) for key in keys]
+        # Vision models may return either ["CTRL", "L"] or ["Ctrl+L"].
+        # Accept both representations while keeping policy checks on the
+        # original action payload.
+        expanded_keys = [part for key in keys for part in key.split("+") if part.strip()]
+        virtual_keys = [self._virtual_key(key) for key in expanded_keys]
         for key in virtual_keys:
             self._send_key(key, 0)
         for key in reversed(virtual_keys):
             self._send_key(key, 0, key_up=True)
 
     def _virtual_key(self, key: str) -> int:
-        normalized = key.strip().upper().replace("+", "")
-        if normalized in self._KEYS:
-            return self._KEYS[normalized]
+        normalized = key.strip().upper()
+        compact = normalized.replace(" ", "").replace("_", "").replace("-", "")
+        canonical = self._KEY_ALIASES.get(compact, compact)
+        if canonical in self._KEYS:
+            return self._KEYS[canonical]
         if len(normalized) == 1 and normalized.isprintable():
             return ord(normalized)
         raise DesktopBridgeError(f"unsupported key: {key}")

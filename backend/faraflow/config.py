@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     desktop_capture_mode: str = "window"
     desktop_allowed_apps: List[str] = Field(default_factory=list)
     desktop_require_confirmation: bool = True
+    desktop_unattended_mode: bool = False
 
     default_allowed_domains: List[str] = Field(default_factory=lambda: ["bing.com"])
     allow_private_networks: bool = False

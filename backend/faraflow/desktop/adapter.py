@@ -98,7 +98,12 @@ class DesktopAdapter:
             raise ValueError("desktop response content was not text")
         return content
 
-    async def next_decision(self, conversation: List[Dict[str, Any]]) -> DesktopDecision:
+    async def next_decision(
+        self,
+        conversation: List[Dict[str, Any]],
+        *,
+        allow_terminal: bool = True,
+    ) -> DesktopDecision:
         if not self.configured:
             raise ModelEndpointError("desktop model is not configured")
         payload: Dict[str, Any] = {
@@ -109,7 +114,9 @@ class DesktopAdapter:
             ],
             "temperature": 0.0,
             "max_tokens": self.settings.desktop_max_tokens,
-            "response_format": build_desktop_response_format(),
+            "response_format": build_desktop_response_format(
+                allow_terminal=allow_terminal
+            ),
         }
         last_error: Optional[Exception] = DesktopProtocolError("no response")
         for attempt in range(3):

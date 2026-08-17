@@ -94,6 +94,7 @@ def build_container(settings: Settings) -> Container:
         allowed_apps=settings.desktop_allowed_apps,
         max_actions=settings.desktop_max_steps,
         require_confirmation=settings.desktop_require_confirmation,
+        unattended_mode=settings.desktop_unattended_mode,
     )
     desktop_runtime = DesktopRuntime(
         settings,
@@ -233,6 +234,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "capture_mode": container.settings.desktop_capture_mode,
                 "allowed_apps": container.settings.desktop_allowed_apps,
                 "require_confirmation": container.settings.desktop_require_confirmation,
+                "unattended_mode": container.settings.desktop_unattended_mode,
             },
             "local_workspaces": {
                 "enabled": container.settings.enable_local_workspaces,

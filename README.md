@@ -134,17 +134,21 @@ FARAFLOW_CHAT_MODEL=
 对话模型；否则普通聊天会复用 `FARAFLOW_FARA_*`。`/health/ready` 会分别显示浏览器模型、
 对话模型、代码模型和桌面模型状态。
 
-当前内网部署可以将普通聊天和代码模型指向 110 服务器上的 Qwen vLLM，将浏览器和桌面
-控制指向 27B Fara vLLM（端口和模型名按服务器实际状态调整）：
+当前内网部署可以将普通聊天和代码模型指向 120 服务器上的 Ollama Gemma，将浏览器和桌面
+控制指向 110 服务器上的 27B Fara vLLM（端口和模型名按服务器实际状态调整）：
 
 ```dotenv
-FARAFLOW_CHAT_BASE_URL=http://10.65.1.110:8002/v1
-FARAFLOW_CHAT_MODEL=qwen-27b-int4
-FARAFLOW_CODE_BASE_URL=http://10.65.1.110:8002/v1
-FARAFLOW_CODE_MODEL=qwen-27b-int4
+FARAFLOW_CHAT_BASE_URL=http://10.65.1.120:11434/v1
+FARAFLOW_CHAT_MODEL=gemma4:26b
+FARAFLOW_CODE_BASE_URL=http://10.65.1.120:11434/v1
+FARAFLOW_CODE_MODEL=gemma4:26b
 FARAFLOW_FARA_BASE_URL=http://10.65.1.110:8003/v1
 FARAFLOW_FARA_MODEL=microsoft/Fara1.5-27B
 ```
+
+The model routing is intentionally split: `FARAFLOW_FARA_*` handles browser
+automation, `FARAFLOW_DESKTOP_*` handles computer control, and both
+`FARAFLOW_CHAT_*` and `FARAFLOW_CODE_*` use the Gemma endpoint.
 普通聊天使用 NDJSON 流式接口逐段更新前端；对支持 thinking 开关的 Qwen/vLLM
 部署，可以设置 `FARAFLOW_CHAT_DISABLE_THINKING=true` 作为默认值。聊天输入区的“深度
 思考”按钮允许用户为单条消息覆盖默认值；开启后，模型返回的思考文本会实时显示在
@@ -158,9 +162,9 @@ FARAFLOW_API_HOST=127.0.0.1
 FARAFLOW_ENABLE_LOCAL_WORKSPACES=true
 FARAFLOW_WORKSPACE_ALLOWED_ROOTS=["C:/Users/Peter/Desktop"]
 FARAFLOW_CODE_WORK_ROOT=./data/code-workspaces
-FARAFLOW_CODE_BASE_URL=http://10.65.1.110:8002/v1
+FARAFLOW_CODE_BASE_URL=http://10.65.1.120:11434/v1
 FARAFLOW_CODE_API_KEY=not-needed
-FARAFLOW_CODE_MODEL=qwen-27b-int4
+FARAFLOW_CODE_MODEL=gemma4:26b
 FARAFLOW_CODE_MAX_STEPS=50
 FARAFLOW_CODE_MAX_RUNTIME_MINUTES=20
 FARAFLOW_CODE_MAX_CONCURRENT_RUNS=1

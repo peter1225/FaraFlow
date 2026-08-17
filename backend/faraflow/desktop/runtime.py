@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from faraflow.domain.enums import DesktopRunStatus
 from faraflow.domain.schemas import SessionEvent
@@ -179,6 +179,8 @@ class DesktopRuntime:
                     "桌面任务开始执行",
                     {"desktop_run_id": desktop_run_id, "target": target.as_dict()},
                 )
+                visible_windows = await asyncio.to_thread(self.bridge.list_windows)
+                known_window_ids = {window.window_id for window in visible_windows}
                 if approved_action is not None:
                     # Resume on the current desktop after approval. Re-running
                     # prepare_target and the initial screenshot would make the
@@ -203,8 +205,30 @@ class DesktopRuntime:
                         subdirectory="desktop",
                     )
                     try:
+                        foreground_before = await asyncio.to_thread(
+                            self.bridge.foreground_window
+                        )
                         result = await asyncio.to_thread(
                             self.bridge.execute, approved_action, target
+                        )
+                        if approved_action.action not in {
+                            "screenshot",
+                            "list_windows",
+                            "wait",
+                        }:
+                            await asyncio.sleep(0.75)
+                        target, switched = await self._follow_target_after_action(
+                            desktop_run_id,
+                            record.session_id,
+                            target,
+                            foreground_before,
+                            known_window_ids,
+                        )
+                        if switched:
+                            result["target_switched"] = target.as_dict()
+                        visible_windows = await asyncio.to_thread(self.bridge.list_windows)
+                        known_window_ids.update(
+                            window.window_id for window in visible_windows
                         )
                         after = await asyncio.to_thread(self.bridge.capture, target)
                     except (DesktopBridgeError, DesktopPolicyError) as exc:
@@ -269,6 +293,9 @@ class DesktopRuntime:
                     first_step = 1
                 last_action_signature: Optional[str] = None
                 repeated_action_count = 0
+                rejected_blocker_finals = 0
+                rejected_handoffs = 0
+                force_action_next = False
                 for step_no in range(first_step, self.settings.desktop_max_steps + 1):
                     if time.monotonic() >= deadline:
                         raise TimeoutError("desktop run exceeded maximum runtime")
@@ -283,8 +310,106 @@ class DesktopRuntime:
                             },
                         )()
                     else:
-                        decision = await self.adapter.next_decision(conversation)
+                        decision = await self.adapter.next_decision(
+                            conversation,
+                            allow_terminal=not force_action_next,
+                        )
+                        force_action_next = False
                     pending = None
+                    if decision.kind == "handoff":
+                        summary = decision.answer or "Desktop task requires user assistance."
+                        if rejected_handoffs == 0:
+                            rejected_handoffs = 1
+                            force_action_next = True
+                            corrective_screenshot = await asyncio.to_thread(
+                                self.bridge.capture, target
+                            )
+                            conversation.append(
+                                {"role": "assistant", "content": decision.raw_response}
+                            )
+                            conversation.append(
+                                self.adapter.observation_message(
+                                    (
+                                        "Re-check the latest screenshot before requesting user "
+                                        "assistance. A saved account/avatar with a visible Login "
+                                        "or Sign in button does not require entering a secret: "
+                                        "click that button now and inspect the next screenshot. "
+                                        "Only return handoff if the updated screen visibly asks "
+                                        "for a password, verification code, QR confirmation, UAC, "
+                                        "or another user-only interaction."
+                                    ),
+                                    corrective_screenshot,
+                                )
+                            )
+                            await self.emit(
+                                record.session_id,
+                                "desktop.handoff.rejected",
+                                (
+                                    "The first handoff request was rejected so the model can "
+                                    "try the visible login action."
+                                ),
+                                {"desktop_run_id": desktop_run_id},
+                            )
+                            continue
+                        await self.repository.update_desktop_run(
+                            desktop_run_id,
+                            status=DesktopRunStatus.HANDOFF,
+                            final_summary=summary,
+                        )
+                        await self.emit(
+                            record.session_id,
+                            "desktop.run.handoff",
+                            summary,
+                            {"desktop_run_id": desktop_run_id},
+                        )
+                        return
+                    if decision.kind == "final" and self._looks_like_blocker(
+                        decision.answer
+                    ):
+                        summary = decision.answer or "Desktop task requires user assistance."
+                        if rejected_blocker_finals == 0:
+                            rejected_blocker_finals = 1
+                            corrective_screenshot = await asyncio.to_thread(
+                                self.bridge.capture, target
+                            )
+                            conversation.append(
+                                {"role": "assistant", "content": decision.raw_response}
+                            )
+                            conversation.append(
+                                self.adapter.observation_message(
+                                    (
+                                        "This is a blocker, not successful completion. Do not "
+                                        "return final. If the screenshot shows a saved account "
+                                        "and a visible Login/Sign in button, click it before "
+                                        "assuming a password or verification is required. Only "
+                                        "return handoff when the latest screenshot actually "
+                                        "shows a user-only credential or confirmation prompt."
+                                    ),
+                                    corrective_screenshot,
+                                )
+                            )
+                            await self.emit(
+                                record.session_id,
+                                "desktop.final.rejected",
+                                (
+                                    "The model reported a blocker as completion and was "
+                                    "asked to continue."
+                                ),
+                                {"desktop_run_id": desktop_run_id},
+                            )
+                            continue
+                        await self.repository.update_desktop_run(
+                            desktop_run_id,
+                            status=DesktopRunStatus.HANDOFF,
+                            final_summary=summary,
+                        )
+                        await self.emit(
+                            record.session_id,
+                            "desktop.run.handoff",
+                            summary,
+                            {"desktop_run_id": desktop_run_id},
+                        )
+                        return
                     if decision.kind == "final":
                         summary = decision.answer or "桌面任务已完成"
                         await self.repository.update_desktop_run(
@@ -302,6 +427,8 @@ class DesktopRuntime:
                     if decision.action is None:
                         raise DesktopProtocolError("desktop model returned no action")
                     action = decision.action
+                    rejected_blocker_finals = 0
+                    rejected_handoffs = 0
                     signature = action.model_dump_json(exclude_none=True)
                     if signature == last_action_signature:
                         repeated_action_count += 1
@@ -338,6 +465,34 @@ class DesktopRuntime:
                             f"desktop model repeated the same {action.action} action 3 times"
                         )
                     self.policy.check_action(action, step_no)
+                    if (
+                        action.action == "focus_window"
+                        and action.window_id is not None
+                        and action.window_id != target.window_id
+                    ):
+                        candidate = await asyncio.to_thread(
+                            self.bridge.get_window, action.window_id
+                        )
+                        self.policy.validate_focus_transition(target, candidate)
+                        target = candidate
+                        await self.repository.update_desktop_run(
+                            desktop_run_id,
+                            target_window_id=target.window_id,
+                            target_title=target.title,
+                            target_process=target.process_name,
+                            target_rect={
+                                "x": target.x,
+                                "y": target.y,
+                                "width": target.width,
+                                "height": target.height,
+                            },
+                        )
+                        await self.emit(
+                            record.session_id,
+                            "desktop.target.focused",
+                            f"已切换到同一应用窗口：{target.title}",
+                            target.as_dict(),
+                        )
                     self.policy.validate_window_target(action, target)
                     if self.policy.requires_approval(action):
                         summary, risk = self.policy.approval_summary(action)
@@ -384,12 +539,30 @@ class DesktopRuntime:
                         subdirectory="desktop",
                     )
                     try:
+                        foreground_before = await asyncio.to_thread(
+                            self.bridge.foreground_window
+                        )
                         result = await asyncio.to_thread(self.bridge.execute, action, target)
                         # Native desktop applications often update asynchronously
                         # after input. Capturing immediately feeds the model the
                         # pre-action frame and makes it repeat the same click.
                         if action.action not in {"screenshot", "list_windows", "wait"}:
                             await asyncio.sleep(0.75)
+                        target, switched = await self._follow_target_after_action(
+                            desktop_run_id,
+                            record.session_id,
+                            target,
+                            foreground_before,
+                            known_window_ids,
+                        )
+                        if switched:
+                            result["target_switched"] = target.as_dict()
+                            last_action_signature = None
+                            repeated_action_count = 0
+                        visible_windows = await asyncio.to_thread(self.bridge.list_windows)
+                        known_window_ids.update(
+                            window.window_id for window in visible_windows
+                        )
                         after = await asyncio.to_thread(self.bridge.capture, target)
                     except (DesktopBridgeError, DesktopPolicyError) as exc:
                         await self.repository.append_desktop_action(
@@ -456,3 +629,70 @@ class DesktopRuntime:
                     "桌面任务执行失败",
                     {"error_type": type(exc).__name__, "message": str(exc)},
                 )
+
+    @staticmethod
+    def _looks_like_blocker(summary: str) -> bool:
+        normalized = " ".join(summary.casefold().split())
+        blocker_markers = (
+            "cannot",
+            "can't",
+            "unable",
+            "need you",
+            "requires your",
+            "manual login",
+            "manually log",
+            "password",
+            "verification code",
+            "qr code",
+            "无法",
+            "不能",
+            "需要您",
+            "请您",
+            "手动登录",
+            "密码",
+            "验证码",
+            "二维码",
+            "敏感信息",
+        )
+        return any(marker in normalized for marker in blocker_markers)
+
+    async def _follow_target_after_action(
+        self,
+        desktop_run_id: str,
+        session_id: str,
+        current: WindowInfo,
+        previous_foreground: Optional[WindowInfo],
+        known_window_ids: Set[int],
+    ) -> Tuple[WindowInfo, bool]:
+        if not self.settings.desktop_unattended_mode:
+            return current, False
+        candidate = await asyncio.to_thread(
+            self.bridge.followup_window,
+            current,
+            previous_foreground_id=(
+                previous_foreground.window_id if previous_foreground else None
+            ),
+            known_window_ids=known_window_ids,
+        )
+        if candidate is None:
+            return current, False
+        self.policy.validate_target(candidate)
+        await self.repository.update_desktop_run(
+            desktop_run_id,
+            target_window_id=candidate.window_id,
+            target_title=candidate.title,
+            target_process=candidate.process_name,
+            target_rect={
+                "x": candidate.x,
+                "y": candidate.y,
+                "width": candidate.width,
+                "height": candidate.height,
+            },
+        )
+        await self.emit(
+            session_id,
+            "desktop.target.followed",
+            f"已自动切换到新前台窗口：{candidate.title}",
+            candidate.as_dict(),
+        )
+        return candidate, True
