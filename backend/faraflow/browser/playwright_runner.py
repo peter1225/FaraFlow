@@ -120,10 +120,14 @@ class BrowserPool:
         except KeyError as exc:
             raise LookupError(f"browser session {session_id} is not running") from exc
 
-    def _scale_coordinate(self, coordinate: Tuple[float, float]) -> Tuple[float, float]:
-        coordinate_space = self.settings.fara_coordinate_space
-        x = coordinate[0] * self.settings.browser_viewport_width / coordinate_space
-        y = coordinate[1] * self.settings.browser_viewport_height / coordinate_space
+    def _coordinate_css(self, coordinate: Tuple[float, float]) -> Tuple[float, float]:
+        """Runtime actions use Playwright CSS pixels after model adaptation."""
+        x, y = coordinate
+        if not (
+            0 <= x <= self.settings.browser_viewport_width
+            and 0 <= y <= self.settings.browser_viewport_height
+        ):
+            raise ValueError("runtime CSS coordinate is outside the viewport")
         return x, y
 
     async def screenshot(self, session_id: str, name: str) -> Tuple[bytes, str]:
@@ -147,7 +151,7 @@ class BrowserPool:
         self, session_id: str, coordinate: Tuple[float, float]
     ) -> Dict[str, str]:
         session = self.get_session(session_id)
-        x, y = self._scale_coordinate(coordinate)
+        x, y = self._coordinate_css(coordinate)
         result = await session.page.evaluate(
             """([x, y]) => {
               const element = document.elementFromPoint(x, y);
@@ -187,7 +191,7 @@ class BrowserPool:
                 "left_click_drag",
             }:
                 assert action.coordinate is not None
-                x, y = self._scale_coordinate(action.coordinate)
+                x, y = self._coordinate_css(action.coordinate)
                 if name == "mouse_move":
                     await page.mouse.move(x, y)
                 elif name == "left_click":

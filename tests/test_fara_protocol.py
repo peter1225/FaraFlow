@@ -4,6 +4,7 @@ import pytest
 from faraflow.model.fara_protocol import (
     ModelProtocolError,
     build_system_prompt,
+    parse_raw_tool_call,
     parse_tool_call,
 )
 
@@ -22,6 +23,30 @@ def test_parse_coordinate_action() -> None:
     assert decision.action.action == "left_click"
     assert decision.action.coordinate == (250, 750)
     assert decision.reasoning_present is True
+
+
+def test_raw_parser_accepts_pixel_coordinate_without_assuming_1000_space() -> None:
+    decision = parse_raw_tool_call(
+        tool_call({"action": "left_click", "coordinate": [1074, 437]})
+    )
+    assert decision.action.coordinate == (1074, 437)
+
+
+def test_terminate_requires_answer() -> None:
+    decision = parse_raw_tool_call(
+        tool_call(
+            {
+                "action": "terminate",
+                "answer": "The Minesweeper board has been solved successfully.",
+            }
+        )
+    )
+    assert decision.action.answer is not None
+
+
+def test_terminate_status_only_is_invalid() -> None:
+    with pytest.raises(ModelProtocolError):
+        parse_raw_tool_call(tool_call({"action": "terminate", "status": "success"}))
 
 
 def test_parse_string_arguments() -> None:
@@ -78,3 +103,16 @@ def test_system_prompt_contains_safety_and_schema() -> None:
     assert '"arguments":{...}' not in prompt
     assert "<function-name>" in prompt
     assert "<args-json-object>" in prompt
+
+
+def test_pixel_system_prompt_describes_screenshot_pixels() -> None:
+    prompt = build_system_prompt(
+        1440,
+        900,
+        coordinate_mode="pixel",
+        screenshot_width=1440,
+        screenshot_height=900,
+    )
+    assert "screenshot is 1440x900 pixels" in prompt
+    assert "screenshot pixels" in prompt
+    assert "1000x1000 model coordinate space" not in prompt

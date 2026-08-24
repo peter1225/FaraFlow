@@ -6,7 +6,13 @@ import httpx
 
 from faraflow.config import Settings
 
-from .fara_protocol import ModelDecision, ModelProtocolError, build_system_prompt, parse_tool_call
+from .coordinate_adapter import CoordinateMode, ObservationGeometry, adapt_action
+from .fara_protocol import (
+    ModelDecision,
+    ModelProtocolError,
+    build_system_prompt,
+    parse_raw_tool_call,
+)
 
 
 class ModelEndpointError(RuntimeError):
@@ -26,9 +32,23 @@ class FaraAdapter:
                 "Content-Type": "application/json",
             },
         )
+        self.coordinate_mode = CoordinateMode(settings.fara_coordinate_mode)
+        self.geometry = ObservationGeometry.full_viewport(
+            settings.browser_viewport_width,
+            settings.browser_viewport_height,
+        )
+        if self.coordinate_mode is CoordinateMode.PIXEL:
+            prompt_width = settings.browser_viewport_width
+            prompt_height = settings.browser_viewport_height
+        else:
+            prompt_width = settings.fara_coordinate_space
+            prompt_height = settings.fara_coordinate_space
         self.system_prompt = build_system_prompt(
-            settings.fara_coordinate_space,
-            settings.fara_coordinate_space,
+            prompt_width,
+            prompt_height,
+            coordinate_mode=self.coordinate_mode.value,
+            screenshot_width=settings.browser_viewport_width,
+            screenshot_height=settings.browser_viewport_height,
         )
 
     @staticmethod
@@ -100,9 +120,11 @@ class FaraAdapter:
         return content
 
     async def next_action(self, conversation: List[Dict[str, Any]]) -> ModelDecision:
-        messages = [{"role": "system", "content": self.system_prompt}]
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt}
+        ]
         messages.extend(self._trim_screenshots(conversation))
-        payload = {
+        payload: Dict[str, Any] = {
             "model": self.settings.fara_model,
             "messages": messages,
             "temperature": 0.0,
@@ -115,12 +137,25 @@ class FaraAdapter:
                 response.raise_for_status()
                 content = self._response_content(response.json())
                 try:
-                    return parse_tool_call(content)
+                    raw_decision = parse_raw_tool_call(content)
+                    try:
+                        action = adapt_action(
+                            raw_decision.action,
+                            self.coordinate_mode,
+                            self.geometry,
+                        )
+                    except ValueError as exc:
+                        raise ModelProtocolError(str(exc)) from exc
+                    return ModelDecision(
+                        action=action,
+                        raw_response=raw_decision.raw_response,
+                        reasoning_present=raw_decision.reasoning_present,
+                    )
                 except ModelProtocolError as exc:
                     last_error = exc
                     if attempt < 2:
-                        payload["messages"] = [
-                            *payload["messages"],
+                        messages = [
+                            *messages,
                             {"role": "assistant", "content": content},
                             {
                                 "role": "user",
@@ -134,6 +169,7 @@ class FaraAdapter:
                                 ),
                             },
                         ]
+                        payload["messages"] = messages
                         await asyncio.sleep(2**attempt)
                         continue
                     raise
@@ -173,8 +209,27 @@ class FaraAdapter:
         try:
             response = await self._client.get("/models", timeout=5.0)
             response.raise_for_status()
+            payload = response.json()
+            entries = payload.get("data") if isinstance(payload, dict) else None
+            model_ids = [
+                entry.get("id")
+                for entry in entries
+                if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+            ] if isinstance(entries, list) else []
+            if model_ids and self.settings.fara_model not in model_ids:
+                return {
+                    "status": "model_mismatch",
+                    "model": self.settings.fara_model,
+                    "available_models": model_ids,
+                }
+            if not model_ids:
+                return {
+                    "status": "unavailable",
+                    "model": self.settings.fara_model,
+                    "detail": "model endpoint returned no OpenAI-compatible model ids",
+                }
             return {"status": "ok", "model": self.settings.fara_model}
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             return {"status": "unavailable", "detail": str(exc)}
 
     async def close(self) -> None:

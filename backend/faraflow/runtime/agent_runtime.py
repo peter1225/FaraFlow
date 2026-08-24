@@ -23,6 +23,13 @@ TERMINAL_STATES = {
     SessionState.EXPIRED,
 }
 
+DUPLICATE_GUARDED_ACTIONS = {
+    "left_click",
+    "double_click",
+    "triple_click",
+    "right_click",
+}
+
 
 class AgentRuntime:
     def __init__(
@@ -84,6 +91,23 @@ class AgentRuntime:
             )
             self._jobs[session.session_id] = job
 
+    async def prepare_rerun(self, task_id: str) -> Any:
+        """Release runtime state and reset a terminal task for a fresh run."""
+        task = await self.repository.get_task(task_id)
+        session = await self.repository.get_session(task.session_id)
+        if SessionState(session.state) not in TERMINAL_STATES:
+            raise ConflictError(
+                "only a completed, failed, terminated, or expired task can be rerun"
+            )
+        async with self._job_lock:
+            existing = self._jobs.get(session.session_id)
+            if existing and not existing.done():
+                raise ConflictError("task is still running")
+            self._pause_requests.discard(session.session_id)
+            self._conversations.pop(session.session_id, None)
+        await self.browser_pool.close_session(session.session_id)
+        return await self.repository.reset_task_for_rerun(task_id)
+
     async def pause(self, task_id: str) -> None:
         task = await self.repository.get_task(task_id)
         session = await self.repository.get_session(task.session_id)
@@ -134,6 +158,8 @@ class AgentRuntime:
         deadline = time.monotonic() + int(runtime_policy.get("max_runtime_minutes", 30)) * 60
         max_retries = int(runtime_policy.get("max_step_retries", 3))
         consecutive_failures = 0
+        last_action_signature = str(runtime_state.get("last_action_signature", ""))
+        repeated_action_count = int(runtime_state.get("repeated_action_count", 0))
 
         try:
             await self.browser_pool.ensure_session(
@@ -319,6 +345,68 @@ class AgentRuntime:
                     )
                     return
 
+                action_signature = action.model_dump_json(exclude_none=True)
+                next_repeated_action_count = (
+                    repeated_action_count + 1
+                    if action_signature == last_action_signature
+                    else 1
+                )
+                if (
+                    not action_was_approved
+                    and action.action in DUPLICATE_GUARDED_ACTIONS
+                    and next_repeated_action_count == 2
+                ):
+                    last_action_signature = action_signature
+                    repeated_action_count = next_repeated_action_count
+                    observation = (
+                        "The exact same click action was already executed at the same "
+                        "coordinate and did not advance the task. Do not repeat it. "
+                        "Inspect the latest screenshot and choose a different safe action. "
+                        "If the task is complete, terminate with an answer."
+                    )
+                    screenshot, screenshot_ref = await self.browser_pool.screenshot(
+                        session_id, f"step_{action_count:03d}_duplicate.png"
+                    )
+                    conversation.append(
+                        self.fara.observation_message(observation, screenshot, facts=facts)
+                    )
+                    runtime_state.update(
+                        {
+                            "action_count": action_count,
+                            "facts": facts[-50:],
+                            "last_observation": observation,
+                            "last_action_signature": last_action_signature,
+                            "repeated_action_count": repeated_action_count,
+                        }
+                    )
+                    await self.repository.update_state(
+                        task_id,
+                        session_id,
+                        SessionState.RUNNING,
+                        runtime_state=runtime_state,
+                        last_screenshot_ref=screenshot_ref,
+                    )
+                    await self.emit(
+                        session_id,
+                        "action.duplicate_blocked",
+                        "已阻止相同坐标的重复点击，并要求模型改用其他操作",
+                        {
+                            "action": action.action,
+                            "parameters": self._redact_action(action),
+                            "repeat_count": repeated_action_count,
+                            "screenshot_ref": screenshot_ref,
+                        },
+                    )
+                    continue
+                if (
+                    not action_was_approved
+                    and action.action in DUPLICATE_GUARDED_ACTIONS
+                    and next_repeated_action_count >= 3
+                ):
+                    raise RuntimeError(
+                        f"browser model repeated the same {action.action} action 3 times"
+                    )
+
                 if (
                     not action_was_approved
                     and action.coordinate is not None
@@ -414,6 +502,8 @@ class AgentRuntime:
                     continue
 
                 action_count += 1
+                last_action_signature = action_signature
+                repeated_action_count = next_repeated_action_count
                 screenshot, screenshot_ref = await self.browser_pool.screenshot(
                     session_id, f"step_{action_count:03d}_after.png"
                 )
@@ -440,6 +530,8 @@ class AgentRuntime:
                         "facts": facts[-50:],
                         "last_observation": result.observation,
                         "current_url": result.url,
+                        "last_action_signature": last_action_signature,
+                        "repeated_action_count": repeated_action_count,
                     }
                 )
                 next_state = (

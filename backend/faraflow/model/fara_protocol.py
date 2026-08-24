@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import ast
 import json
+import math
 import re
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ActionName = Literal[
     "key",
@@ -52,55 +55,82 @@ class ModelProtocolError(ValueError):
     pass
 
 
-class ComputerAction(BaseModel):
+_COORDINATE_ACTIONS = {
+    "mouse_move",
+    "left_click",
+    "left_click_drag",
+    "right_click",
+    "double_click",
+    "triple_click",
+}
+
+
+def _validate_common_action_arguments(action: Any) -> None:
+    action_name = action.action
+    coordinate = action.coordinate
+    if action_name in _COORDINATE_ACTIONS and coordinate is None:
+        raise ValueError(f"{action_name} requires coordinate")
+    if coordinate is not None:
+        x, y = coordinate
+        if not all(math.isfinite(float(value)) for value in (x, y)):
+            raise ValueError("coordinates must contain finite numbers")
+    required = {
+        "key": ("keys", action.keys),
+        "type": ("text", action.text),
+        "scroll": ("pixels", action.pixels),
+        "hscroll": ("pixels", action.pixels),
+        "visit_url": ("url", action.url),
+        "web_search": ("query", action.query),
+        "read_page_answer_question": ("question", action.question),
+        "pause_and_memorize_fact": ("fact", action.fact),
+        "ask_user_question": ("question", action.question),
+        "wait": ("time", action.time),
+        "terminate": ("answer", action.answer),
+    }
+    if action_name in required:
+        field_name, value = required[action_name]
+        if value is None or value == [] or value == "":
+            raise ValueError(f"{action_name} requires {field_name}")
+    if action_name == "wait" and action.time is not None:
+        if not 0 <= float(action.time) <= 30:
+            raise ValueError("wait time must be between 0 and 30 seconds")
+
+
+class RawComputerAction(BaseModel):
+    """Model-emitted action with no assumed coordinate space.
+
+    Bounds are intentionally checked later by CoordinateAdapter because the
+    same XML protocol may contain pixel or normalized coordinates.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
     action: ActionName
-    keys: List[str] = Field(default_factory=list)
-    text: Optional[str] = None
-    coordinate: Optional[Tuple[float, float]] = None
-    pixels: Optional[float] = None
-    url: Optional[str] = None
-    query: Optional[str] = None
-    fact: Optional[str] = None
-    question: Optional[str] = None
-    time: Optional[float] = None
-    answer: Optional[str] = None
+    keys: list[str] = Field(default_factory=list)
+    text: str | None = None
+    coordinate: tuple[float, float] | None = None
+    pixels: float | None = None
+    url: str | None = None
+    query: str | None = None
+    fact: str | None = None
+    question: str | None = None
+    time: float | None = None
+    answer: str | None = None
 
     @model_validator(mode="after")
-    def validate_action_arguments(self) -> "ComputerAction":
-        coordinate_actions = {
-            "mouse_move",
-            "left_click",
-            "left_click_drag",
-            "right_click",
-            "double_click",
-            "triple_click",
-        }
-        if self.action in coordinate_actions and self.coordinate is None:
-            raise ValueError(f"{self.action} requires coordinate")
-        if self.coordinate is not None:
-            x, y = self.coordinate
-            if not (0 <= x <= 1000 and 0 <= y <= 1000):
-                raise ValueError("coordinates must be in Fara's 0..1000 coordinate space")
-        required = {
-            "key": ("keys", self.keys),
-            "type": ("text", self.text),
-            "scroll": ("pixels", self.pixels),
-            "hscroll": ("pixels", self.pixels),
-            "visit_url": ("url", self.url),
-            "web_search": ("query", self.query),
-            "read_page_answer_question": ("question", self.question),
-            "pause_and_memorize_fact": ("fact", self.fact),
-            "ask_user_question": ("question", self.question),
-            "wait": ("time", self.time),
-            "terminate": ("answer", self.answer),
-        }
-        if self.action in required:
-            field_name, value = required[self.action]
-            if value is None or value == [] or value == "":
-                raise ValueError(f"{self.action} requires {field_name}")
-        if self.action == "wait" and self.time is not None and not (0 <= self.time <= 30):
-            raise ValueError("wait time must be between 0 and 30 seconds")
+    def validate_action_arguments(self) -> RawComputerAction:
+        _validate_common_action_arguments(self)
         return self
+
+
+class ComputerAction(RawComputerAction):
+    """Runtime action whose coordinate is always in CSS pixels."""
+
+
+class RawModelDecision(BaseModel):
+    action: RawComputerAction
+    raw_response: str
+    reasoning_present: bool = False
 
 
 class ModelDecision(BaseModel):
@@ -112,7 +142,7 @@ class ModelDecision(BaseModel):
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
 
-def parse_tool_call(content: str) -> ModelDecision:
+def _decode_tool_call(content: str) -> tuple[dict[str, Any], str]:
     match = _TOOL_CALL_RE.search(content)
     if match is None:
         raise ModelProtocolError("Fara response did not contain a <tool_call> block")
@@ -135,19 +165,48 @@ def parse_tool_call(content: str) -> ModelDecision:
             raise ModelProtocolError("computer_use arguments were not valid JSON") from exc
     if not isinstance(arguments, dict):
         raise ModelProtocolError("computer_use arguments must be an object")
+    return arguments, content[: match.start()].strip()
+
+
+def parse_raw_tool_call(content: str) -> RawModelDecision:
+    arguments, reasoning = _decode_tool_call(content)
     try:
-        action = ComputerAction.model_validate(arguments)
+        action = RawComputerAction.model_validate(arguments)
     except ValueError as exc:
         raise ModelProtocolError(str(exc)) from exc
-    reasoning = content[: match.start()].strip()
-    return ModelDecision(
+    return RawModelDecision(
         action=action,
         raw_response=content,
         reasoning_present=bool(reasoning),
     )
 
 
-COMPUTER_USE_PARAMETERS: Dict[str, Any] = {
+def parse_tool_call(content: str) -> ModelDecision:
+    """Backward-compatible normalized parser for existing callers/tests.
+
+    New model-serving code should call ``parse_raw_tool_call`` and then
+    ``coordinate_adapter.adapt_action`` with the actual screenshot geometry.
+    """
+
+    from .coordinate_adapter import CoordinateMode, ObservationGeometry, adapt_action
+
+    raw = parse_raw_tool_call(content)
+    try:
+        action = adapt_action(
+            raw.action,
+            CoordinateMode.NORMALIZED_1000,
+            ObservationGeometry.full_viewport(1000, 1000),
+        )
+    except ValueError as exc:
+        raise ModelProtocolError(str(exc)) from exc
+    return ModelDecision(
+        action=action,
+        raw_response=raw.raw_response,
+        reasoning_present=raw.reasoning_present,
+    )
+
+
+COMPUTER_USE_PARAMETERS: dict[str, Any] = {
     "type": "object",
     "properties": {
         "action": {
@@ -196,15 +255,57 @@ COMPUTER_USE_PARAMETERS: Dict[str, Any] = {
 }
 
 
-def build_system_prompt(width: int = 1000, height: int = 1000) -> str:
+def _computer_use_parameters(coordinate_mode: str) -> dict[str, Any]:
+    """Return tool-schema parameters whose coordinate description matches the mode."""
+
+    parameters = dict(COMPUTER_USE_PARAMETERS)
+    properties = dict(COMPUTER_USE_PARAMETERS["properties"])
+    coordinate = dict(properties["coordinate"])
+    if coordinate_mode == "pixel":
+        coordinate["description"] = (
+            "(x, y) coordinate in screenshot pixel space, relative to the screenshot's "
+            "top-left corner. Required for mouse and click actions."
+        )
+    else:
+        coordinate["description"] = (
+            "(x, y) coordinate in the 0..1000 normalized model coordinate space. "
+            "Required for mouse and click actions."
+        )
+    properties["coordinate"] = coordinate
+    parameters["properties"] = properties
+    return parameters
+
+
+def build_system_prompt(
+    width: int = 1000,
+    height: int = 1000,
+    *,
+    coordinate_mode: str = "normalized_1000",
+    screenshot_width: int = 1440,
+    screenshot_height: int = 900,
+) -> str:
+    if coordinate_mode not in {"pixel", "normalized_1000"}:
+        raise ValueError("coordinate_mode must be pixel or normalized_1000")
+    if coordinate_mode == "pixel":
+        coordinate_description = (
+            f"The current screenshot is {screenshot_width}x{screenshot_height} pixels. "
+            "Mouse coordinates are screenshot pixels relative to its top-left corner."
+        )
+    else:
+        coordinate_description = (
+            f"The current screenshot is {screenshot_width}x{screenshot_height} pixels. "
+            "For mouse actions, normalize each axis independently to integer coordinates "
+            "from 0 to 1000; [0,0] is top-left and [1000,1000] is the bottom-right extent."
+        )
     tool = {
         "name": "computer_use",
         "description": (
             "Use a mouse and keyboard to interact with a web browser. "
-            f"The model coordinate space is {width}x{height}. Consult the latest "
+            f"The model coordinate space is {width}x{height}. {coordinate_description} "
+            "Consult the latest "
             "screenshot before clicking and target the visual center of controls."
         ),
-        "parameters": COMPUTER_USE_PARAMETERS,
+        "parameters": _computer_use_parameters(coordinate_mode),
     }
     return (
         "You are Fara, a computer use agent (CUA) specialized for web browsers. "

@@ -109,6 +109,17 @@ class TaskService:
         await self.runtime.terminate(task_id)
         return await self.get(task_id)
 
+    async def rerun(self, task_id: str) -> TaskView:
+        task = await self.runtime.prepare_rerun(task_id)
+        await self.runtime.emit(
+            task.session_id,
+            "session.planned",
+            "任务执行记录已清空，准备重新执行",
+            {"rerun": True, "task_id": task.task_id},
+        )
+        await self.runtime.start(task_id)
+        return await self.get(task_id)
+
     async def respond(self, task_id: str, response: UserResponse) -> TaskView:
         task = await self.repository.get_task(task_id)
         session = await self.repository.get_session(task.session_id)

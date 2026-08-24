@@ -50,6 +50,11 @@ async def terminate_task(task_id: str, request: Request) -> TaskView:
     return await get_container(request).tasks.terminate(task_id)
 
 
+@router.post("/tasks/{task_id}/rerun", response_model=TaskView, tags=["tasks"])
+async def rerun_task(task_id: str, request: Request) -> TaskView:
+    return await get_container(request).tasks.rerun(task_id)
+
+
 @router.post("/tasks/{task_id}/respond", response_model=TaskView, tags=["tasks"])
 async def respond_to_task(task_id: str, payload: UserResponse, request: Request) -> TaskView:
     return await get_container(request).tasks.respond(task_id, payload)

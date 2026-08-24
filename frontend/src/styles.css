@@ -2727,3 +2727,40 @@ textarea:focus {
   }
 }
 
+.task-nav-row {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+
+.task-nav-row .task-nav {
+  flex: 1;
+  min-width: 0;
+  padding-right: 34px;
+}
+
+.nav-delete {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  width: 24px;
+  height: 24px;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-soft);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.task-nav-row:hover .nav-delete,
+.task-nav-row:focus-within .nav-delete {
+  opacity: 1;
+}
+
+.nav-delete:hover {
+  background: var(--surface-2);
+  color: var(--danger);
+}

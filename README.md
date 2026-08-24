@@ -19,7 +19,7 @@ FaraFlow 是一个带安全边界的本地 Agent 工作台。它将普通聊天�
 - 深色/浅色主题切换，并将用户选择保存到浏览器本地存储；
 - `AgentRuntime` 浏览器 Agent 主循环：截图 → 模型决策 → 安全检查 → Playwright 执行 → 结果回传；
 - Playwright 1440×900 隔离 BrowserContext 与并发会话池；
-- Fara 官方 `computer_use` XML/JSON 工具协议与 1000×1000 坐标映射；
+- Fara 官方 `computer_use` XML/JSON 工具协议，支持 pixel / normalized_1000 模式并在运行时统一为 Playwright CSS 像素；
 - 域名白名单、私网拦截、页面提示注入检测；
 - 提交、购买、删除、发送和登录控件的模型外审批拦截；
 - 任务、Session、Action、Approval、Event、Skill 持久化；
@@ -117,6 +117,9 @@ tests/               单元、API、浏览器和 Agent 运行时测试
 FARAFLOW_FARA_BASE_URL=http://10.65.1.110:8003/v1
 FARAFLOW_FARA_MODEL=microsoft/Fara1.5-27B
 FARAFLOW_FARA_API_KEY=not-needed
+# 当前 Fara1.5-27B smoke 验证显示模型稳定输出 0..1000 坐标，推荐使用 normalized_1000。
+# 只有在目标端点已单独验证会输出截图像素时才切换为 pixel。
+FARAFLOW_FARA_COORDINATE_MODE=normalized_1000
 ```
 
 如果模型部署在内网服务器，将 `FARAFLOW_FARA_BASE_URL` 改成该服务器的 `/v1` 地址即可，前端和后端不需要修改模型调用代码。
@@ -144,6 +147,7 @@ FARAFLOW_CODE_BASE_URL=http://10.65.1.120:11434/v1
 FARAFLOW_CODE_MODEL=gemma4:26b
 FARAFLOW_FARA_BASE_URL=http://10.65.1.110:8003/v1
 FARAFLOW_FARA_MODEL=microsoft/Fara1.5-27B
+FARAFLOW_FARA_COORDINATE_MODE=normalized_1000
 ```
 
 The model routing is intentionally split: `FARAFLOW_FARA_*` handles browser
@@ -254,6 +258,87 @@ npm run typecheck
 npm test
 npm run build
 ```
+
+### Minesweeper 数据生成与 Fara SFT 导出
+
+脚本可以自动生成确定性轨迹、Pillow 合成截图，或使用本机 Chromium 对可见状态做
+无网络浏览器渲染。两种数据源会在 `manifest.json` 中分别标记为
+`deterministic_synthetic_engine` 和 `browser_synthetic_local`；它们不是同一类数据，
+正式训练前应优先补充真实目标页面的浏览器截图。
+
+```powershell
+$env:PYTHONPATH = "backend;."
+
+# 生成 1000 条 Canonical v3 轨迹和 Pillow 截图
+conda run -n faraflow python -m scripts.generate_minesweeper_dataset `
+  data/minesweeper-pilot-large --records 1000 --seed-start 0
+
+# 可选：用本机 Chromium 渲染为浏览器截图（先安装 playwright chromium）
+conda run -n faraflow python -m scripts.render_browser_dataset `
+  data/minesweeper-pilot-large/records.jsonl data/minesweeper-browser-large
+
+# 导出 Fara ChatML-style 多模态 JSONL；默认使用 normalized_1000 坐标
+conda run -n faraflow python -m scripts.export_fara_sft `
+  data/minesweeper-browser-large/records.jsonl `
+  data/minesweeper-browser-large/fara-sft.jsonl
+
+# 按 trajectory 切分，避免同一局泄漏到 train 和 validation
+conda run -n faraflow python -m scripts.split_minesweeper_dataset `
+  data/minesweeper-browser-large data/minesweeper-browser-large-split `
+  --validation-fraction 0.2
+
+conda run -n faraflow python -m scripts.export_fara_sft `
+  data/minesweeper-browser-large-split/train/records.jsonl `
+  data/minesweeper-browser-large-split/train/fara-sft.jsonl
+
+conda run -n faraflow python -m scripts.export_fara_sft `
+  data/minesweeper-browser-large-split/validation/records.jsonl `
+  data/minesweeper-browser-large-split/validation/fara-sft.jsonl
+
+conda run -n faraflow python -m scripts.validate_minesweeper_dataset `
+  data/minesweeper-browser-large-split
+```
+
+导出器会复用当前 `computer_use` XML/raw parser，自动拒绝不带 `answer` 的
+`terminate`，并且不会把 `supervision_only.mine_map` 写入模型消息。该 JSONL 是可审计的
+ChatML-style 中间格式；实际 LoRA trainer 仍需确认其图片字段映射和 loss mask。
+
+#### LLaMA-Factory 训练格式
+
+如果使用 LLaMA-Factory，请把切分后的 Canonical 记录转换为其多模态 Alpaca 格式。
+脚本会复制截图、写出 `train.json`/`validation.json` 和 `dataset_info.json`，并保留
+`normalized_1000` 坐标与 Fara 的 XML tool-call 合约：
+
+```powershell
+$env:PYTHONPATH = "backend;."
+conda run -n faraflow python -m scripts.export_llamafactory `
+  data/minesweeper-browser-large-split/train/records.jsonl `
+  data/minesweeper-browser-large-split/validation/records.jsonl `
+  data/llamafactory-fara27b
+```
+
+在有 NVIDIA GPU 和 Fara1.5-27B 权重的 Linux/WSL 训练机上，先安装并检查版本：
+
+```bash
+git clone --depth 1 https://github.com/hiyouga/LlamaFactory.git
+cd LlamaFactory
+pip install -e .
+pip install -r requirements/metrics.txt
+pip install bitsandbytes
+llamafactory-cli version
+```
+
+将 `configs/llamafactory_fara27b_qlora.example.yaml` 复制到训练机后，修改
+`model_name_or_path`、`dataset_dir`、`output_dir`。`template: qwen3_5` 只在当前
+LLaMA-Factory 版本确认支持 Fara1.5 的 Qwen3.5 兼容模板后使用；若不支持，应先
+升级/补充模板，不能把 27B vLLM 接口地址当成训练模型路径。先做 dry-run：
+
+```bash
+llamafactory-cli train configs/llamafactory_fara27b_qlora.example.yaml \\
+  --max_samples 8 --num_train_epochs 0.01 --output_dir /tmp/fara27b-dry-run
+```
+
+dry-run 能成功读取图片、模板和 tool-call 后，再去掉覆盖参数进行正式 QLoRA 训练。
 
 前端开发服务器也只监听 `127.0.0.1`，避免其 `/v1` 代理把仅限本机的 Workspace
 接口意外暴露到局域网。

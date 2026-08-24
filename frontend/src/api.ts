@@ -98,6 +98,8 @@ async function streamChatRequest(
 export const api = {
   listChats: () => request<ChatSummary[]>("/v1/chats"),
   getChat: (chatId: string) => request<Chat>(`/v1/chats/${chatId}`),
+  deleteChat: (chatId: string) =>
+    request<void>(`/v1/chats/${chatId}`, { method: "DELETE" }),
   createChat: (payload: Record<string, unknown> = {}) =>
     request<Chat>("/v1/chats", { method: "POST", body: JSON.stringify(payload) }),
   sendChatMessage: (
@@ -213,6 +215,8 @@ export const api = {
     request<Task>(`/v1/tasks/${taskId}/pause`, { method: "POST" }),
   terminateTask: (taskId: string) =>
     request<Task>(`/v1/tasks/${taskId}/terminate`, { method: "POST" }),
+  rerunTask: (taskId: string) =>
+    request<Task>(`/v1/tasks/${taskId}/rerun`, { method: "POST" }),
   respond: (taskId: string, response: string, resumeToken: string) =>
     request<Task>(`/v1/tasks/${taskId}/respond`, {
       method: "POST",

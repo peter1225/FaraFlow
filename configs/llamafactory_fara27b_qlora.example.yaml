@@ -1,0 +1,43 @@
+# Copy this file to a real training host and replace the three paths below.
+# Verify that the installed LLaMA-Factory version supports the Fara1.5
+# architecture and its Qwen3.5-compatible template before starting training.
+model_name_or_path: /models/Fara1.5-27B
+template: qwen3_5
+trust_remote_code: true
+
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_target: all
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+
+# 27B full-bf16 LoRA is usually too large for a single 48 GB card; use QLoRA
+# first, then increase the effective batch with gradient accumulation.
+quantization_bit: 4
+dataset_dir: /workspace/FaraFlow/data/llamafactory-fara27b
+dataset: fara_mines_train
+eval_dataset: fara_mines_validation
+cutoff_len: 4096
+max_samples: 1000
+overwrite_cache: true
+preprocessing_num_workers: 8
+dataloader_num_workers: 2
+
+output_dir: /workspace/FaraFlow/artifacts/fara27b-qlora-minesweeper
+logging_steps: 5
+save_steps: 100
+save_only_model: true
+plot_loss: true
+overwrite_output_dir: true
+
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 1.0e-5
+num_train_epochs: 1.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.05
+bf16: true
+ddp_timeout: 180000000

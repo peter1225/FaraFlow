@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     fara_max_tokens: int = 2048
     fara_max_screenshots: int = 3
     fara_coordinate_space: int = 1000
+    fara_coordinate_mode: Literal["pixel", "normalized_1000"] = "normalized_1000"
 
     # Leave both URL and model empty to reuse the Fara endpoint for chat.
     chat_base_url: str = ""

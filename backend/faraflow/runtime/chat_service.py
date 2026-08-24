@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from faraflow.code.service import CodeRunService
 from faraflow.desktop.service import DesktopRunService
+from faraflow.domain.enums import CodeRunStatus, DesktopRunStatus, SessionState
 from faraflow.domain.schemas import (
     ChatCreate,
     ChatMessageCreate,
@@ -123,6 +124,44 @@ class ChatService:
     async def list(self, tenant_id: Optional[str] = None) -> List[ChatSummary]:
         rows = await self.repository.list_chats(tenant_id=tenant_id)
         return [self._summary(item) for item in rows]
+
+    async def delete(self, chat_id: str) -> None:
+        """Stop live work owned by a chat, then remove its persisted history."""
+        resources = await self.repository.chat_resource_ids(chat_id)
+
+        for task_id in resources["task_ids"]:
+            task = await self.repository.get_task(task_id)
+            if SessionState(task.status) not in {
+                SessionState.COMPLETED,
+                SessionState.FAILED,
+                SessionState.TERMINATED,
+                SessionState.EXPIRED,
+            }:
+                await self.tasks.runtime.terminate(task_id, reason="chat_deleted")
+
+        if self.code_runs is not None:
+            for code_run_id in resources["code_run_ids"]:
+                run = await self.repository.get_code_run(code_run_id)
+                if CodeRunStatus(run.status) in {
+                    CodeRunStatus.CREATED,
+                    CodeRunStatus.RUNNING,
+                }:
+                    await self.code_runs.runtime.cancel(code_run_id)
+
+        if self.desktop_runs is not None:
+            for desktop_run_id in resources["desktop_run_ids"]:
+                run = await self.repository.get_desktop_run(desktop_run_id)
+                if DesktopRunStatus(run.status) in {
+                    DesktopRunStatus.CREATED,
+                    DesktopRunStatus.WAITING_CAPTURE_CONSENT,
+                    DesktopRunStatus.RUNNING,
+                    DesktopRunStatus.WAITING_APPROVAL,
+                    DesktopRunStatus.PAUSED,
+                    DesktopRunStatus.HANDOFF,
+                }:
+                    await self.desktop_runs.runtime.terminate(desktop_run_id)
+
+        await self.repository.delete_chat(chat_id)
 
     async def get(self, chat_id: str) -> ChatView:
         chat = await self.repository.get_chat(chat_id)

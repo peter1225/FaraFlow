@@ -823,6 +823,11 @@ function TaskDetail({
               Ⅱ 暂停
             </button>
           )}
+          {["COMPLETED", "FAILED", "TERMINATED", "EXPIRED"].includes(task.status) && (
+            <button className="button primary" disabled={busy} onClick={() => onCommand("rerun")}>
+              ↻ 重新执行
+            </button>
+          )}
           {!["COMPLETED", "FAILED", "TERMINATED", "EXPIRED"].includes(task.status) && (
             <button className="button danger ghost" disabled={busy} onClick={() => onCommand("terminate")}>
               终止
@@ -1192,6 +1197,41 @@ export default function App() {
     }
   }
 
+  async function deleteChat(chatId: string) {
+    const chat = chats.find((item) => item.chat_id === chatId);
+    if (!window.confirm(`删除对话“${chat?.title ?? "新对话"}”及其保存的执行记录？`)) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.deleteChat(chatId);
+      const remaining = chats.filter((item) => item.chat_id !== chatId);
+      const [taskRows, workspaceRows] = await Promise.all([
+        api.listTasks(),
+        api.listWorkspaces().catch(() => [] as Workspace[]),
+      ]);
+      setChats(remaining);
+      setTasks(taskRows);
+      setWorkspaces(workspaceRows);
+      if (selectedChatId === chatId) {
+        setSelectedChatId(undefined);
+        setSelectedChat(undefined);
+        setSelectedId(undefined);
+        setSelected(undefined);
+        if (remaining.length > 0) {
+          selectChat(remaining[0].chat_id);
+        } else if (taskRows.length > 0) {
+          selectTask(taskRows[0].task_id);
+        } else if (workspaceRows.length > 0) {
+          selectWorkspace(workspaceRows[0].workspace_id);
+        }
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "删除对话失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function sendChat(
     content: string,
     mode: RequestedMode,
@@ -1311,6 +1351,7 @@ export default function App() {
       if (commandName === "start") await api.startTask(selected.task_id);
       if (commandName === "pause") await api.pauseTask(selected.task_id);
       if (commandName === "terminate") await api.terminateTask(selected.task_id);
+      if (commandName === "rerun") await api.rerunTask(selected.task_id);
       if (commandName === "respond" && payload)
         await api.respond(selected.task_id, payload, selected.session.resume_token);
       if ((commandName === "approve" || commandName === "reject") && payload)
@@ -1376,17 +1417,29 @@ export default function App() {
           <div className="nav-label">对话</div>
           <nav className="task-list">
             {chats.map((chat) => (
-              <button
-                key={chat.chat_id}
-                className={`task-nav ${selectedChatId === chat.chat_id ? "active" : ""}`}
-                onClick={() => selectChat(chat.chat_id)}
-              >
-                <span className="chat-state-icon">◇</span>
-                <span className="task-nav-copy">
-                  <strong>{chat.title}</strong>
-                  <small>{formatTime(chat.updated_at)}</small>
-                </span>
-              </button>
+              <div className="task-nav-row" key={chat.chat_id}>
+                <button
+                  className={`task-nav ${selectedChatId === chat.chat_id ? "active" : ""}`}
+                  onClick={() => selectChat(chat.chat_id)}
+                >
+                  <span className="chat-state-icon">◇</span>
+                  <span className="task-nav-copy">
+                    <strong>{chat.title}</strong>
+                    <small>{formatTime(chat.updated_at)}</small>
+                  </span>
+                </button>
+                <button
+                  className="nav-delete"
+                  aria-label={`删除对话 ${chat.title}`}
+                  title="删除对话"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void deleteChat(chat.chat_id);
+                  }}
+                >
+                  ×
+                </button>
+              </div>
             ))}
             {!loading && chats.length === 0 && <div className="no-tasks">还没有对话</div>}
           </nav>

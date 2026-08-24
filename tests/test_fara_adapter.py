@@ -14,6 +14,17 @@ class FakeResponse:
         return {"choices": [{"message": {"content": self.content}}]}
 
 
+class HealthResponse:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self.payload
+
+
 class FakeClient:
     def __init__(self, responses: list[str]) -> None:
         self.responses = responses
@@ -23,6 +34,61 @@ class FakeClient:
         del path
         self.payloads.append(json)
         return FakeResponse(self.responses.pop(0))
+
+
+class HealthClient:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    async def get(self, path: str, *, timeout: float) -> HealthResponse:
+        del path, timeout
+        return HealthResponse(self.payload)
+
+
+@pytest.mark.asyncio
+async def test_health_rejects_endpoint_with_wrong_model() -> None:
+    adapter = FaraAdapter(Settings(fara_model="microsoft/Fara1.5-27B"))
+    await adapter._client.aclose()
+    adapter._client = HealthClient(
+        {"data": [{"id": "hf.co/bartowski/Fara1.5-9B-GGUF:Q4_K_M"}]}
+    )  # type: ignore[assignment]
+
+    health = await adapter.health()
+
+    assert health["status"] == "model_mismatch"
+    assert health["available_models"] == ["hf.co/bartowski/Fara1.5-9B-GGUF:Q4_K_M"]
+
+
+@pytest.mark.asyncio
+async def test_pixel_mode_adapts_model_coordinates_to_css_pixels() -> None:
+    adapter = FaraAdapter(Settings(fara_coordinate_mode="pixel"))
+    await adapter._client.aclose()
+    adapter._client = FakeClient(
+        [
+            '<tool_call>{"name":"computer_use","arguments":'
+            '{"action":"left_click","coordinate":[1074,437]}}</tool_call>'
+        ]
+    )  # type: ignore[assignment]
+
+    decision = await adapter.next_action([])
+
+    assert decision.action.coordinate == (1074.0, 437.0)
+
+
+@pytest.mark.asyncio
+async def test_normalized_mode_adapts_to_configured_viewport_css_pixels() -> None:
+    adapter = FaraAdapter(Settings(fara_coordinate_mode="normalized_1000"))
+    await adapter._client.aclose()
+    adapter._client = FakeClient(
+        [
+            '<tool_call>{"name":"computer_use","arguments":'
+            '{"action":"left_click","coordinate":[500,500]}}</tool_call>'
+        ]
+    )  # type: ignore[assignment]
+
+    decision = await adapter.next_action([])
+
+    assert decision.action.coordinate == (720.0, 450.0)
 
 
 @pytest.mark.asyncio

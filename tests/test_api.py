@@ -123,6 +123,82 @@ def test_chat_routes_between_direct_answer_and_browser_task(tmp_path: Path) -> N
         assert body["chat"]["messages"][-1]["task_id"] == body["task"]["task_id"]
 
 
+def test_delete_chat_removes_messages_and_linked_automation_session(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path.as_posix()}/test.db",
+        artifact_root=tmp_path / "artifacts",
+        browser_state_root=tmp_path / "browser-state",
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        app.state.container.chat_model.complete_chat = AsyncMock(
+            return_value=(
+                '{"mode":"automation","reply":"已创建任务","task_name":"测试任务",'
+                '"description":"打开网页并读取标题","start_url":"https://www.bing.com/",'
+                '"allowed_domains":["bing.com"]}'
+            )
+        )
+        chat = client.post("/v1/chats", json={"title": "待删除对话"}).json()
+        reply = client.post(
+            f"/v1/chats/{chat['chat_id']}/messages",
+            json={"content": "打开网页", "auto_start": False},
+        )
+        assert reply.status_code == 200, reply.text
+        task_id = reply.json()["task"]["task_id"]
+
+        deleted = client.delete(f"/v1/chats/{chat['chat_id']}")
+        assert deleted.status_code == 204, deleted.text
+        assert client.get(f"/v1/chats/{chat['chat_id']}").status_code == 404
+        assert client.get(f"/v1/tasks/{task_id}").status_code == 404
+        assert client.get(f"/v1/tasks/{task_id}/events").status_code == 404
+
+
+def test_rerun_task_clears_execution_history_and_keeps_parameters(tmp_path: Path) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path.as_posix()}/test.db",
+        artifact_root=tmp_path / "artifacts",
+        browser_state_root=tmp_path / "browser-state",
+    )
+    app = create_app(settings)
+    with TestClient(app) as client:
+        created = client.post(
+            "/v1/tasks",
+            json={
+                "task_name": "可重复任务",
+                "description": "打开网页并读取标题。",
+                "start_url": "https://www.bing.com/",
+                "allowed_domains": ["bing.com"],
+            },
+        )
+        assert created.status_code == 201, created.text
+        original = created.json()
+        task_id = original["task_id"]
+
+        terminated = client.post(f"/v1/tasks/{task_id}/terminate")
+        assert terminated.status_code == 200, terminated.text
+        app.state.container.runtime.start = AsyncMock()
+
+        rerun = client.post(f"/v1/tasks/{task_id}/rerun")
+        assert rerun.status_code == 200, rerun.text
+        body = rerun.json()
+        assert body["task_id"] == task_id
+        assert body["task_name"] == original["task_name"]
+        assert body["description"] == original["description"]
+        assert body["start_url"] == original["start_url"]
+        assert body["allowed_domains"] == original["allowed_domains"]
+        assert body["status"] == "PLANNED"
+        assert body["session"]["state"] == "PLANNED"
+        assert body["session"]["runtime_state"]["action_count"] == 0
+        assert body["final_result"] is None
+
+        events = client.get(f"/v1/tasks/{task_id}/events")
+        assert events.status_code == 200
+        assert [item["event_type"] for item in events.json()] == ["session.planned"]
+        app.state.container.runtime.start.assert_awaited_once_with(task_id)
+
+
 def test_chat_returns_actionable_message_when_model_is_unavailable(tmp_path: Path) -> None:
     settings = Settings(
         _env_file=None,

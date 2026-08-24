@@ -38,6 +38,11 @@ async def get_chat(chat_id: str, request: Request) -> ChatView:
     return await get_container(request).chat.get(chat_id)
 
 
+@router.delete("/{chat_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat(chat_id: str, request: Request) -> None:
+    await get_container(request).chat.delete(chat_id)
+
+
 @router.post("/{chat_id}/messages", response_model=ChatReply)
 async def send_chat_message(
     chat_id: str,

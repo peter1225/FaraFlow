@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import Select, desc, select, update
+from sqlalchemy import Select, delete, desc, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from faraflow.domain.enums import ApprovalStatus, CodeRunStatus, DesktopRunStatus, SessionState
@@ -83,6 +83,169 @@ class Repository:
             if chat is None:
                 raise NotFoundError(f"chat {chat_id} not found")
             return chat
+
+    async def chat_resource_ids(self, chat_id: str) -> Dict[str, List[str]]:
+        """Return execution records owned by a chat before it is deleted.
+
+        Automation tasks are linked to chats through their assistant message,
+        while code and desktop runs also carry a direct chat foreign key.  The
+        returned ids let the service stop live runtimes before the database
+        rows are removed.
+        """
+        async with self._session_factory() as db:
+            chat = await db.get(ChatThreadRecord, chat_id)
+            if chat is None:
+                raise NotFoundError(f"chat {chat_id} not found")
+            messages = list(
+                (
+                    await db.scalars(
+                        select(ChatMessageRecord).where(ChatMessageRecord.chat_id == chat_id)
+                    )
+                ).all()
+            )
+            task_ids = {item.task_id for item in messages if item.task_id}
+            code_run_ids = {item.code_run_id for item in messages if item.code_run_id}
+            desktop_run_ids = {
+                item.desktop_run_id for item in messages if item.desktop_run_id
+            }
+            code_run_ids.update(
+                (
+                    await db.scalars(
+                        select(CodeRunRecord.code_run_id).where(
+                            CodeRunRecord.chat_id == chat_id
+                        )
+                    )
+                ).all()
+            )
+            desktop_run_ids.update(
+                (
+                    await db.scalars(
+                        select(DesktopRunRecord.desktop_run_id).where(
+                            DesktopRunRecord.chat_id == chat_id
+                        )
+                    )
+                ).all()
+            )
+            return {
+                "task_ids": list(task_ids),
+                "code_run_ids": list(code_run_ids),
+                "desktop_run_ids": list(desktop_run_ids),
+            }
+
+    async def delete_chat(self, chat_id: str) -> None:
+        """Delete a chat and its persisted messages and execution history."""
+        async with self._session_factory() as db:
+            chat = await db.get(ChatThreadRecord, chat_id)
+            if chat is None:
+                raise NotFoundError(f"chat {chat_id} not found")
+
+            messages = list(
+                (
+                    await db.scalars(
+                        select(ChatMessageRecord).where(ChatMessageRecord.chat_id == chat_id)
+                    )
+                ).all()
+            )
+            task_ids = {item.task_id for item in messages if item.task_id}
+            code_run_ids = {item.code_run_id for item in messages if item.code_run_id}
+            desktop_run_ids = {
+                item.desktop_run_id for item in messages if item.desktop_run_id
+            }
+            code_run_ids.update(
+                (
+                    await db.scalars(
+                        select(CodeRunRecord.code_run_id).where(
+                            CodeRunRecord.chat_id == chat_id
+                        )
+                    )
+                ).all()
+            )
+            desktop_run_ids.update(
+                (
+                    await db.scalars(
+                        select(DesktopRunRecord.desktop_run_id).where(
+                            DesktopRunRecord.chat_id == chat_id
+                        )
+                    )
+                ).all()
+            )
+
+            task_session_ids: List[str] = []
+            if task_ids:
+                task_session_ids = list(
+                    (
+                        await db.scalars(
+                            select(SessionRecord.session_id).where(
+                                SessionRecord.task_id.in_(task_ids)
+                            )
+                        )
+                    ).all()
+                )
+            code_session_ids: List[str] = []
+            if code_run_ids:
+                code_session_ids = list(
+                    (
+                        await db.scalars(
+                            select(CodeRunRecord.session_id).where(
+                                CodeRunRecord.code_run_id.in_(code_run_ids)
+                            )
+                        )
+                    ).all()
+                )
+            desktop_session_ids: List[str] = []
+            if desktop_run_ids:
+                desktop_session_ids = list(
+                    (
+                        await db.scalars(
+                            select(DesktopRunRecord.session_id).where(
+                                DesktopRunRecord.desktop_run_id.in_(desktop_run_ids)
+                            )
+                        )
+                    ).all()
+                )
+            session_ids = set(task_session_ids + code_session_ids + desktop_session_ids)
+
+            # EventRecord intentionally has no FK because code and desktop
+            # sessions share the event stream. Remove those rows explicitly.
+            if session_ids:
+                await db.execute(delete(EventRecord).where(EventRecord.session_id.in_(session_ids)))
+            await db.execute(
+                delete(ChatMessageRecord).where(ChatMessageRecord.chat_id == chat_id)
+            )
+            if task_ids:
+                await db.execute(delete(ActionRecord).where(ActionRecord.task_id.in_(task_ids)))
+                await db.execute(
+                    delete(ApprovalRecord).where(ApprovalRecord.task_id.in_(task_ids))
+                )
+                await db.execute(
+                    delete(SessionRecord).where(SessionRecord.task_id.in_(task_ids))
+                )
+                await db.execute(delete(TaskRecord).where(TaskRecord.task_id.in_(task_ids)))
+            if code_run_ids:
+                await db.execute(
+                    delete(ToolCallRecord).where(ToolCallRecord.code_run_id.in_(code_run_ids))
+                )
+                await db.execute(
+                    delete(CodeRunRecord).where(CodeRunRecord.code_run_id.in_(code_run_ids))
+                )
+            if desktop_run_ids:
+                await db.execute(
+                    delete(DesktopActionRecord).where(
+                        DesktopActionRecord.desktop_run_id.in_(desktop_run_ids)
+                    )
+                )
+                await db.execute(
+                    delete(DesktopApprovalRecord).where(
+                        DesktopApprovalRecord.desktop_run_id.in_(desktop_run_ids)
+                    )
+                )
+                await db.execute(
+                    delete(DesktopRunRecord).where(
+                        DesktopRunRecord.desktop_run_id.in_(desktop_run_ids)
+                    )
+                )
+            await db.delete(chat)
+            await db.commit()
 
     async def update_chat_title(self, chat_id: str, title: str) -> None:
         async with self._session_factory() as db:
@@ -726,6 +889,52 @@ class Repository:
             task = await db.get(TaskRecord, task_id)
             if task is None:
                 raise NotFoundError(f"task {task_id} not found")
+            return task
+
+    async def reset_task_for_rerun(self, task_id: str) -> TaskRecord:
+        """Clear execution history while keeping the task's input parameters."""
+        async with self._session_factory() as db:
+            task = await db.get(TaskRecord, task_id)
+            if task is None:
+                raise NotFoundError(f"task {task_id} not found")
+            session = await db.get(SessionRecord, task.session_id)
+            if session is None:
+                raise NotFoundError(f"session for task {task_id} not found")
+            if SessionState(session.state) not in {
+                SessionState.COMPLETED,
+                SessionState.FAILED,
+                SessionState.TERMINATED,
+                SessionState.EXPIRED,
+            }:
+                raise ConflictError(
+                    "only a completed, failed, terminated, or expired task can be rerun"
+                )
+
+            await db.execute(delete(ActionRecord).where(ActionRecord.task_id == task_id))
+            await db.execute(delete(ApprovalRecord).where(ApprovalRecord.task_id == task_id))
+            await db.execute(
+                delete(EventRecord).where(EventRecord.session_id == session.session_id)
+            )
+
+            reset_plan = [dict(item, status="pending") for item in (task.plan or [])]
+            task.plan = reset_plan
+            task.status = SessionState.PLANNED.value
+            task.started_at = None
+            task.finished_at = None
+            task.final_result = None
+            session.state = SessionState.PLANNED.value
+            session.current_step_id = reset_plan[0].get("step_id") if reset_plan else None
+            session.resume_token = secrets.token_urlsafe(32)
+            session.runtime_state = {
+                "action_count": 0,
+                "facts": [],
+                "last_observation": "",
+            }
+            session.checkpoint_ref = None
+            session.last_screenshot_ref = None
+            session.updated_at = now_utc()
+            await db.commit()
+            await db.refresh(task)
             return task
 
     async def get_session(self, session_id: str) -> SessionRecord:
