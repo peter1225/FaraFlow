@@ -340,6 +340,74 @@ llamafactory-cli train configs/llamafactory_fara27b_qlora.example.yaml \\
 
 dry-run 能成功读取图片、模板和 tool-call 后，再去掉覆盖参数进行正式 QLoRA 训练。
 
+#### 确定性扫雷 Canonical V4 数据
+
+V4 数据只允许执行由可见数字和旗标严格证明的动作：确定为雷时右键标记，确定安全时
+左键点击；完整约束枚举仍无法确定时输出带 `answer` 的 `terminate`，禁止猜测。默认
+6500 条试验数据由 5000 条训练、1000 条验证和 500 条测试组成。
+
+在 Windows PowerShell 中生成 Canonical 数据：
+
+```powershell
+cd C:\Users\Peter\Desktop\demo\FaraFlow
+$env:PYTHONPATH = "backend;."
+conda activate faraflow
+
+python -m scripts.generate_minesweeper_dataset_v4 `
+  data/minesweeper-v4-canonical `
+  --records 6500 `
+  --seed-start 100000 `
+  --width 9 `
+  --height 9 `
+  --mines 10 `
+  --include-ambiguous `
+  --solver constraint `
+  --randomize-layout
+```
+
+使用六种确定性布局、明暗主题、尺寸和滚动偏移渲染浏览器截图。渲染器会在截图后
+重新计算每个动作的 CSS、图片像素和 `normalized_1000` 坐标：
+
+```powershell
+python -m scripts.render_browser_dataset_v4 `
+  data/minesweeper-v4-canonical/records.jsonl `
+  data/minesweeper-v4-browser `
+  --layouts 6
+```
+
+按照完整 `trajectory_id` 精确拆分，任何棋局都不会跨集合：
+
+```powershell
+python -m scripts.split_minesweeper_dataset_v4 `
+  data/minesweeper-v4-browser `
+  data/minesweeper-v4-split `
+  --train-records 5000 `
+  --validation-records 1000 `
+  --test-records 500
+```
+
+训练前重放隐藏真值并重新运行可见状态约束求解器：
+
+```powershell
+python -m scripts.validate_minesweeper_dataset_v4 `
+  data/minesweeper-v4-split
+```
+
+只有报告同时满足 `unsafe_clicks=0`、`false_flags=0`、
+`ambiguous_actions=0`、`hidden_truth_leaks=0`、`trajectory_overlap=0` 和
+`status=ok` 才能导出：
+
+```powershell
+python -m scripts.export_llamafactory_v4 `
+  data/minesweeper-v4-split/train/records.jsonl `
+  data/minesweeper-v4-split/validation/records.jsonl `
+  data/llamafactory-fara27b-v2
+```
+
+导出器会自动发现同级 `test/records.jsonl`，并写出 `train.json`、
+`validation.json`、`test.json`、`dataset_info.json` 和审计 manifest。训练数据名称是
+`fara_mines_v2_train`，验证数据名称是 `fara_mines_v2_validation`。
+
 前端开发服务器也只监听 `127.0.0.1`，避免其 `/v1` 代理把仅限本机的 Workspace
 接口意外暴露到局域网。
 
