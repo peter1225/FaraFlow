@@ -462,8 +462,69 @@ class DesktopBridge:
         if not self._user32.IsWindow(window_id):
             raise DesktopBridgeError(f"window {window_id} no longer exists")
         self._user32.ShowWindow(window_id, 9)
-        if not self._user32.SetForegroundWindow(window_id):
-            raise DesktopBridgeError("Windows refused to focus the target window")
+        if self._wait_for_foreground(window_id, attempts=1):
+            return
+
+        # SetForegroundWindow is subject to Windows' foreground-lock policy.
+        # Try the normal API first, but verify the actual foreground HWND rather
+        # than treating its return value as authoritative.
+        self._user32.SetForegroundWindow(window_id)
+        if self._wait_for_foreground(window_id):
+            return
+
+        # A desktop run is initiated from the browser, so that browser commonly
+        # owns the foreground input queue when the worker tries to reactivate the
+        # explicitly selected application. Temporarily join the foreground and
+        # target queues, activate only that selected HWND, and always detach.
+        current_thread = (
+            int(self._kernel32.GetCurrentThreadId()) if self._kernel32 is not None else 0
+        )
+        foreground_id = int(self._user32.GetForegroundWindow() or 0)
+        attached_threads: List[int] = []
+        if current_thread:
+            candidate_threads: List[int] = []
+            for candidate_window in (foreground_id, window_id):
+                if not candidate_window:
+                    continue
+                thread_id = int(
+                    self._user32.GetWindowThreadProcessId(candidate_window, None) or 0
+                )
+                if (
+                    thread_id
+                    and thread_id != current_thread
+                    and thread_id not in candidate_threads
+                ):
+                    candidate_threads.append(thread_id)
+            for thread_id in candidate_threads:
+                if self._user32.AttachThreadInput(current_thread, thread_id, True):
+                    attached_threads.append(thread_id)
+
+        try:
+            self._user32.BringWindowToTop(window_id)
+            self._user32.SetActiveWindow(window_id)
+            self._user32.SetFocus(window_id)
+            self._user32.SetForegroundWindow(window_id)
+            if self._wait_for_foreground(window_id):
+                return
+        finally:
+            for thread_id in reversed(attached_threads):
+                self._user32.AttachThreadInput(current_thread, thread_id, False)
+
+        foreground_id = int(self._user32.GetForegroundWindow() or 0)
+        raise DesktopBridgeError(
+            "Windows refused to focus the target window "
+            f"(target={window_id}, foreground={foreground_id})"
+        )
+
+    def _wait_for_foreground(
+        self, window_id: int, *, attempts: int = 3, delay: float = 0.05
+    ) -> bool:
+        for attempt in range(attempts):
+            if int(self._user32.GetForegroundWindow() or 0) == window_id:
+                return True
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+        return False
 
     def _focus_desktop_icons(self, program_manager_id: int) -> None:
         """Best-effort focus for both classic and modern Explorer desktops.

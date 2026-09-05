@@ -114,6 +114,9 @@ def test_desktop_response_schema_requires_action_specific_arguments() -> None:
     assert "use key_press" in build_desktop_system_prompt()
     assert "visible Login/Sign in button" in build_desktop_system_prompt()
     assert "must click the visible login" in build_desktop_system_prompt()
+    assert "Never use double_click on an in-app disclosure control" in (
+        build_desktop_system_prompt()
+    )
 
     forced_schema = build_desktop_response_format(allow_terminal=False)["json_schema"][
         "schema"
@@ -126,6 +129,17 @@ def test_desktop_response_schema_requires_action_specific_arguments() -> None:
     assert "final" not in forced_actions
     assert "handoff" not in forced_actions
 
+    restricted_schema = build_desktop_response_format(
+        excluded_actions=["key_press", "double_click"]
+    )["json_schema"]["schema"]
+    restricted_actions = {
+        item["properties"]["action"]["enum"][0]
+        for item in restricted_schema["oneOf"]
+    }
+    assert "click" in restricted_actions
+    assert "key_press" not in restricted_actions
+    assert "double_click" not in restricted_actions
+
 
 def test_desktop_runtime_detects_blocker_summaries() -> None:
     assert DesktopRuntime._looks_like_blocker("Please manually log in first")
@@ -133,6 +147,14 @@ def test_desktop_runtime_detects_blocker_summaries() -> None:
     assert not DesktopRuntime._looks_like_blocker(
         "Message sent to up_up and confirmed visible in the conversation"
     )
+
+
+def test_desktop_runtime_allows_double_click_only_for_explorer() -> None:
+    qq = WindowInfo(1, "QQ", "QQ.exe", 0, 0, 500, 700)
+    desktop = WindowInfo(2, "Windows Desktop", "explorer.exe", 0, 0, 1920, 1080)
+
+    assert not DesktopRuntime._allows_double_click(qq)
+    assert DesktopRuntime._allows_double_click(desktop)
 
 
 @pytest.mark.parametrize(
@@ -191,6 +213,170 @@ def test_desktop_bridge_prepares_program_manager_as_real_desktop(monkeypatch) ->
 
     assert bridge._user32.messages == [(99, 0x0111, 419, 0)]
     assert focused == [1]
+
+
+def test_desktop_bridge_focus_accepts_verified_foreground_when_api_returns_false(
+    monkeypatch,
+) -> None:
+    class FakeUser32:
+        def __init__(self) -> None:
+            self.foreground = 55
+            self.shown: list[tuple[int, int]] = []
+
+        @staticmethod
+        def IsWindow(_hwnd: int) -> int:
+            return 1
+
+        def ShowWindow(self, hwnd: int, command: int) -> int:
+            self.shown.append((hwnd, command))
+            return 1
+
+        def GetForegroundWindow(self) -> int:
+            return self.foreground
+
+        def SetForegroundWindow(self, hwnd: int) -> int:
+            self.foreground = hwnd
+            return 0
+
+    bridge = object.__new__(DesktopBridge)
+    bridge._user32 = FakeUser32()
+    bridge._kernel32 = None
+    monkeypatch.setattr("faraflow.desktop.bridge.time.sleep", lambda _seconds: None)
+
+    bridge._focus(123)
+
+    assert bridge._user32.foreground == 123
+    assert bridge._user32.shown == [(123, 9)]
+
+
+def test_desktop_bridge_focus_joins_input_queues_after_foreground_lock(monkeypatch) -> None:
+    class FakeKernel32:
+        @staticmethod
+        def GetCurrentThreadId() -> int:
+            return 7
+
+    class FakeUser32:
+        def __init__(self) -> None:
+            self.foreground = 55
+            self.attached: set[int] = set()
+            self.attach_calls: list[tuple[int, int, bool]] = []
+            self.activation_calls: list[tuple[str, int]] = []
+
+        @staticmethod
+        def IsWindow(_hwnd: int) -> int:
+            return 1
+
+        @staticmethod
+        def ShowWindow(_hwnd: int, _command: int) -> int:
+            return 1
+
+        def GetForegroundWindow(self) -> int:
+            return self.foreground
+
+        @staticmethod
+        def GetWindowThreadProcessId(hwnd: int, _process_id: None) -> int:
+            return {55: 5, 123: 12}[hwnd]
+
+        def AttachThreadInput(self, current: int, target: int, attach: bool) -> int:
+            self.attach_calls.append((current, target, attach))
+            if attach:
+                self.attached.add(target)
+            else:
+                self.attached.discard(target)
+            return 1
+
+        def SetForegroundWindow(self, hwnd: int) -> int:
+            if self.attached == {5, 12}:
+                self.foreground = hwnd
+                return 1
+            return 0
+
+        def BringWindowToTop(self, hwnd: int) -> int:
+            self.activation_calls.append(("top", hwnd))
+            return 1
+
+        def SetActiveWindow(self, hwnd: int) -> int:
+            self.activation_calls.append(("active", hwnd))
+            return 1
+
+        def SetFocus(self, hwnd: int) -> int:
+            self.activation_calls.append(("focus", hwnd))
+            return 1
+
+    bridge = object.__new__(DesktopBridge)
+    bridge._user32 = FakeUser32()
+    bridge._kernel32 = FakeKernel32()
+    monkeypatch.setattr("faraflow.desktop.bridge.time.sleep", lambda _seconds: None)
+
+    bridge._focus(123)
+
+    assert bridge._user32.foreground == 123
+    assert bridge._user32.activation_calls == [
+        ("top", 123),
+        ("active", 123),
+        ("focus", 123),
+    ]
+    assert bridge._user32.attach_calls == [
+        (7, 5, True),
+        (7, 12, True),
+        (7, 12, False),
+        (7, 5, False),
+    ]
+
+
+def test_desktop_bridge_focus_reports_actual_foreground_after_retries(monkeypatch) -> None:
+    class FakeKernel32:
+        @staticmethod
+        def GetCurrentThreadId() -> int:
+            return 7
+
+    class FakeUser32:
+        @staticmethod
+        def IsWindow(_hwnd: int) -> int:
+            return 1
+
+        @staticmethod
+        def ShowWindow(_hwnd: int, _command: int) -> int:
+            return 1
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 55
+
+        @staticmethod
+        def GetWindowThreadProcessId(hwnd: int, _process_id: None) -> int:
+            return {55: 5, 123: 12}[hwnd]
+
+        @staticmethod
+        def AttachThreadInput(_current: int, _target: int, _attach: bool) -> int:
+            return 1
+
+        @staticmethod
+        def SetForegroundWindow(_hwnd: int) -> int:
+            return 0
+
+        @staticmethod
+        def BringWindowToTop(_hwnd: int) -> int:
+            return 0
+
+        @staticmethod
+        def SetActiveWindow(_hwnd: int) -> int:
+            return 0
+
+        @staticmethod
+        def SetFocus(_hwnd: int) -> int:
+            return 0
+
+    bridge = object.__new__(DesktopBridge)
+    bridge._user32 = FakeUser32()
+    bridge._kernel32 = FakeKernel32()
+    monkeypatch.setattr("faraflow.desktop.bridge.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        DesktopBridgeError,
+        match=r"Windows refused to focus the target window \(target=123, foreground=55\)",
+    ):
+        bridge._focus(123)
 
 
 def test_desktop_bridge_uses_full_windows_input_structure() -> None:
@@ -491,13 +677,19 @@ async def test_desktop_adapter_requests_structured_json() -> None:
     fake = FakeDesktopClient(['{"action":"click","coordinate":[345,978]}'])
     adapter._client = fake  # type: ignore[assignment]
 
-    decision = await adapter.next_decision([])
+    decision = await adapter.next_decision([], excluded_actions=["key_press"])
 
     assert decision.action is not None
     assert decision.action.action == "click"
     response_format = fake.payloads[0]["response_format"]
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["strict"] is True
+    allowed_actions = {
+        item["properties"]["action"]["enum"][0]
+        for item in response_format["json_schema"]["schema"]["oneOf"]
+    }
+    assert "click" in allowed_actions
+    assert "key_press" not in allowed_actions
 
 
 @pytest.mark.asyncio

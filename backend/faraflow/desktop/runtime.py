@@ -296,6 +296,7 @@ class DesktopRuntime:
                 rejected_blocker_finals = 0
                 rejected_handoffs = 0
                 force_action_next = False
+                excluded_action_next: Optional[str] = None
                 for step_no in range(first_step, self.settings.desktop_max_steps + 1):
                     if time.monotonic() >= deadline:
                         raise TimeoutError("desktop run exceeded maximum runtime")
@@ -310,11 +311,18 @@ class DesktopRuntime:
                             },
                         )()
                     else:
+                        excluded_for_decision: List[str] = []
+                        if excluded_action_next:
+                            excluded_for_decision.append(excluded_action_next)
+                        if not self._allows_double_click(target):
+                            excluded_for_decision.append("double_click")
                         decision = await self.adapter.next_decision(
                             conversation,
                             allow_terminal=not force_action_next,
+                            excluded_actions=excluded_for_decision or None,
                         )
                         force_action_next = False
+                        excluded_action_next = None
                     pending = None
                     if decision.kind == "handoff":
                         summary = decision.answer or "Desktop task requires user assistance."
@@ -427,6 +435,21 @@ class DesktopRuntime:
                     if decision.action is None:
                         raise DesktopProtocolError("desktop model returned no action")
                     action = decision.action
+                    effective_raw_response = decision.raw_response
+                    if action.action == "double_click" and not self._allows_double_click(target):
+                        action = action.model_copy(update={"action": "click"})
+                        effective_raw_response = action.model_dump_json(exclude_none=True)
+                        await self.emit(
+                            record.session_id,
+                            "desktop.action.normalized",
+                            "已将应用内双击降级为单击，避免重复切换控件状态",
+                            {
+                                "step_no": step_no,
+                                "from": "double_click",
+                                "to": "click",
+                                "target_process": target.process_name,
+                            },
+                        )
                     rejected_blocker_finals = 0
                     rejected_handoffs = 0
                     signature = action.model_dump_json(exclude_none=True)
@@ -439,16 +462,42 @@ class DesktopRuntime:
                         corrective_screenshot = await asyncio.to_thread(
                             self.bridge.capture, target
                         )
+                        blocked_ref = self.artifacts.save_bytes(
+                            record.session_id,
+                            f"step_{step_no:03d}_blocked.png",
+                            corrective_screenshot,
+                            subdirectory="desktop",
+                        )
+                        excluded_action_next = action.action
+                        await self.repository.append_desktop_action(
+                            desktop_run_id=desktop_run_id,
+                            session_id=record.session_id,
+                            step_no=step_no,
+                            action_name=action.action,
+                            arguments=self.policy.audit_arguments(action),
+                            status="BLOCKED",
+                            screenshot_before=blocked_ref,
+                            screenshot_after=blocked_ref,
+                            execution_result={
+                                "reason": "duplicate_action",
+                                "repeat_count": repeated_action_count,
+                                "excluded_next": action.action,
+                            },
+                        )
+                        await self.repository.update_desktop_run(
+                            desktop_run_id, last_screenshot_ref=blocked_ref
+                        )
                         conversation.append(
-                            {"role": "assistant", "content": decision.raw_response}
+                            {"role": "assistant", "content": effective_raw_response}
                         )
                         conversation.append(
                             self.adapter.observation_message(
                                 (
                                     "The exact same action was already executed and did not "
-                                    "advance the task. Do not repeat it. If the intended desktop "
-                                    "item is selected, use key_press with ENTER; otherwise choose "
-                                    "a different safe action."
+                                    "advance the task. That action type is unavailable for the "
+                                    "next decision. Inspect the current screenshot and choose a "
+                                    "different visible control or another safe action type. For "
+                                    "long keyboard navigation, prefer clicking the visible target."
                                 ),
                                 corrective_screenshot,
                             )
@@ -457,7 +506,11 @@ class DesktopRuntime:
                             record.session_id,
                             "desktop.action.duplicate_blocked",
                             "已阻止重复桌面动作，并要求模型改用其他操作",
-                            {"step_no": step_no, "action": action.action},
+                            {
+                                "step_no": step_no,
+                                "action": action.action,
+                                "excluded_next": action.action,
+                            },
                         )
                         continue
                     if repeated_action_count >= 3:
@@ -603,7 +656,9 @@ class DesktopRuntime:
                         f"已执行桌面动作：{action.action}",
                         {"step_no": step_no, "action": action.action},
                     )
-                    conversation.append({"role": "assistant", "content": decision.raw_response})
+                    conversation.append(
+                        {"role": "assistant", "content": effective_raw_response}
+                    )
                     conversation.append(
                         self.adapter.observation_message(str(result), after)
                     )
@@ -629,6 +684,11 @@ class DesktopRuntime:
                     "桌面任务执行失败",
                     {"error_type": type(exc).__name__, "message": str(exc)},
                 )
+
+    @staticmethod
+    def _allows_double_click(target: WindowInfo) -> bool:
+        process_name = target.process_name.replace("/", "\\").rsplit("\\", 1)[-1]
+        return process_name.casefold() == "explorer.exe"
 
     @staticmethod
     def _looks_like_blocker(summary: str) -> bool:

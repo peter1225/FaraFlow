@@ -191,7 +191,11 @@ def parse_desktop_response(content: str) -> DesktopDecision:
     raise DesktopProtocolError("desktop response did not contain a desktop action or final block")
 
 
-def build_desktop_response_format(*, allow_terminal: bool = True) -> Dict[str, Any]:
+def build_desktop_response_format(
+    *,
+    allow_terminal: bool = True,
+    excluded_actions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Return a schema that enforces the arguments required by each action."""
 
     coordinate = {
@@ -254,6 +258,15 @@ def build_desktop_response_format(*, allow_terminal: bool = True) -> Dict[str, A
                 variant("handoff", required=("answer",)),
             ]
         )
+    excluded = set(excluded_actions or ())
+    if excluded:
+        variants = [
+            item
+            for item in variants
+            if item["properties"]["action"]["enum"][0] not in excluded
+        ]
+    if not variants:
+        raise ValueError("desktop response schema must allow at least one action")
     return {
         "type": "json_schema",
         "json_schema": {
@@ -290,6 +303,10 @@ just to dismiss a menu or change focus; use ESC when a visible menu must be clos
 To open a Windows desktop shortcut, issue double_click exactly once. The runtime converts that
 single action into Explorer's native Open command; do not add a separate wait, right-click,
 or repeated double-click unless a new screenshot clearly shows that launch failed.
+Inside a running application, use click for buttons, list rows, tabs, disclosure arrows, and
+expand/collapse group headers. Never use double_click on an in-app disclosure control because
+the second click immediately reverses the first one. Reserve double_click for Windows desktop
+shortcuts and File Explorer items that conventionally require it.
 Do not return final until every part of the request is visibly complete. For a messaging task,
 opening the app is not completion: verify the intended account is signed in, select the exact
 recipient, send the exact text, and confirm the sent message is visible in that conversation.

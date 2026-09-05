@@ -103,6 +103,7 @@ class DesktopAdapter:
         conversation: List[Dict[str, Any]],
         *,
         allow_terminal: bool = True,
+        excluded_actions: Optional[List[str]] = None,
     ) -> DesktopDecision:
         if not self.configured:
             raise ModelEndpointError("desktop model is not configured")
@@ -115,7 +116,8 @@ class DesktopAdapter:
             "temperature": 0.0,
             "max_tokens": self.settings.desktop_max_tokens,
             "response_format": build_desktop_response_format(
-                allow_terminal=allow_terminal
+                allow_terminal=allow_terminal,
+                excluded_actions=excluded_actions,
             ),
         }
         last_error: Optional[Exception] = DesktopProtocolError("no response")
