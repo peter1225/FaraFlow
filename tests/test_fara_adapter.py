@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest
 from faraflow.config import Settings
 from faraflow.model.fara_adapter import FaraAdapter

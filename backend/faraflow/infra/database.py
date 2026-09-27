@@ -192,6 +192,8 @@ class CodeRunRecord(Base):
     session_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     instruction: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), index=True)
+    engine: Mapped[str] = mapped_column(String(30), default="native")
+    model: Mapped[str] = mapped_column(String(300), default="")
     isolation_kind: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     isolated_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     base_revision: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
@@ -200,10 +202,45 @@ class CodeRunRecord(Base):
     final_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     changed_paths: Mapped[List[str]] = mapped_column(JSON, default=list)
     diff_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    review_revision: Mapped[int] = mapped_column(Integer, default=0)
+    review_manifest: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CodeTurnRecord(Base):
+    __tablename__ = "ff_code_turns"
+    __table_args__ = (UniqueConstraint("code_run_id", "ordinal"),)
+
+    turn_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_code_runs.code_run_id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    instruction: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CodeReviewRecord(Base):
+    __tablename__ = "ff_code_review_revisions"
+    __table_args__ = (UniqueConstraint("code_run_id", "revision"),)
+
+    review_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_code_runs.code_run_id", ondelete="CASCADE"), index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer)
+    changed_paths: Mapped[List[str]] = mapped_column(JSON, default=list)
+    manifest: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    diff_ref: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ToolCallRecord(Base):
@@ -215,6 +252,12 @@ class ToolCallRecord(Base):
         String(64), ForeignKey("ff_code_runs.code_run_id", ondelete="CASCADE"), index=True
     )
     session_id: Mapped[str] = mapped_column(String(64), index=True)
+    turn_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("ff_code_turns.turn_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     step_no: Mapped[int] = mapped_column(Integer)
     tool_name: Mapped[str] = mapped_column(String(60))
     arguments: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)

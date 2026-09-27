@@ -1,4 +1,4 @@
-# Pico 代码执行引擎（第一版）
+# Pico 代码执行引擎与持续协作
 
 FaraFlow 后端继续使用本地 conda `zzx`。`native` 是默认代码引擎，Pico 通过独立进程接入；API 进程不导入 Pico，也不把 Pico 依赖安装进 `zzx`。
 
@@ -39,17 +39,33 @@ FARAFLOW_PICO_CONTEXT_WINDOW_TOKENS=32768
 
 Worker 的工具限制是能力边界，不是操作系统沙箱。第一版没有任意命令、测试或构建执行能力。停止任务时，系统会等待在途文件操作和审计完成，再关闭 Worker 和清理隔离目录。
 
-Pico 状态位于 `<PICO_STATE_ROOT>/<code_run_id>`，可能包含代码与模型会话，应按本地私有数据管理。它不会通过 artifacts API 发布，也不进入代码 Diff。第一版暂不实现自动保留期清理、跨进程恢复、补充指令、多 Turn 协作、逐 token 输出或多 Agent。
+Pico 状态位于 `<PICO_STATE_ROOT>/<code_run_id>`，可能包含代码与模型会话，应按本地私有数据管理。它不会通过 artifacts API 发布，也不进入代码 Diff。
+
+## 第二版持续协作
+
+同一个 CodeRun 现在可以包含多个 Turn。初始要求和后续要求按顺序执行，共用隔离目录、基线、Session 和固定的引擎/模型配置。前端“继续修改”会追加 Turn；运行中追加的要求进入队列。
+
+每轮结束后，系统重新对比初始基线并生成累计 Diff。发生文件变化时会创建不可变审核版本：
+
+- `review_revision` 从 1 递增；
+- 每个版本保存独立的文件快照、哈希与 Diff；
+- 应用请求必须携带当前审核版本，过期版本返回 409；
+- 应用使用审核快照，不读取可能继续变化的隔离目录；
+- 应用和撤销按工作区串行执行，并继续检查原目录冲突。
+
+“停止并保留修改”会取消当前及排队 Turn，等待正在进行的文件操作与审计完成，然后把任务置为 `PAUSED`。存在修改时仍可应用或继续修改。“丢弃任务”才会清理隔离目录。
+
+后端重启会把执行中的 CodeRun 标记为 `INTERRUPTED`，保留隔离目录和历史记录；可以追加新 Turn 继续处理。当前版本尚未自动重放中断中的模型调用，也不开放测试命令、Shell、逐 token 输出或多 Agent 写入。
 
 ## 验证
 
 后端验证使用现有 `zzx`：
 
 ```powershell
-conda run -n zzx python -m pytest tests/test_code_workspace.py tests/test_pico_bridge.py tests/test_api.py tests/test_chat_service.py tests/test_chat_adapter.py -q
+conda run -n zzx python -m pytest tests/test_code_workspace.py tests/test_pico_bridge.py tests/test_migrations.py tests/test_api.py tests/test_chat_service.py tests/test_chat_adapter.py -q
 ```
 
-桥接测试使用真实子进程和模拟 Worker，覆盖越界路径、敏感文件、读后写、Diff、应用冲突、撤销、畸形协议、启动超时和取消回收。它不能替代 Pico 与实际 CodingModel 的集成验收。
+测试覆盖越界路径、敏感文件、读后写、多轮累计修改、轮次排队、暂停保留、审核版本冲突、不可变快照、撤销、畸形协议、启动超时和取消回收。它不能替代 Pico 与实际 CodingModel 的集成验收。
 
 ## 升级约束
 

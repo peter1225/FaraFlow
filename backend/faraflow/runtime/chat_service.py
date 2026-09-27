@@ -365,15 +365,24 @@ class ChatService:
             raise ValueError("code mode requires a workspace bound to the chat")
         if self.code_runs is None:
             raise RuntimeError("code runtime is unavailable")
-        code_run = await self.code_runs.create(
-            CodeRunCreate(
-                workspace_id=chat.workspace_id,
-                chat_id=chat_id,
-                instruction=request.content,
-                auto_start=request.auto_start,
-            )
+        code_run = await self.code_runs.continue_chat_run(
+            chat_id, request.content, auto_start=request.auto_start
         )
-        reply = "已在隔离工作区中启动代码任务；生成修改后会展示 Diff，确认前不会改动原目录。"
+        continued = code_run is not None
+        if code_run is None:
+            code_run = await self.code_runs.create(
+                CodeRunCreate(
+                    workspace_id=chat.workspace_id,
+                    chat_id=chat_id,
+                    instruction=request.content,
+                    auto_start=request.auto_start,
+                )
+            )
+        reply = (
+            "已将要求加入当前代码任务；会继续修改同一隔离工作区并生成新的审核版本。"
+            if continued
+            else "已在隔离工作区中启动代码任务；生成修改后会展示 Diff，确认前不会改动原目录。"
+        )
         await self.repository.append_chat_message(
             chat_id=chat_id,
             role="assistant",

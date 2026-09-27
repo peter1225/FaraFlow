@@ -79,7 +79,8 @@ class PicoCodeEngine:
             forbidden = forbidden.resolve()
             if state == forbidden or forbidden in state.parents:
                 raise ValueError("FARAFLOW_PICO_STATE_ROOT must be outside source/artifact roots")
-        state.mkdir(parents=True, exist_ok=False)
+        # Keep one Pico session directory for all turns of this CodeRun.
+        state.mkdir(parents=True, exist_ok=True)
         env = {
             key: value
             for key, value in os.environ.items()

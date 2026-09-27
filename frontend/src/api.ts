@@ -164,8 +164,18 @@ export const api = {
     request<CodeDiff>(`/v1/code-runs/${codeRunId}/diff`),
   codeRunEvents: (codeRunId: string) =>
     request<SessionEvent[]>(`/v1/code-runs/${codeRunId}/events`),
-  applyCodeRun: (codeRunId: string) =>
-    request<CodeRun>(`/v1/code-runs/${codeRunId}/apply`, { method: "POST" }),
+  continueCodeRun: (codeRunId: string, instruction: string) =>
+    request<CodeRun>(`/v1/code-runs/${codeRunId}/turns`, {
+      method: "POST",
+      body: JSON.stringify({ instruction, auto_start: true }),
+    }),
+  pauseCodeRun: (codeRunId: string) =>
+    request<CodeRun>(`/v1/code-runs/${codeRunId}/pause`, { method: "POST" }),
+  applyCodeRun: (codeRunId: string, reviewRevision: number) =>
+    request<CodeRun>(`/v1/code-runs/${codeRunId}/apply`, {
+      method: "POST",
+      body: JSON.stringify({ review_revision: reviewRevision }),
+    }),
   revertCodeRun: (codeRunId: string) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/revert`, { method: "POST" }),
   discardCodeRun: (codeRunId: string) =>

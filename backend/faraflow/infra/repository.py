@@ -1,12 +1,18 @@
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
-from sqlalchemy import Select, desc, select, update
+from sqlalchemy import Select, desc, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from faraflow.domain.enums import ApprovalStatus, CodeRunStatus, DesktopRunStatus, SessionState
+from faraflow.domain.enums import (
+    ApprovalStatus,
+    CodeRunStatus,
+    CodeTurnStatus,
+    DesktopRunStatus,
+    SessionState,
+)
 from faraflow.domain.schemas import ChatCreate, SkillManifest, TaskCreate, WorkspaceCreate
 
 from .database import (
@@ -14,7 +20,9 @@ from .database import (
     ApprovalRecord,
     ChatMessageRecord,
     ChatThreadRecord,
+    CodeReviewRecord,
     CodeRunRecord,
+    CodeTurnRecord,
     DesktopActionRecord,
     DesktopApprovalRecord,
     DesktopRunRecord,
@@ -219,7 +227,10 @@ class Repository:
                         [
                             CodeRunStatus.CREATED.value,
                             CodeRunStatus.RUNNING.value,
+                            CodeRunStatus.PAUSED.value,
                             CodeRunStatus.REVIEW_REQUIRED.value,
+                            CodeRunStatus.FAILED.value,
+                            CodeRunStatus.INTERRUPTED.value,
                         ]
                     ),
                 )
@@ -243,6 +254,8 @@ class Repository:
         workspace_id: str,
         instruction: str,
         chat_id: Optional[str] = None,
+        engine: str = "native",
+        model: str = "",
     ) -> CodeRunRecord:
         async with self._session_factory() as db:
             workspace = await db.get(WorkspaceRecord, workspace_id)
@@ -261,8 +274,20 @@ class Repository:
                 session_id=new_id("sess"),
                 instruction=instruction,
                 status=CodeRunStatus.CREATED.value,
+                engine=engine,
+                model=model,
             )
             db.add(record)
+            await db.flush()
+            db.add(
+                CodeTurnRecord(
+                    turn_id=new_id("turn"),
+                    code_run_id=record.code_run_id,
+                    ordinal=1,
+                    instruction=instruction,
+                    status=CodeTurnStatus.QUEUED.value,
+                )
+            )
             await db.commit()
             await db.refresh(record)
             return record
@@ -292,6 +317,144 @@ class Repository:
         async with self._session_factory() as db:
             return list((await db.scalars(statement)).all())
 
+    async def get_latest_open_code_run(self, chat_id: str) -> Optional[CodeRunRecord]:
+        async with self._session_factory() as db:
+            return cast(
+                Optional[CodeRunRecord],
+                await db.scalar(
+                    select(CodeRunRecord)
+                    .where(
+                        CodeRunRecord.chat_id == chat_id,
+                        CodeRunRecord.status.in_(
+                            [
+                                CodeRunStatus.CREATED.value,
+                                CodeRunStatus.RUNNING.value,
+                                CodeRunStatus.PAUSED.value,
+                                CodeRunStatus.REVIEW_REQUIRED.value,
+                                CodeRunStatus.FAILED.value,
+                                CodeRunStatus.INTERRUPTED.value,
+                            ]
+                        ),
+                    )
+                    .order_by(desc(CodeRunRecord.created_at))
+                    .limit(1)
+                )
+            )
+
+    async def create_code_turn(self, code_run_id: str, instruction: str) -> CodeTurnRecord:
+        allowed = {
+            CodeRunStatus.CREATED.value,
+            CodeRunStatus.RUNNING.value,
+            CodeRunStatus.PAUSED.value,
+            CodeRunStatus.REVIEW_REQUIRED.value,
+            CodeRunStatus.FAILED.value,
+            CodeRunStatus.INTERRUPTED.value,
+        }
+        async with self._session_factory() as db:
+            run = await db.get(CodeRunRecord, code_run_id)
+            if run is None:
+                raise NotFoundError(f"code run {code_run_id} not found")
+            if run.status not in allowed:
+                raise ConflictError(f"cannot continue code run in state {run.status}")
+            ordinal = int(
+                await db.scalar(
+                    select(func.coalesce(func.max(CodeTurnRecord.ordinal), 0)).where(
+                        CodeTurnRecord.code_run_id == code_run_id
+                    )
+                )
+                or 0
+            ) + 1
+            turn = CodeTurnRecord(
+                turn_id=new_id("turn"),
+                code_run_id=code_run_id,
+                ordinal=ordinal,
+                instruction=instruction,
+                status=CodeTurnStatus.QUEUED.value,
+            )
+            if run.status != CodeRunStatus.RUNNING.value:
+                run.status = CodeRunStatus.CREATED.value
+            run.finished_at = None
+            run.error = None
+            db.add(turn)
+            await db.commit()
+            await db.refresh(turn)
+            return turn
+
+    async def list_code_turns(self, code_run_id: str) -> List[CodeTurnRecord]:
+        await self.get_code_run(code_run_id)
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(CodeTurnRecord)
+                .where(CodeTurnRecord.code_run_id == code_run_id)
+                .order_by(CodeTurnRecord.ordinal)
+            )
+            return list(rows.all())
+
+    async def next_queued_code_turn(self, code_run_id: str) -> Optional[CodeTurnRecord]:
+        async with self._session_factory() as db:
+            return cast(
+                Optional[CodeTurnRecord],
+                await db.scalar(
+                    select(CodeTurnRecord)
+                    .where(
+                        CodeTurnRecord.code_run_id == code_run_id,
+                        CodeTurnRecord.status == CodeTurnStatus.QUEUED.value,
+                    )
+                    .order_by(CodeTurnRecord.ordinal)
+                    .limit(1)
+                )
+            )
+
+    async def update_code_turn(
+        self,
+        turn_id: str,
+        status: CodeTurnStatus,
+        *,
+        summary: Optional[str] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> CodeTurnRecord:
+        async with self._session_factory() as db:
+            turn = await db.get(CodeTurnRecord, turn_id)
+            if turn is None:
+                raise NotFoundError(f"code turn {turn_id} not found")
+            turn.status = status.value
+            if status == CodeTurnStatus.RUNNING:
+                turn.started_at = now_utc()
+                turn.finished_at = None
+            if status in {
+                CodeTurnStatus.COMPLETED,
+                CodeTurnStatus.FAILED,
+                CodeTurnStatus.CANCELLED,
+            }:
+                turn.finished_at = now_utc()
+            if summary is not None:
+                turn.summary = summary
+            if error is not None:
+                turn.error = error
+            await db.commit()
+            await db.refresh(turn)
+            return turn
+
+    async def cancel_open_code_turns(self, code_run_id: str) -> int:
+        async with self._session_factory() as db:
+            rows = list(
+                (
+                    await db.scalars(
+                        select(CodeTurnRecord).where(
+                            CodeTurnRecord.code_run_id == code_run_id,
+                            CodeTurnRecord.status.in_(
+                                [CodeTurnStatus.QUEUED.value, CodeTurnStatus.RUNNING.value]
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            for turn in rows:
+                turn.status = CodeTurnStatus.CANCELLED.value
+                turn.finished_at = now_utc()
+            await db.commit()
+            return len(rows)
+
     async def update_code_run(
         self,
         code_run_id: str,
@@ -306,6 +469,8 @@ class Repository:
         changed_paths: Optional[List[str]] = None,
         diff_ref: Optional[str] = None,
         error: Optional[Dict[str, Any]] = None,
+        review_revision: Optional[int] = None,
+        review_manifest: Optional[Dict[str, Any]] = None,
     ) -> CodeRunRecord:
         async with self._session_factory() as db:
             record = await db.get(CodeRunRecord, code_run_id)
@@ -315,6 +480,9 @@ class Repository:
                 record.status = status.value
                 if status == CodeRunStatus.RUNNING and record.started_at is None:
                     record.started_at = now_utc()
+                if status == CodeRunStatus.RUNNING:
+                    record.finished_at = None
+                    record.error = None
                 if status in {
                     CodeRunStatus.APPLIED,
                     CodeRunStatus.DISCARDED,
@@ -341,6 +509,10 @@ class Repository:
                 record.diff_ref = diff_ref
             if error is not None:
                 record.error = error
+            if review_revision is not None:
+                record.review_revision = review_revision
+            if review_manifest is not None:
+                record.review_manifest = review_manifest
             await db.commit()
             await db.refresh(record)
             return record
@@ -360,14 +532,78 @@ class Repository:
                 record.status = CodeRunStatus.INTERRUPTED.value
                 record.finished_at = now_utc()
                 record.error = {"reason": "server_restarted"}
+                turns = list(
+                    (
+                        await db.scalars(
+                            select(CodeTurnRecord).where(
+                                CodeTurnRecord.code_run_id == record.code_run_id,
+                                CodeTurnRecord.status == CodeTurnStatus.RUNNING.value,
+                            )
+                        )
+                    ).all()
+                )
+                for turn in turns:
+                    turn.status = CodeTurnStatus.CANCELLED.value
+                    turn.finished_at = now_utc()
             await db.commit()
             return len(rows)
+
+    async def create_code_review(
+        self,
+        code_run_id: str,
+        *,
+        revision: int,
+        changed_paths: List[str],
+        manifest: Dict[str, Any],
+        diff_ref: str,
+        status: CodeRunStatus,
+        final_summary: str,
+    ) -> CodeReviewRecord:
+        async with self._session_factory() as db:
+            run = await db.get(CodeRunRecord, code_run_id)
+            if run is None:
+                raise NotFoundError(f"code run {code_run_id} not found")
+            if revision != int(run.review_revision or 0) + 1:
+                raise ConflictError("review revision is stale")
+            review = CodeReviewRecord(
+                review_id=new_id("review"),
+                code_run_id=code_run_id,
+                revision=revision,
+                changed_paths=changed_paths,
+                manifest=manifest,
+                diff_ref=diff_ref,
+            )
+            run.status = status.value
+            run.final_summary = final_summary
+            run.changed_paths = changed_paths
+            run.diff_ref = diff_ref
+            run.review_revision = revision
+            run.review_manifest = manifest
+            db.add(review)
+            await db.commit()
+            await db.refresh(review)
+            return review
+
+    async def get_code_review(self, code_run_id: str, revision: int) -> CodeReviewRecord:
+        async with self._session_factory() as db:
+            review = await db.scalar(
+                select(CodeReviewRecord).where(
+                    CodeReviewRecord.code_run_id == code_run_id,
+                    CodeReviewRecord.revision == revision,
+                )
+            )
+            if review is None:
+                raise NotFoundError(
+                    f"review revision {revision} for code run {code_run_id} not found"
+                )
+            return review
 
     async def append_tool_call(
         self,
         *,
         code_run_id: str,
         session_id: str,
+        turn_id: Optional[str] = None,
         step_no: int,
         tool_name: str,
         arguments: Dict[str, Any],
@@ -384,6 +620,7 @@ class Repository:
                 tool_call_id=new_id("tool"),
                 code_run_id=code_run_id,
                 session_id=session_id,
+                turn_id=turn_id,
                 step_no=step_no,
                 tool_name=tool_name,
                 arguments=arguments,
@@ -487,7 +724,7 @@ class Repository:
                     record.started_at = now_utc()
                     record.finished_at = None
                     record.error = None
-                    record.pending_action = None
+                    record.pending_action = {}
                     record.final_summary = None
                 if status in {
                     DesktopRunStatus.COMPLETED,

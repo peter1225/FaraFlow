@@ -3,7 +3,14 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .enums import ApprovalStatus, CodeRunStatus, DesktopRunStatus, RiskLevel, SessionState
+from .enums import (
+    ApprovalStatus,
+    CodeRunStatus,
+    CodeTurnStatus,
+    DesktopRunStatus,
+    RiskLevel,
+    SessionState,
+)
 
 
 class ApprovalPolicy(BaseModel):
@@ -104,10 +111,32 @@ class CodeRunCreate(BaseModel):
     auto_start: bool = True
 
 
+class CodeTurnCreate(BaseModel):
+    instruction: str = Field(min_length=1, max_length=10_000)
+    auto_start: bool = True
+
+
+class CodeRunApply(BaseModel):
+    review_revision: int = Field(ge=1)
+
+
+class CodeTurnView(BaseModel):
+    turn_id: str
+    ordinal: int
+    instruction: str
+    status: CodeTurnStatus
+    summary: Optional[str] = None
+    error: Optional[Dict[str, Any]] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
 class ToolCallView(BaseModel):
     tool_call_id: str
     step_no: int
     tool_name: str
+    turn_id: Optional[str] = None
     status: str
     affected_paths: List[str] = Field(default_factory=list)
     diff_summary: List[str] = Field(default_factory=list)
@@ -125,21 +154,26 @@ class CodeRunView(BaseModel):
     session_id: str
     instruction: str
     status: CodeRunStatus
+    engine: str = "native"
+    model: str = ""
     isolation_kind: Optional[Literal["worktree", "snapshot"]] = None
     base_revision: Optional[str] = None
     final_summary: Optional[str] = None
     changed_paths: List[str] = Field(default_factory=list)
     diff_ref: Optional[str] = None
+    review_revision: int = 0
     error: Optional[Dict[str, Any]] = None
     created_at: datetime
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     tool_calls: List[ToolCallView] = Field(default_factory=list)
+    turns: List[CodeTurnView] = Field(default_factory=list)
 
 
 class CodeDiffView(BaseModel):
     code_run_id: str
     status: CodeRunStatus
+    review_revision: int = 0
     changed_paths: List[str] = Field(default_factory=list)
     diff: str = ""
 

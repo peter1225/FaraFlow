@@ -13,6 +13,7 @@ import type {
 const STATUS_TEXT: Record<CodeRun["status"], string> = {
   CREATED: "待执行",
   RUNNING: "执行中",
+  PAUSED: "已停止（修改已保留）",
   REVIEW_REQUIRED: "等待审核",
   APPLIED: "已应用",
   DISCARDED: "已丢弃",
@@ -44,6 +45,7 @@ export function CodeWorkspace({
   const [diff, setDiff] = useState<CodeDiff>();
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [busy, setBusy] = useState(false);
+  const [continuation, setContinuation] = useState("");
   const [error, setError] = useState("");
 
   const selectedRun = useMemo(
@@ -120,17 +122,36 @@ export function CodeWorkspace({
     }
   }
 
-  async function runAction(action: "apply" | "discard" | "revert") {
+  async function runAction(action: "apply" | "pause" | "discard" | "revert") {
     if (!selectedRun) return;
     setBusy(true);
     setError("");
     try {
-      if (action === "apply") await api.applyCodeRun(selectedRun.code_run_id);
+      if (action === "apply") {
+        if (!diff?.review_revision) throw new Error("请先加载最新审核版本");
+        await api.applyCodeRun(selectedRun.code_run_id, diff.review_revision);
+      }
+      if (action === "pause") await api.pauseCodeRun(selectedRun.code_run_id);
       if (action === "discard") await api.discardCodeRun(selectedRun.code_run_id);
       if (action === "revert") await api.revertCodeRun(selectedRun.code_run_id);
       await Promise.all([loadRuns(), refreshRun(), loadTree()]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "操作失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function continueRun() {
+    if (!selectedRun || !continuation.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.continueCodeRun(selectedRun.code_run_id, continuation.trim());
+      setContinuation("");
+      await Promise.all([loadRuns(), refreshRun()]);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "追加要求失败");
     } finally {
       setBusy(false);
     }
@@ -197,6 +218,16 @@ export function CodeWorkspace({
                 <p>{selectedRun.final_summary ?? selectedRun.instruction}</p>
                 {selectedRun.error && <p role="alert">{String(selectedRun.error.message ?? "代码执行失败")}</p>}
               </div>
+              {selectedRun.turns.map((turn) => (
+                <article className="tool-step code-turn" key={turn.turn_id}>
+                  <span>{turn.ordinal}</span>
+                  <div>
+                    <strong>{turn.instruction}</strong>
+                    <small>{turn.status}</small>
+                    {turn.summary && <p>{turn.summary}</p>}
+                  </div>
+                </article>
+              ))}
               {events.filter((event) => ["code.engine.ready", "code.text", "code.usage"].includes(event.event_type)).map((event) => (
                 <article className="tool-step" key={event.event_id}>
                   <div><p>{event.message}</p>
@@ -222,12 +253,38 @@ export function CodeWorkspace({
         <section className="code-review panel-card">
           <div className="panel-title">
             <span>{diff?.diff ? "统一 Diff" : file ? file.path : "内容与审核"}</span>
-            <small>{diff?.changed_paths.length ?? 0} FILES CHANGED</small>
+            <small>
+              {diff?.changed_paths.length ?? 0} FILES CHANGED
+              {diff?.review_revision ? ` · REV ${diff.review_revision}` : ""}
+            </small>
           </div>
-          {selectedRun?.status === "REVIEW_REQUIRED" && (
+          {selectedRun && ["CREATED", "RUNNING", "PAUSED", "REVIEW_REQUIRED", "FAILED", "INTERRUPTED"].includes(selectedRun.status) && (
+            <div className="code-continuation">
+              <textarea
+                aria-label="继续修改要求"
+                value={continuation}
+                onChange={(event) => setContinuation(event.target.value)}
+                placeholder="继续修改当前任务，例如：把错误提示改成中文"
+              />
+              <button
+                className="button primary"
+                disabled={busy || !continuation.trim()}
+                onClick={() => void continueRun()}
+              >
+                {selectedRun.status === "RUNNING" ? "排队追加要求" : "继续修改"}
+              </button>
+            </div>
+          )}
+          {selectedRun && ["REVIEW_REQUIRED", "PAUSED", "FAILED"].includes(selectedRun.status) && Boolean(diff?.diff) && (
             <div className="review-actions">
               <button className="button primary" disabled={busy} onClick={() => void runAction("apply")}>应用修改</button>
               <button className="button secondary" disabled={busy} onClick={() => void runAction("discard")}>丢弃修改</button>
+            </div>
+          )}
+          {selectedRun?.status === "RUNNING" && (
+            <div className="review-actions">
+              <button className="button secondary" disabled={busy} onClick={() => void runAction("pause")}>停止并保留修改</button>
+              <button className="button secondary danger-text" disabled={busy} onClick={() => void runAction("discard")}>丢弃任务</button>
             </div>
           )}
           {selectedRun?.status === "APPLIED" && (
@@ -236,14 +293,14 @@ export function CodeWorkspace({
             </div>
           )}
           {selectedRun &&
-            ["CREATED", "RUNNING", "FAILED", "INTERRUPTED"].includes(selectedRun.status) && (
+            ["CREATED", "PAUSED", "FAILED", "INTERRUPTED"].includes(selectedRun.status) && !diff?.diff && (
               <div className="review-actions">
                 <button
                   className="button secondary"
                   disabled={busy}
                   onClick={() => void runAction("discard")}
                 >
-                  {selectedRun.status === "RUNNING" ? "停止并丢弃" : "丢弃运行"}
+                  丢弃任务
                 </button>
               </div>
             )}

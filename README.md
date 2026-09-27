@@ -1,6 +1,6 @@
 # FaraFlow
 
-可选 Pico 代码执行引擎的配置、独立运行环境和第一版边界见 [Pico 接入说明](docs/pico-integration.md)。后端仍可使用 conda `zzx`，默认代码引擎为 `native`。
+可选 Pico 代码执行引擎、独立运行环境、多轮协作和版本化审核见 [Pico 接入说明](docs/pico-integration.md)。后端仍可使用 conda `zzx`，默认代码引擎为 `native`。
 
 FaraFlow 是一个带安全边界的本地 Agent 工作台。它将普通聊天、Microsoft Fara1.5
 浏览器自动化、本地代码工作区和 Windows 桌面控制放进独立执行平面，并统一提供会话、审批、Diff 审核、

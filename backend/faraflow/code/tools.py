@@ -38,6 +38,7 @@ class CodeToolExecutor:
         *,
         code_run_id: str,
         session_id: str,
+        turn_id: Optional[str] = None,
         root: Path,
         baseline_manifest: Dict[str, Optional[str]],
         repository: Repository,
@@ -47,6 +48,7 @@ class CodeToolExecutor:
     ) -> None:
         self.code_run_id = code_run_id
         self.session_id = session_id
+        self.turn_id = turn_id
         self.root = root.resolve()
         self.baseline_manifest = baseline_manifest
         self.repository = repository
@@ -82,6 +84,7 @@ class CodeToolExecutor:
         await self.repository.append_tool_call(
             code_run_id=self.code_run_id,
             session_id=self.session_id,
+            turn_id=self.turn_id,
             step_no=step_no,
             tool_name=name,
             arguments=self._redact_arguments(name, arguments),

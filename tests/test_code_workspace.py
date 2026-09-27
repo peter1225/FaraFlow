@@ -53,6 +53,20 @@ def wait_for_status(client: TestClient, code_run_id: str, status: str) -> dict:
     raise AssertionError(f"code run did not reach {status}")
 
 
+def wait_for_review(client: TestClient, code_run_id: str, revision: int) -> dict:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        response = client.get(f"/v1/code-runs/{code_run_id}")
+        assert response.status_code == 200, response.text
+        body = response.json()
+        if body["status"] == "REVIEW_REQUIRED" and body["review_revision"] == revision:
+            return body
+        if body["status"] == "FAILED":
+            raise AssertionError(body)
+        time.sleep(0.05)
+    raise AssertionError(f"code run did not reach review revision {revision}")
+
+
 def code_decisions(old_title: str, new_title: str) -> list[CodeDecision]:
     return [
         CodeDecision(
@@ -160,7 +174,10 @@ def test_workspace_code_run_review_apply_revert_and_conflict(tmp_path: Path) -> 
         )
         assert private_baseline.status_code == 404
 
-        applied = client.post(f"/v1/code-runs/{code_run_id}/apply")
+        applied = client.post(
+            f"/v1/code-runs/{code_run_id}/apply",
+            json={"review_revision": review["review_revision"]},
+        )
         assert applied.status_code == 200, applied.text
         assert applied.json()["status"] == "APPLIED"
         assert readme.read_text(encoding="utf-8").startswith("# Updated")
@@ -182,9 +199,12 @@ def test_workspace_code_run_review_apply_revert_and_conflict(tmp_path: Path) -> 
         )
         assert conflict_run.status_code == 201, conflict_run.text
         conflict_id = conflict_run.json()["code_run_id"]
-        wait_for_status(client, conflict_id, "REVIEW_REQUIRED")
+        conflict_review = wait_for_status(client, conflict_id, "REVIEW_REQUIRED")
         readme.write_text("# Human edit\n", encoding="utf-8")
-        conflict = client.post(f"/v1/code-runs/{conflict_id}/apply")
+        conflict = client.post(
+            f"/v1/code-runs/{conflict_id}/apply",
+            json={"review_revision": conflict_review["review_revision"]},
+        )
         assert conflict.status_code == 409
         assert readme.read_text(encoding="utf-8") == "# Human edit\n"
         discarded = client.post(f"/v1/code-runs/{conflict_id}/discard")
@@ -197,6 +217,150 @@ def test_workspace_code_run_review_apply_revert_and_conflict(tmp_path: Path) -> 
         assert readme.exists()
         detached_chat = client.get(f"/v1/chats/{chat.json()['chat_id']}")
         assert detached_chat.json()["workspace_id"] is None
+
+
+def test_code_run_continues_in_same_isolation_and_versions_review(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "project"
+    workspace_root.mkdir()
+    readme = workspace_root / "README.md"
+    readme.write_text("# Original\n", encoding="utf-8")
+    app = create_app(local_settings(tmp_path, workspace_root))
+
+    with TestClient(app) as client:
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            side_effect=code_decisions("# Original", "# First")
+        )
+        workspace = client.post(
+            "/v1/workspaces",
+            json={"name": "Collaboration", "root_path": str(workspace_root)},
+        ).json()
+        created = client.post(
+            "/v1/code-runs",
+            json={
+                "workspace_id": workspace["workspace_id"],
+                "instruction": "Set the first title",
+            },
+        )
+        assert created.status_code == 201, created.text
+        run_id = created.json()["code_run_id"]
+        first = wait_for_review(client, run_id, 1)
+        isolation = Path(app.state.container.settings.code_work_root) / run_id
+        assert (isolation / "README.md").read_text("utf-8") == "# First\n"
+        assert readme.read_text("utf-8") == "# Original\n"
+
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            side_effect=code_decisions("# First", "# Second")
+        )
+        continued = client.post(
+            f"/v1/code-runs/{run_id}/turns",
+            json={"instruction": "Change it again", "auto_start": True},
+        )
+        assert continued.status_code == 200, continued.text
+        second = wait_for_review(client, run_id, 2)
+        versioned_patch = client.get(f"/v1/artifacts/code-runs/{run_id}/diff-2.patch")
+        assert versioned_patch.status_code == 200
+        assert "+# Second" in versioned_patch.text
+        assert [turn["status"] for turn in second["turns"]] == [
+            "COMPLETED",
+            "COMPLETED",
+        ]
+        assert {call["turn_id"] for call in second["tool_calls"]} == {
+            turn["turn_id"] for turn in second["turns"]
+        }
+
+        stale = client.post(
+            f"/v1/code-runs/{run_id}/apply", json={"review_revision": 1}
+        )
+        assert stale.status_code == 409
+
+        # Apply the immutable reviewed snapshot rather than the mutable isolation.
+        (isolation / "README.md").write_text("# Tampered\n", encoding="utf-8")
+        applied = client.post(
+            f"/v1/code-runs/{run_id}/apply", json={"review_revision": 2}
+        )
+        assert applied.status_code == 200, applied.text
+        assert readme.read_text("utf-8") == "# Second\n"
+        assert first["session_id"] == second["session_id"]
+
+
+def test_queued_code_turns_run_in_order(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "project"
+    workspace_root.mkdir()
+    (workspace_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+    app = create_app(local_settings(tmp_path, workspace_root))
+
+    with TestClient(app) as client:
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            side_effect=[
+                CodeDecision(kind="final", raw_response="<final>one</final>", answer="one"),
+                CodeDecision(kind="final", raw_response="<final>two</final>", answer="two"),
+            ]
+        )
+        workspace = client.post(
+            "/v1/workspaces", json={"name": "Queue", "root_path": str(workspace_root)}
+        ).json()
+        created = client.post(
+            "/v1/code-runs",
+            json={
+                "workspace_id": workspace["workspace_id"],
+                "instruction": "First turn",
+                "auto_start": False,
+            },
+        ).json()
+        run_id = created["code_run_id"]
+        queued = client.post(
+            f"/v1/code-runs/{run_id}/turns",
+            json={"instruction": "Second turn", "auto_start": True},
+        )
+        assert queued.status_code == 200, queued.text
+        paused = wait_for_status(client, run_id, "PAUSED")
+        assert [
+            (turn["ordinal"], turn["status"], turn["summary"])
+            for turn in paused["turns"]
+        ] == [
+            (1, "COMPLETED", "one"),
+            (2, "COMPLETED", "two"),
+        ]
+        assert paused["review_revision"] == 0
+        assert (workspace_root / "README.md").read_text("utf-8") == "# Demo\n"
+        discarded = client.post(f"/v1/code-runs/{run_id}/discard")
+        assert discarded.status_code == 200
+
+
+def test_code_chat_continues_latest_open_run(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "project"
+    workspace_root.mkdir()
+    (workspace_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+    app = create_app(local_settings(tmp_path, workspace_root))
+
+    with TestClient(app) as client:
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            side_effect=[
+                CodeDecision(kind="final", raw_response="<final>one</final>", answer="one"),
+                CodeDecision(kind="final", raw_response="<final>two</final>", answer="two"),
+            ]
+        )
+        workspace = client.post(
+            "/v1/workspaces", json={"name": "Chat", "root_path": str(workspace_root)}
+        ).json()
+        chat = client.post(
+            "/v1/chats", json={"title": "Code", "workspace_id": workspace["workspace_id"]}
+        ).json()
+        first = client.post(
+            f"/v1/chats/{chat['chat_id']}/messages",
+            json={"content": "First", "requested_mode": "code"},
+        ).json()
+        run_id = first["code_run"]["code_run_id"]
+        wait_for_status(client, run_id, "PAUSED")
+
+        second = client.post(
+            f"/v1/chats/{chat['chat_id']}/messages",
+            json={"content": "Second", "requested_mode": "code"},
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["code_run"]["code_run_id"] == run_id
+        result = wait_for_status(client, run_id, "PAUSED")
+        assert [turn["instruction"] for turn in result["turns"]] == ["First", "Second"]
 
 
 @pytest.mark.asyncio

@@ -41,12 +41,21 @@ class ExecutorRoute(str, Enum):
 class CodeRunStatus(str, Enum):
     CREATED = "CREATED"
     RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
     REVIEW_REQUIRED = "REVIEW_REQUIRED"
     APPLIED = "APPLIED"
     DISCARDED = "DISCARDED"
     REVERTED = "REVERTED"
     FAILED = "FAILED"
     INTERRUPTED = "INTERRUPTED"
+
+
+class CodeTurnStatus(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class DesktopRunStatus(str, Enum):

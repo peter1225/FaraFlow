@@ -25,6 +25,8 @@ def test_alembic_creates_fresh_database(tmp_path: Path) -> None:
             "ff_chat_threads",
             "ff_workspaces",
             "ff_code_runs",
+            "ff_code_turns",
+            "ff_code_review_revisions",
             "ff_tool_calls",
             "ff_desktop_runs",
             "ff_desktop_actions",
@@ -33,7 +35,11 @@ def test_alembic_creates_fresh_database(tmp_path: Path) -> None:
         tool_columns = {
             item["name"] for item in inspect(engine).get_columns("ff_tool_calls")
         }
-        assert {"before_hashes", "after_hashes", "unified_diff"} <= tool_columns
+        assert {"before_hashes", "after_hashes", "unified_diff", "turn_id"} <= tool_columns
+        run_columns = {
+            item["name"] for item in inspect(engine).get_columns("ff_code_runs")
+        }
+        assert {"engine", "model", "review_revision", "review_manifest"} <= run_columns
     finally:
         engine.dispose()
 

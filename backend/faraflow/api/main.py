@@ -251,7 +251,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         normalized = artifact_path.replace("\\", "/").strip("/")
         if normalized.startswith("code-runs/"):
             parts = normalized.split("/")
-            if len(parts) != 3 or parts[-1] != "diff.patch":
+            filename = parts[-1] if parts else ""
+            versioned_diff = (
+                filename.startswith("diff-")
+                and filename.endswith(".patch")
+                and filename[5:-6].isdigit()
+            )
+            if len(parts) != 3 or (filename != "diff.patch" and not versioned_diff):
                 raise HTTPException(status_code=404, detail="artifact not found")
             require_local_workspace_request(request, get_container(request).settings)
         elif len(normalized.split("/")) >= 2 and normalized.split("/")[1] == "desktop":

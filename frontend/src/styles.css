@@ -2334,6 +2334,26 @@ textarea:focus {
   gap: 8px;
 }
 
+.code-continuation {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.code-continuation textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.code-continuation .button {
+  justify-self: end;
+}
+
+.code-turn {
+  border-left-color: rgba(77, 217, 200, 0.5);
+}
+
 .repo-badge,
 .code-status {
   display: inline-flex;

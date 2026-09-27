@@ -9,10 +9,12 @@ const apiMock = vi.hoisted(() => ({
   applyCodeRun: vi.fn(),
   codeRunDiff: vi.fn(),
   codeRunEvents: vi.fn(),
+  continueCodeRun: vi.fn(),
   createWorkspace: vi.fn(),
   discardCodeRun: vi.fn(),
   getCodeRun: vi.fn(),
   listCodeRuns: vi.fn(),
+  pauseCodeRun: vi.fn(),
   pickWorkspaceDirectory: vi.fn(),
   revertCodeRun: vi.fn(),
   workspaceFile: vi.fn(),
@@ -42,9 +44,22 @@ const reviewRun: CodeRun = {
   session_id: "sess_test",
   instruction: "Update README",
   status: "REVIEW_REQUIRED",
+  engine: "native",
+  model: "test-coder",
   final_summary: "README updated",
   changed_paths: ["README.md"],
+  review_revision: 1,
   created_at: "2026-08-08T00:00:00Z",
+  turns: [
+    {
+      turn_id: "turn_1",
+      ordinal: 1,
+      instruction: "Update README",
+      status: "COMPLETED",
+      summary: "README updated",
+      created_at: "2026-08-08T00:00:00Z",
+    },
+  ],
   tool_calls: [
     {
       tool_call_id: "tool_test",
@@ -87,7 +102,7 @@ describe("local code workspace", () => {
     };
     apiMock.listCodeRuns.mockResolvedValue([failedRun]);
     apiMock.getCodeRun.mockResolvedValue(failedRun);
-    apiMock.codeRunDiff.mockResolvedValue({ diff: "", changed_paths: [] });
+    apiMock.codeRunDiff.mockResolvedValue({ diff: "", changed_paths: [], review_revision: 1 });
     apiMock.codeRunEvents.mockResolvedValue([
       { event_id: "ready", event_type: "code.engine.ready", message: "Pico 执行引擎已就绪", payload: { engine: "pico" } },
       { event_id: "usage", event_type: "code.usage", message: "模型用量已记录", payload: { total_tokens: 12 } },
@@ -120,6 +135,7 @@ describe("local code workspace", () => {
     apiMock.codeRunDiff.mockResolvedValue({
       code_run_id: reviewRun.code_run_id,
       status: "REVIEW_REQUIRED",
+      review_revision: 1,
       changed_paths: ["README.md"],
       diff: "-# Old\n+# Demo\n",
     });
@@ -133,8 +149,31 @@ describe("local code workspace", () => {
     );
 
     fireEvent.click(await screen.findByRole("button", { name: "应用修改" }));
-    await waitFor(() => expect(apiMock.applyCodeRun).toHaveBeenCalledWith("code_test"));
+    await waitFor(() => expect(apiMock.applyCodeRun).toHaveBeenCalledWith("code_test", 1));
     expect(screen.getByRole("button", { name: "丢弃修改" })).toBeInTheDocument();
+  });
+
+  it("queues another turn in the same code run", async () => {
+    apiMock.listCodeRuns.mockResolvedValue([reviewRun]);
+    apiMock.getCodeRun.mockResolvedValue(reviewRun);
+    apiMock.codeRunDiff.mockResolvedValue({
+      code_run_id: reviewRun.code_run_id,
+      status: "REVIEW_REQUIRED",
+      review_revision: 1,
+      changed_paths: ["README.md"],
+      diff: "-# Old\n+# Demo\n",
+    });
+    apiMock.continueCodeRun.mockResolvedValue({ ...reviewRun, status: "CREATED" });
+    render(
+      <CodeWorkspace workspace={workspace} onCreateChat={vi.fn()} onDelete={vi.fn()} />,
+    );
+    fireEvent.change(await screen.findByLabelText("继续修改要求"), {
+      target: { value: "把标题改成中文" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "继续修改" }));
+    await waitFor(() =>
+      expect(apiMock.continueCodeRun).toHaveBeenCalledWith("code_test", "把标题改成中文"),
+    );
   });
 
   it("registers an absolute local folder from the modal", async () => {

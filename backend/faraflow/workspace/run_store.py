@@ -3,7 +3,7 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 def file_hash(path: Path) -> Optional[str]:
@@ -59,6 +59,36 @@ class CodeRunStore:
         path = self._safe_artifact_path(code_run_id, "apply-backup", relative)
         return path.read_bytes() if path.exists() else None
 
+    def preserve_review(
+        self,
+        code_run_id: str,
+        revision: int,
+        isolated_root: Path,
+        changed_paths: Iterable[str],
+    ) -> Dict[str, Optional[str]]:
+        manifest: Dict[str, Optional[str]] = {}
+        category = f"reviews/{revision}"
+        for relative in sorted(set(changed_paths)):
+            source = (isolated_root / Path(relative)).resolve()
+            if source != isolated_root and isolated_root not in source.parents:
+                raise ValueError("review source escapes isolated workspace")
+            target = self._safe_artifact_path(code_run_id, category, relative)
+            marker = target.with_name(target.name + ".missing.json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source.exists():
+                shutil.copy2(source, target)
+                manifest[relative] = file_hash(target)
+            else:
+                marker.write_text('{"missing":true}', encoding="utf-8")
+                manifest[relative] = None
+        return manifest
+
+    def review_path(self, code_run_id: str, revision: int, relative: str) -> Path:
+        return self._safe_artifact_path(code_run_id, f"reviews/{revision}", relative)
+
+    def review_diff_path(self, code_run_id: str, revision: int) -> Path:
+        return self.run_dir(code_run_id) / f"diff-{revision}.patch"
+
     def build_diff(
         self, code_run_id: str, isolated_root: Path, changed_paths: Iterable[str]
     ) -> Tuple[str, List[str]]:
@@ -83,9 +113,16 @@ class CodeRunStore:
         path.write_text(diff, encoding="utf-8")
         return diff, normalized
 
+    def preserve_review_diff(self, code_run_id: str, revision: int, diff: str) -> str:
+        path = self.review_diff_path(code_run_id, revision)
+        path.write_text(diff, encoding="utf-8")
+        return f"/v1/artifacts/code-runs/{code_run_id}/diff-{revision}.patch"
+
     def diff_reference(self, code_run_id: str) -> str:
         return f"/v1/artifacts/code-runs/{code_run_id}/diff.patch"
 
-    def save_manifest(self, code_run_id: str, name: str, manifest: Dict[str, object]) -> None:
+    def save_manifest(
+        self, code_run_id: str, name: str, manifest: Mapping[str, object]
+    ) -> None:
         path = self.run_dir(code_run_id) / f"{name}.json"
         path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

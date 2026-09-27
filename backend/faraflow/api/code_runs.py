@@ -2,7 +2,14 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Query, Request, status
 
-from faraflow.domain.schemas import CodeDiffView, CodeRunCreate, CodeRunView, SessionEvent
+from faraflow.domain.schemas import (
+    CodeDiffView,
+    CodeRunApply,
+    CodeRunCreate,
+    CodeRunView,
+    CodeTurnCreate,
+    SessionEvent,
+)
 
 from .dependencies import get_container, require_local_workspace_request
 
@@ -40,6 +47,22 @@ async def get_code_diff(code_run_id: str, request: Request) -> CodeDiffView:
     return await container.code_runs.diff(code_run_id)
 
 
+@router.post("/{code_run_id}/turns", response_model=CodeRunView)
+async def continue_code_run(
+    code_run_id: str, payload: CodeTurnCreate, request: Request
+) -> CodeRunView:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.continue_run(code_run_id, payload)
+
+
+@router.post("/{code_run_id}/pause", response_model=CodeRunView)
+async def pause_code_run(code_run_id: str, request: Request) -> CodeRunView:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.pause(code_run_id)
+
+
 @router.get("/{code_run_id}/events", response_model=List[SessionEvent])
 async def list_code_events(code_run_id: str, request: Request) -> List[SessionEvent]:
     container = get_container(request)
@@ -60,10 +83,12 @@ async def list_code_events(code_run_id: str, request: Request) -> List[SessionEv
 
 
 @router.post("/{code_run_id}/apply", response_model=CodeRunView)
-async def apply_code_run(code_run_id: str, request: Request) -> CodeRunView:
+async def apply_code_run(
+    code_run_id: str, payload: CodeRunApply, request: Request
+) -> CodeRunView:
     container = get_container(request)
     require_local_workspace_request(request, container.settings)
-    return await container.code_runs.apply(code_run_id)
+    return await container.code_runs.apply(code_run_id, payload)
 
 
 @router.post("/{code_run_id}/revert", response_model=CodeRunView)

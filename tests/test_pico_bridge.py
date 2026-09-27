@@ -90,9 +90,15 @@ def test_pico_review_apply_revert_and_conflict(tmp_path, worker):
         assert "TOKEN=secret" not in json.dumps(events)
         assert (settings.pico_state_root / run_id).is_dir()
         readme.write_text("# User edit\n", encoding="utf-8")
-        assert client.post(f"/v1/code-runs/{run_id}/apply").status_code == 409
+        assert client.post(
+            f"/v1/code-runs/{run_id}/apply",
+            json={"review_revision": record["review_revision"]},
+        ).status_code == 409
         readme.write_text("# Original\n", encoding="utf-8")
-        assert client.post(f"/v1/code-runs/{run_id}/apply").status_code == 200
+        assert client.post(
+            f"/v1/code-runs/{run_id}/apply",
+            json={"review_revision": record["review_revision"]},
+        ).status_code == 200
         assert readme.read_text("utf-8") == "# Updated\n"
         assert client.post(f"/v1/code-runs/{run_id}/revert").status_code == 200
         assert readme.read_text("utf-8") == "# Original\n"
@@ -250,5 +256,62 @@ time.sleep(60)
                 assert response.json()["tool_calls"][0]["status"] == "ok"
             assert not (settings.code_work_root / run_id).exists()
             assert not (root / "new.txt").exists()
+        finally:
+            release.set()
+
+
+def test_pause_waits_for_write_and_keeps_reviewable_changes(tmp_path, worker, monkeypatch):
+    worker.write_text(PREAMBLE + '''
+send(id="write", method="tool.execute", params={
+    "name":"create_file", "arguments":{"path":"new.txt", "content":"staged"}})
+read()
+time.sleep(60)
+''', encoding="utf-8")
+    started, release = threading.Event(), threading.Event()
+    dispatch = CodeToolExecutor._dispatch
+
+    def slow_write(self, name, arguments):
+        started.set()
+        assert release.wait(10)
+        return dispatch(self, name, arguments)
+
+    monkeypatch.setattr(CodeToolExecutor, "_dispatch", slow_write)
+    root = tmp_path / "project"
+    root.mkdir()
+    settings = local_settings(tmp_path, root)
+    settings.code_engine = "pico"
+    settings.pico_python = sys.executable
+    settings.pico_state_root = tmp_path / "private-pico"
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        workspace = client.post("/v1/workspaces", json={
+            "name": "Pico", "root_path": str(root),
+        }).json()
+        run_id = client.post("/v1/code-runs", json={
+            "workspace_id": workspace["workspace_id"], "instruction": "Create file",
+        }).json()["code_run_id"]
+        try:
+            assert started.wait(5)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                stop = pool.submit(client.post, f"/v1/code-runs/{run_id}/pause")
+                assert not stop.done()
+                release.set()
+                response = stop.result(timeout=10)
+            assert response.status_code == 200, response.text
+            paused = response.json()
+            assert paused["status"] == "PAUSED"
+            assert paused["changed_paths"] == ["new.txt"]
+            assert paused["review_revision"] == 1
+            assert paused["turns"][0]["status"] == "CANCELLED"
+            assert (settings.code_work_root / run_id / "new.txt").read_text("utf-8") == "staged"
+            assert not (root / "new.txt").exists()
+
+            applied = client.post(
+                f"/v1/code-runs/{run_id}/apply",
+                json={"review_revision": paused["review_revision"]},
+            )
+            assert applied.status_code == 200, applied.text
+            assert (root / "new.txt").read_text("utf-8") == "staged"
         finally:
             release.set()

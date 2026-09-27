@@ -228,6 +228,7 @@ export interface WorkspaceFile {
 export type CodeRunStatus =
   | "CREATED"
   | "RUNNING"
+  | "PAUSED"
   | "REVIEW_REQUIRED"
   | "APPLIED"
   | "DISCARDED"
@@ -239,6 +240,7 @@ export interface ToolCall {
   tool_call_id: string;
   step_no: number;
   tool_name: string;
+  turn_id?: string;
   status: string;
   affected_paths: string[];
   diff_summary: string[];
@@ -249,6 +251,18 @@ export interface ToolCall {
   created_at: string;
 }
 
+export interface CodeTurn {
+  turn_id: string;
+  ordinal: number;
+  instruction: string;
+  status: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  summary?: string;
+  error?: Record<string, unknown>;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+
 export interface CodeRun {
   code_run_id: string;
   workspace_id: string;
@@ -256,21 +270,26 @@ export interface CodeRun {
   session_id: string;
   instruction: string;
   status: CodeRunStatus;
+  engine: string;
+  model: string;
   isolation_kind?: string;
   base_revision?: string;
   final_summary?: string;
   changed_paths: string[];
   diff_ref?: string;
+  review_revision: number;
   error?: Record<string, unknown>;
   created_at: string;
   started_at?: string;
   finished_at?: string;
   tool_calls: ToolCall[];
+  turns: CodeTurn[];
 }
 
 export interface CodeDiff {
   code_run_id: string;
   status: CodeRunStatus;
+  review_revision: number;
   changed_paths: string[];
   diff: string;
 }
