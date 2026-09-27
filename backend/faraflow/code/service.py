@@ -1,4 +1,3 @@
-import asyncio
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -10,6 +9,7 @@ from faraflow.domain.schemas import (
     CodeRunView,
     ToolCallView,
 )
+from faraflow.infra.async_utils import run_sync
 from faraflow.infra.repository import ConflictError, Repository
 from faraflow.workspace.run_store import CodeRunStore, file_hash
 from faraflow.workspace.service import WorkspaceService
@@ -74,7 +74,7 @@ class CodeRunService:
         workspace = await self.repository.get_workspace(record.workspace_id)
         original_root = Path(workspace.root_path)
         isolated_root = Path(record.isolated_path or "")
-        if not await asyncio.to_thread(isolated_root.is_dir):
+        if not await run_sync(isolated_root.is_dir):
             raise ConflictError("code run isolation directory is unavailable")
 
         targets: Dict[str, Path] = {}
@@ -134,9 +134,7 @@ class CodeRunService:
             if file_hash(target) != metadata.get("after_hash"):
                 raise ConflictError(f"workspace file changed after apply: {relative}")
         self._restore_backups(code_run_id, original_root, record.applied_manifest.keys())
-        record = await self.repository.update_code_run(
-            code_run_id, status=CodeRunStatus.REVERTED
-        )
+        record = await self.repository.update_code_run(code_run_id, status=CodeRunStatus.REVERTED)
         await self.runtime.emit(
             record.session_id,
             "code.run.reverted",
@@ -151,13 +149,11 @@ class CodeRunService:
         if state in {CodeRunStatus.APPLIED, CodeRunStatus.REVERTED, CodeRunStatus.DISCARDED}:
             raise ConflictError(f"cannot discard code run in state {state.value}")
         await self.runtime.cancel(code_run_id)
-        workspace = await self.repository.get_workspace(
-            record.workspace_id, active_only=False
-        )
+        # Isolation may have been persisted while cancellation drained an in-flight operation.
+        record = await self.repository.get_code_run(code_run_id)
+        workspace = await self.repository.get_workspace(record.workspace_id, active_only=False)
         await self._cleanup(record, workspace)
-        record = await self.repository.update_code_run(
-            code_run_id, status=CodeRunStatus.DISCARDED
-        )
+        record = await self.repository.update_code_run(code_run_id, status=CodeRunStatus.DISCARDED)
         await self.runtime.emit(
             record.session_id,
             "code.run.discarded",
@@ -168,13 +164,9 @@ class CodeRunService:
 
     async def _cleanup(self, record: Any, workspace: Any) -> None:
         if record.isolated_path:
-            await asyncio.to_thread(
-                self.workspaces.cleanup_isolation, record, workspace
-            )
+            await run_sync(self.workspaces.cleanup_isolation, record, workspace)
 
-    def _restore_backups(
-        self, code_run_id: str, original_root: Path, relative_paths: Any
-    ) -> None:
+    def _restore_backups(self, code_run_id: str, original_root: Path, relative_paths: Any) -> None:
         for relative in relative_paths:
             target = self.workspaces.safe_path(original_root, relative, allow_missing=True)
             backup = self.run_store.backup_bytes(code_run_id, relative)

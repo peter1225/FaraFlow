@@ -14,6 +14,7 @@ from faraflow.domain.schemas import (
     WorkspaceTreeEntry,
     WorkspaceView,
 )
+from faraflow.infra.async_utils import run_sync
 from faraflow.infra.repository import ConflictError, Repository
 
 from .run_store import CodeRunStore, file_hash
@@ -116,12 +117,12 @@ class WorkspaceService:
         self.assert_enabled()
         async with self._directory_picker_lock:
             try:
-                selected = await asyncio.to_thread(self._open_directory_picker)
+                selected = await run_sync(self._open_directory_picker)
             except Exception as exc:
                 raise ConflictError(f"native folder picker is unavailable: {exc}") from exc
         if not selected:
             return WorkspaceDirectorySelection()
-        root = await asyncio.to_thread(self.validate_root, selected)
+        root = await run_sync(self.validate_root, selected)
         return WorkspaceDirectorySelection(path=str(root), name=root.name or str(root))
 
     def _open_directory_picker(self) -> Optional[str]:
@@ -231,8 +232,8 @@ class WorkspaceService:
         return ignored
 
     async def register(self, request: WorkspaceCreate) -> WorkspaceView:
-        root = await asyncio.to_thread(self.validate_root, request.root_path)
-        git_root, branch, dirty = await asyncio.to_thread(self.git_facts, root)
+        root = await run_sync(self.validate_root, request.root_path)
+        git_root, branch, dirty = await run_sync(self.git_facts, root)
         record = await self.repository.create_workspace(
             request,
             root_path=str(root),
@@ -245,7 +246,7 @@ class WorkspaceService:
     async def list(self) -> List[WorkspaceView]:
         rows = await self.repository.list_workspaces()
         facts = await asyncio.gather(
-            *(asyncio.to_thread(self.git_facts, Path(record.root_path)) for record in rows)
+            *(run_sync(self.git_facts, Path(record.root_path)) for record in rows)
         )
         views = []
         for record, (_, branch, dirty) in zip(rows, facts):
@@ -255,7 +256,7 @@ class WorkspaceService:
 
     async def get(self, workspace_id: str) -> WorkspaceView:
         record = await self.repository.get_workspace(workspace_id)
-        _, branch, dirty = await asyncio.to_thread(
+        _, branch, dirty = await run_sync(
             self.git_facts, Path(record.root_path)
         )
         record.branch = branch
@@ -295,7 +296,7 @@ class WorkspaceService:
 
     async def tree(self, workspace_id: str, relative: str = ".") -> List[WorkspaceTreeEntry]:
         record = await self.repository.get_workspace(workspace_id)
-        return await asyncio.to_thread(self._tree, Path(record.root_path), relative)
+        return await run_sync(self._tree, Path(record.root_path), relative)
 
     def _tree(self, root: Path, relative: str) -> List[WorkspaceTreeEntry]:
         directory = self.safe_path(root, relative)
@@ -333,7 +334,7 @@ class WorkspaceService:
         self, workspace_id: str, relative: str, start: int = 1, end: int = 200
     ) -> WorkspaceFileView:
         record = await self.repository.get_workspace(workspace_id)
-        return await asyncio.to_thread(
+        return await run_sync(
             self._read_file, Path(record.root_path), relative, start, end
         )
 

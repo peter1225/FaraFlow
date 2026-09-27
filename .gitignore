@@ -1,8 +1,11 @@
 .env
 .venv/
+.venv-pico/
+/tmp/pico-harness-review/
 .conda/
 .uv-cache/
 .uv-python/
+.npm-cache/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -30,3 +33,4 @@ auth.json
 
 # 原始需求与技术文档仅保留在本地，不上传 GitHub
 /FaraFlow — 企业级浏览器智能自动化 Agent 平台/
+note/

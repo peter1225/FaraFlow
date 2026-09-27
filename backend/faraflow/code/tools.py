@@ -1,4 +1,3 @@
-import asyncio
 import difflib
 import hashlib
 import json
@@ -8,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from faraflow.infra.async_utils import run_sync
 from faraflow.infra.repository import Repository
 from faraflow.workspace.run_store import CodeRunStore, file_hash
 from faraflow.workspace.service import (
@@ -57,9 +57,7 @@ class CodeToolExecutor:
         self.changed_paths: Set[str] = set()
         self.previous_calls: Set[str] = set()
 
-    async def execute(
-        self, step_no: int, name: str, arguments: Dict[str, Any]
-    ) -> CodeToolResult:
+    async def execute(self, step_no: int, name: str, arguments: Dict[str, Any]) -> CodeToolResult:
         key = json.dumps({"name": name, "args": arguments}, sort_keys=True, ensure_ascii=False)
         if key in self.previous_calls:
             result = CodeToolResult(
@@ -71,7 +69,12 @@ class CodeToolExecutor:
         else:
             self.previous_calls.add(key)
             try:
-                result = await asyncio.to_thread(self._dispatch, name, arguments)
+                result = await run_sync(self._dispatch, name, arguments)
+                # A fresh read or write is progress: allow a previously failed patch
+                # to be retried after reading, and allow rereading after an edit.
+                if not result.is_error and (name == "read_file" or result.after_hashes):
+                    self.previous_calls.clear()
+                    self.previous_calls.add(key)
             except Exception as exc:
                 result = CodeToolResult(
                     f"error: {name} failed: {type(exc).__name__}: {exc}", is_error=True
@@ -292,14 +295,10 @@ class CodeToolExecutor:
                 return CodeToolResult(result.stdout.strip() or "clean")
         except OSError:
             pass
-        return CodeToolResult(
-            "\n".join(sorted(self.changed_paths)) or "clean (managed snapshot)"
-        )
+        return CodeToolResult("\n".join(sorted(self.changed_paths)) or "clean (managed snapshot)")
 
     def _git_diff(self) -> CodeToolResult:
-        diff, changed = self.run_store.build_diff(
-            self.code_run_id, self.root, self.changed_paths
-        )
+        diff, changed = self.run_store.build_diff(self.code_run_id, self.root, self.changed_paths)
         return CodeToolResult(diff or "(no changes)", affected_paths=changed)
 
     @staticmethod

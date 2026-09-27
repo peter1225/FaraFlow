@@ -7,15 +7,17 @@ from typing import Any, Dict, List, Optional
 from faraflow.config import Settings
 from faraflow.domain.enums import CodeRunStatus
 from faraflow.domain.schemas import SessionEvent
+from faraflow.infra.async_utils import run_sync
 from faraflow.infra.events import EventBus
 from faraflow.infra.repository import ConflictError, Repository
 from faraflow.workspace.run_store import CodeRunStore
 from faraflow.workspace.service import WorkspaceService
 
 from .adapter import CodeAdapter
-from .protocol import build_code_system_prompt
+from .engine import CodeEngine, EngineRequest, NativeCodeEngine
+from .pico_bridge import PicoCodeEngine
 from .registry import ToolRegistry
-from .tools import CodeToolExecutor
+from .tools import CodeToolExecutor, CodeToolResult
 
 
 class CodeRuntime:
@@ -38,6 +40,11 @@ class CodeRuntime:
         self._lock = asyncio.Lock()
         self._capacity = asyncio.Semaphore(settings.code_max_concurrent_runs)
         self.tool_registry = ToolRegistry.default()
+        self.engine: CodeEngine = (
+            PicoCodeEngine(settings)
+            if settings.code_engine == "pico"
+            else NativeCodeEngine(settings, adapter)
+        )
 
     async def emit(
         self,
@@ -66,9 +73,7 @@ class CodeRuntime:
             existing = self._jobs.get(code_run_id)
             if existing and not existing.done():
                 raise ConflictError("code run is already running")
-            job = asyncio.create_task(
-                self._run(code_run_id), name=f"faraflow-code:{code_run_id}"
-            )
+            job = asyncio.create_task(self._run(code_run_id), name=f"faraflow-code:{code_run_id}")
             self._jobs[code_run_id] = job
             job.add_done_callback(
                 lambda finished, run_id=code_run_id: self._forget_job(run_id, finished)
@@ -91,19 +96,30 @@ class CodeRuntime:
             workspace = await self.repository.get_workspace(record.workspace_id)
             deadline = time.monotonic() + self.settings.code_max_runtime_minutes * 60
             try:
-                await self.repository.update_code_run(
-                    code_run_id, status=CodeRunStatus.RUNNING
-                )
+                await self.repository.update_code_run(code_run_id, status=CodeRunStatus.RUNNING)
                 await self.emit(
                     record.session_id,
                     "code.run.started",
                     "代码任务开始执行",
-                    {"code_run_id": code_run_id, "workspace_id": record.workspace_id},
+                    {
+                        "code_run_id": code_run_id,
+                        "workspace_id": record.workspace_id,
+                        "engine": self.settings.code_engine,
+                    },
                 )
-                isolation = await asyncio.to_thread(
-                    self.workspaces.prepare_isolation, code_run_id, workspace
-                )
-                record = await self.repository.update_code_run(code_run_id, **isolation)
+
+                async def prepare() -> Any:
+                    isolation = await run_sync(
+                        self.workspaces.prepare_isolation, code_run_id, workspace
+                    )
+                    return await self.repository.update_code_run(code_run_id, **isolation)
+
+                preparation = asyncio.create_task(prepare())
+                try:
+                    record = await asyncio.shield(preparation)
+                except asyncio.CancelledError:
+                    await preparation
+                    raise
                 isolated_root = Path(record.isolated_path or "")
                 executor = CodeToolExecutor(
                     code_run_id=code_run_id,
@@ -115,47 +131,72 @@ class CodeRuntime:
                     run_store=self.run_store,
                     registry=self.tool_registry,
                 )
-                context = await asyncio.to_thread(self._workspace_context, isolated_root)
-                system_prompt = build_code_system_prompt(context)
-                messages: List[Dict[str, str]] = [
-                    {"role": "user", "content": record.instruction}
-                ]
-                final_summary = ""
-                for step in range(1, self.settings.code_max_steps + 1):
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError("code run exceeded maximum runtime")
-                    decision = await asyncio.wait_for(
-                        self.adapter.next_decision(messages, system_prompt=system_prompt),
-                        timeout=max(0.1, deadline - time.monotonic()),
-                    )
-                    messages.append({"role": "assistant", "content": decision.raw_response})
-                    if decision.kind == "final":
-                        final_summary = decision.answer or "代码任务已完成"
-                        break
-                    assert decision.tool_name is not None
-                    result = await executor.execute(
-                        step, decision.tool_name, decision.arguments or {}
-                    )
-                    audit_summary = executor.audit_summary(decision.tool_name, result)
+                context = await run_sync(self._workspace_context, isolated_root)
+                step = 0
+                sequence = 0
+
+                async def engine_event(
+                    event_type: str, message: str, payload: Dict[str, Any]
+                ) -> None:
+                    nonlocal sequence
+                    sequence += 1
                     await self.emit(
                         record.session_id,
-                        "code.tool.completed" if not result.is_error else "code.tool.failed",
-                        audit_summary[:500],
+                        event_type,
+                        message,
                         {
-                            "step_no": step,
-                            "tool_name": decision.tool_name,
+                            **payload,
+                            "code_run_id": code_run_id,
+                            "turn_id": code_run_id,
+                            "engine": self.settings.code_engine,
+                            "sequence": sequence,
+                        },
+                    )
+
+                async def execute_and_audit(
+                    name: str, arguments: Dict[str, Any], call_id: str
+                ) -> CodeToolResult:
+                    nonlocal step
+                    step += 1
+                    if step > self.settings.code_max_steps:
+                        raise RuntimeError("code run exceeded maximum tool calls")
+                    details = {"step_no": step, "tool_name": name, "tool_call_id": call_id}
+                    await engine_event("code.tool.started", f"正在执行 {name}", details)
+                    result = await executor.execute(step, name, arguments)
+                    await engine_event(
+                        "code.tool.failed" if result.is_error else "code.tool.completed",
+                        executor.audit_summary(name, result)[:500],
+                        {
+                            **details,
                             "affected_paths": result.affected_paths,
                             "diff_summary": result.diff_summary,
                         },
                     )
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": f"Tool result for {decision.tool_name}:\n{result.content}",
-                        }
-                    )
-                else:
-                    raise RuntimeError("code run exceeded maximum model steps")
+                    return result
+
+                async def execute(
+                    name: str, arguments: Dict[str, Any], call_id: str
+                ) -> CodeToolResult:
+                    # Cancelling a to_thread write cannot stop its thread. Finish the
+                    # operation and audit before discard is allowed to delete isolation.
+                    operation = asyncio.create_task(execute_and_audit(name, arguments, call_id))
+                    try:
+                        return await asyncio.shield(operation)
+                    except asyncio.CancelledError:
+                        await operation
+                        raise
+
+                final_summary = await asyncio.wait_for(
+                    self.engine.run(
+                        EngineRequest(
+                            code_run_id, record.instruction, isolated_root, context,
+                            source_root=Path(workspace.root_path),
+                        ),
+                        execute,
+                        engine_event,
+                    ),
+                    timeout=max(0.1, deadline - time.monotonic()),
+                )
 
                 diff, changed = self.run_store.build_diff(
                     code_run_id, isolated_root, executor.changed_paths
@@ -192,9 +233,7 @@ class CodeRuntime:
                         final_summary or "代码任务完成，未产生文件修改",
                         {"code_run_id": code_run_id, "changed_paths": []},
                     )
-                    await asyncio.to_thread(
-                        self.workspaces.cleanup_isolation, record, workspace
-                    )
+                    await run_sync(self.workspaces.cleanup_isolation, record, workspace)
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -242,8 +281,9 @@ class CodeRuntime:
         return "\n\n".join(sections)
 
     async def close(self) -> None:
-        for job in self._jobs.values():
+        jobs = list(self._jobs.values())
+        for job in jobs:
             if not job.done():
                 job.cancel()
-        if self._jobs:
-            await asyncio.gather(*self._jobs.values(), return_exceptions=True)
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)

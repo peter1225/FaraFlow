@@ -193,8 +193,17 @@ export function CodeWorkspace({
             <div className="tool-timeline">
               <div className="run-summary">
                 <span className={`code-status state-${selectedRun.status.toLowerCase()}`}>{STATUS_TEXT[selectedRun.status]}</span>
+                {events.some((event) => event.payload?.engine === "pico") && <small> · Pico</small>}
                 <p>{selectedRun.final_summary ?? selectedRun.instruction}</p>
+                {selectedRun.error && <p role="alert">{String(selectedRun.error.message ?? "代码执行失败")}</p>}
               </div>
+              {events.filter((event) => ["code.engine.ready", "code.text", "code.usage"].includes(event.event_type)).map((event) => (
+                <article className="tool-step" key={event.event_id}>
+                  <div><p>{event.message}</p>
+                    {event.event_type === "code.usage" && <small>Tokens: {String(event.payload?.total_tokens ?? 0)}</small>}
+                  </div>
+                </article>
+              ))}
               {selectedRun.tool_calls.map((call) => (
                 <article className="tool-step" key={call.tool_call_id}>
                   <span>{call.step_no}</span>

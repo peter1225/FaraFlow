@@ -80,6 +80,25 @@ describe("local code workspace", () => {
 
   afterEach(cleanup);
 
+  it("shows Pico engine events, usage and a failed run's error", async () => {
+    const failedRun = {
+      ...reviewRun, status: "FAILED" as const,
+      error: { message: "Pico turn failed; check model/tool compatibility" },
+    };
+    apiMock.listCodeRuns.mockResolvedValue([failedRun]);
+    apiMock.getCodeRun.mockResolvedValue(failedRun);
+    apiMock.codeRunDiff.mockResolvedValue({ diff: "", changed_paths: [] });
+    apiMock.codeRunEvents.mockResolvedValue([
+      { event_id: "ready", event_type: "code.engine.ready", message: "Pico 执行引擎已就绪", payload: { engine: "pico" } },
+      { event_id: "usage", event_type: "code.usage", message: "模型用量已记录", payload: { total_tokens: 12 } },
+    ]);
+    render(<CodeWorkspace workspace={workspace} onCreateChat={vi.fn()} onDelete={vi.fn()} />);
+    expect(await screen.findByText("Pico 执行引擎已就绪")).toBeInTheDocument();
+    expect(await screen.findByText("Tokens: 12")).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Pico turn failed");
+    expect(screen.queryByRole("button", { name: "应用修改" })).not.toBeInTheDocument();
+  });
+
   it("loads a safe workspace file into the read-only viewer", async () => {
     apiMock.listCodeRuns.mockResolvedValue([]);
     render(

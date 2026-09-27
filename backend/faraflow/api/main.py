@@ -203,15 +203,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @app.get("/health/ready", tags=["health"])
     async def health_ready(request: Request) -> Dict[str, Any]:
         container = get_container(request)
-        model, chat_model, coding_model, desktop_model = await asyncio.gather(
+        model, chat_model, coding_model, desktop_model, code_engine = await asyncio.gather(
             container.fara.health(),
             container.chat_model.health(),
             container.code_adapter.health(),
             container.desktop_adapter.health(),
+            container.code_runtime.engine.health(),
         )
         code_ready = (
             not container.settings.enable_local_workspaces
-            or coding_model["status"] == "ok"
+            or (coding_model["status"] == "ok" and code_engine["status"] == "ok")
         )
         chat_ready = chat_model["status"] == "ok"
         desktop_ready = (
@@ -228,6 +229,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "model_endpoint": model,
             "chat_model_endpoint": chat_model,
             "coding_model_endpoint": coding_model,
+            "code_engine": code_engine,
             "desktop_model_endpoint": desktop_model,
             "desktop_control": {
                 "enabled": container.settings.enable_desktop_control,

@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import List, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     code_max_steps: int = Field(default=50, ge=1)
     code_max_runtime_minutes: int = Field(default=20, ge=1)
     code_max_concurrent_runs: int = Field(default=1, ge=1)
+    code_engine: Literal["native", "pico"] = "native"
+    # Pico has its own Python 3.12 environment; never import it into the API process.
+    pico_python: str = ""
+    pico_state_root: Path = Path("./data/pico-runs")
+    pico_startup_timeout_seconds: float = Field(default=45.0, gt=0)
+    pico_context_window_tokens: int = Field(default=32768, ge=4096)
 
     # Desktop control is opt-in and intentionally separate from browser automation.
     enable_desktop_control: bool = False

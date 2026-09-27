@@ -1,0 +1,2 @@
+# Install in a separate Python 3.12 environment; the API can stay in conda zzx.
+pico-harness @ git+https://gitee.com/htxoffical/pico-harness.git@d6c7a648fd7ee63e472c0d438f1c8299d9b8f871
