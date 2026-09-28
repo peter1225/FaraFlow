@@ -170,13 +170,22 @@ class ApprovalRecord(Base):
 
 class EventRecord(Base):
     __tablename__ = "ff_events"
+    __table_args__ = (UniqueConstraint("session_id", "sequence"),)
 
     event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     session_id: Mapped[str] = mapped_column(String(64), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
     event_type: Mapped[str] = mapped_column(String(80), index=True)
     message: Mapped[str] = mapped_column(Text)
     payload: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class EventSequenceRecord(Base):
+    __tablename__ = "ff_event_sequences"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    next_sequence: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class CodeRunRecord(Base):
@@ -204,6 +213,13 @@ class CodeRunRecord(Base):
     diff_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     review_revision: Mapped[int] = mapped_column(Integer, default=0)
     review_manifest: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    state_version: Mapped[int] = mapped_column(Integer, default=0)
+    lease_owner: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    next_turn_ordinal: Mapped[int] = mapped_column(Integer, default=2)
+    active_turn_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -245,7 +261,10 @@ class CodeReviewRecord(Base):
 
 class ToolCallRecord(Base):
     __tablename__ = "ff_tool_calls"
-    __table_args__ = (UniqueConstraint("code_run_id", "step_no"),)
+    __table_args__ = (
+        UniqueConstraint("code_run_id", "step_no"),
+        UniqueConstraint("code_run_id", "external_call_id"),
+    )
 
     tool_call_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     code_run_id: Mapped[str] = mapped_column(
@@ -258,6 +277,13 @@ class ToolCallRecord(Base):
         nullable=True,
         index=True,
     )
+    external_call_id: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+    phase: Mapped[str] = mapped_column(String(30), default="SUCCEEDED", index=True)
+    request_digest: Mapped[str] = mapped_column(String(64), default="")
+    result_digest: Mapped[str] = mapped_column(String(64), default="")
+    expected_after_hashes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     step_no: Mapped[int] = mapped_column(Integer)
     tool_name: Mapped[str] = mapped_column(String(60))
     arguments: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -269,6 +295,25 @@ class ToolCallRecord(Base):
     after_hashes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     unified_diff: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CodeApplyJournalRecord(Base):
+    __tablename__ = "ff_code_apply_journals"
+
+    journal_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_code_runs.code_run_id", ondelete="CASCADE"), index=True
+    )
+    workspace_id: Mapped[str] = mapped_column(String(64), index=True)
+    review_revision: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    paths: Mapped[List[str]] = mapped_column(JSON, default=list)
+    completed_paths: Mapped[List[str]] = mapped_column(JSON, default=list)
+    error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class DesktopRunRecord(Base):

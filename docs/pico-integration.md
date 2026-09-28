@@ -20,6 +20,7 @@ FARAFLOW_PICO_PYTHON=C:/path/to/pico-env/python.exe
 FARAFLOW_PICO_STATE_ROOT=./data/pico-runs
 FARAFLOW_PICO_STARTUP_TIMEOUT_SECONDS=45
 FARAFLOW_PICO_CONTEXT_WINDOW_TOKENS=32768
+FARAFLOW_CODE_LEASE_SECONDS=60
 ```
 
 保留现有 `FARAFLOW_CODE_BASE_URL`、`FARAFLOW_CODE_MODEL` 和 `FARAFLOW_CODE_API_KEY`。`PICO_PYTHON` 必须是解释器的绝对路径。状态目录必须位于原项目、隔离副本和公开 `artifact_root` 之外。如果正在修改 FaraFlow 自身，应将 Pico 状态目录配置到 FaraFlow 项目目录之外。
@@ -56,6 +57,34 @@ Pico 状态位于 `<PICO_STATE_ROOT>/<code_run_id>`，可能包含代码与模�
 “停止并保留修改”会取消当前及排队 Turn，等待正在进行的文件操作与审计完成，然后把任务置为 `PAUSED`。存在修改时仍可应用或继续修改。“丢弃任务”才会清理隔离目录。
 
 后端重启会把执行中的 CodeRun 标记为 `INTERRUPTED`，保留隔离目录和历史记录；可以追加新 Turn 继续处理。当前版本尚未自动重放中断中的模型调用，也不开放测试命令、Shell、逐 token 输出或多 Agent 写入。
+
+## 持久化恢复与可靠事件流
+
+代码运行使用数据库租约，避免两个 Runtime 同时执行同一个 CodeRun。租约由运行器定期续期；进程退出后会过期，恢复操作才能由新 Runtime 接管。
+
+文件工具采用两阶段 Journal：执行前保存调用 ID、参数摘要、执行前哈希和预期结果哈希，执行后再保存实际结果。如果进程在文件写入和结果落库之间退出，恢复时会进行哈希对账：
+
+- 当前哈希等于预期结果：补记成功，不重复写文件；
+- 当前哈希等于执行前状态：标记为可安全重试；
+- 两者均不匹配：保持 `UNKNOWN`，阻止自动恢复并要求人工检查。
+
+恢复接口：
+
+```text
+GET  /v1/code-runs/{code_run_id}/recovery
+POST /v1/code-runs/{code_run_id}/resume
+```
+
+多文件应用使用 `CodeApplyJournal`。所有原文件先完成备份，之后逐文件通过同目录临时文件和 `os.replace` 替换。后端启动时发现未完成的应用会自动回滚，包括“文件已经替换、completed_paths 尚未落库”的崩溃窗口。
+
+事件记录带有 Session 内单调递增的 `sequence`。REST 和 WebSocket 都支持 `after_sequence`：
+
+```text
+GET /v1/code-runs/{id}/events?after_sequence=120
+WS  /v1/sessions/{session_id}/events?after_sequence=120
+```
+
+WebSocket 会先建立订阅再回放数据库事件，通过 sequence 去重；检测到队列跳号时会自动从数据库补发。前端保存最后一个 sequence，断线后从 cursor 重连，并按 150ms 合并运行状态刷新，不再为每个工具事件重新加载完整事件历史。
 
 ## 验证
 

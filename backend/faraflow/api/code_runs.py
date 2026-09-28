@@ -4,8 +4,10 @@ from fastapi import APIRouter, Query, Request, status
 
 from faraflow.domain.schemas import (
     CodeDiffView,
+    CodeRecoveryView,
     CodeRunApply,
     CodeRunCreate,
+    CodeRunResume,
     CodeRunView,
     CodeTurnCreate,
     SessionEvent,
@@ -63,16 +65,39 @@ async def pause_code_run(code_run_id: str, request: Request) -> CodeRunView:
     return await container.code_runs.pause(code_run_id)
 
 
+@router.get("/{code_run_id}/recovery", response_model=CodeRecoveryView)
+async def get_code_recovery(code_run_id: str, request: Request) -> CodeRecoveryView:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.recovery(code_run_id)
+
+
+@router.post("/{code_run_id}/resume", response_model=CodeRunView)
+async def resume_code_run(
+    code_run_id: str, payload: CodeRunResume, request: Request
+) -> CodeRunView:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.resume(code_run_id, payload)
+
+
 @router.get("/{code_run_id}/events", response_model=List[SessionEvent])
-async def list_code_events(code_run_id: str, request: Request) -> List[SessionEvent]:
+async def list_code_events(
+    code_run_id: str,
+    request: Request,
+    after_sequence: int = Query(default=0, ge=0),
+) -> List[SessionEvent]:
     container = get_container(request)
     require_local_workspace_request(request, container.settings)
     record = await container.repository.get_code_run(code_run_id)
-    rows = await container.repository.list_events(record.session_id)
+    rows = await container.repository.list_events(
+        record.session_id, after_sequence=after_sequence
+    )
     return [
         SessionEvent(
             event_id=item.event_id,
             session_id=item.session_id,
+            sequence=item.sequence,
             event_type=item.event_type,
             message=item.message,
             payload=item.payload,

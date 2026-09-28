@@ -59,6 +59,7 @@ class AgentRuntime:
         event = SessionEvent(
             event_id=record.event_id,
             session_id=record.session_id,
+            sequence=getattr(record, "sequence", 0),
             event_type=record.event_type,
             message=record.message,
             payload=record.payload,

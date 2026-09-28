@@ -1,14 +1,16 @@
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, cast
 
-from sqlalchemy import Select, desc, func, select, update
+from sqlalchemy import Select, case, desc, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from faraflow.domain.enums import (
     ApprovalStatus,
+    CodeApplyStatus,
     CodeRunStatus,
+    CodeToolPhase,
     CodeTurnStatus,
     DesktopRunStatus,
     SessionState,
@@ -20,6 +22,7 @@ from .database import (
     ApprovalRecord,
     ChatMessageRecord,
     ChatThreadRecord,
+    CodeApplyJournalRecord,
     CodeReviewRecord,
     CodeRunRecord,
     CodeTurnRecord,
@@ -41,6 +44,9 @@ def new_id(prefix: str) -> str:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+_UNSET = object()
 
 
 class NotFoundError(LookupError):
@@ -276,6 +282,7 @@ class Repository:
                 status=CodeRunStatus.CREATED.value,
                 engine=engine,
                 model=model,
+                next_turn_ordinal=2,
             )
             db.add(record)
             await db.flush()
@@ -307,6 +314,67 @@ class Repository:
             if record is None:
                 raise NotFoundError(f"code run session {session_id} not found")
             return record
+
+    async def acquire_code_run_lease(
+        self, code_run_id: str, owner: str, ttl_seconds: int
+    ) -> bool:
+        now = now_utc()
+        expires = now + timedelta(seconds=ttl_seconds)
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(CodeRunRecord)
+                .where(
+                    CodeRunRecord.code_run_id == code_run_id,
+                    or_(
+                        CodeRunRecord.lease_owner == owner,
+                        CodeRunRecord.lease_owner.is_(None),
+                        CodeRunRecord.lease_expires_at.is_(None),
+                        CodeRunRecord.lease_expires_at < now,
+                    ),
+                )
+                .values(
+                    lease_owner=owner,
+                    lease_expires_at=expires,
+                    state_version=CodeRunRecord.state_version + 1,
+                )
+            )
+            await db.commit()
+            return bool(cast(Any, result).rowcount)
+
+    async def renew_code_run_lease(
+        self, code_run_id: str, owner: str, ttl_seconds: int
+    ) -> bool:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(CodeRunRecord)
+                .where(
+                    CodeRunRecord.code_run_id == code_run_id,
+                    CodeRunRecord.lease_owner == owner,
+                )
+                .values(
+                    lease_expires_at=now_utc() + timedelta(seconds=ttl_seconds),
+                    state_version=CodeRunRecord.state_version + 1,
+                )
+            )
+            await db.commit()
+            return bool(cast(Any, result).rowcount)
+
+    async def release_code_run_lease(self, code_run_id: str, owner: str) -> None:
+        async with self._session_factory() as db:
+            await db.execute(
+                update(CodeRunRecord)
+                .where(
+                    CodeRunRecord.code_run_id == code_run_id,
+                    CodeRunRecord.lease_owner == owner,
+                )
+                .values(
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    active_turn_id=None,
+                    state_version=CodeRunRecord.state_version + 1,
+                )
+            )
+            await db.commit()
 
     async def list_code_runs(
         self, workspace_id: Optional[str] = None, limit: int = 100
@@ -356,14 +424,30 @@ class Repository:
                 raise NotFoundError(f"code run {code_run_id} not found")
             if run.status not in allowed:
                 raise ConflictError(f"cannot continue code run in state {run.status}")
-            ordinal = int(
-                await db.scalar(
-                    select(func.coalesce(func.max(CodeTurnRecord.ordinal), 0)).where(
-                        CodeTurnRecord.code_run_id == code_run_id
-                    )
+            next_ordinal = await db.scalar(
+                update(CodeRunRecord)
+                .where(
+                    CodeRunRecord.code_run_id == code_run_id,
+                    CodeRunRecord.status.in_(allowed),
                 )
-                or 0
-            ) + 1
+                .values(
+                    next_turn_ordinal=CodeRunRecord.next_turn_ordinal + 1,
+                    state_version=CodeRunRecord.state_version + 1,
+                    status=case(
+                        (
+                            CodeRunRecord.status == CodeRunStatus.RUNNING.value,
+                            CodeRunRecord.status,
+                        ),
+                        else_=CodeRunStatus.CREATED.value,
+                    ),
+                    finished_at=None,
+                    error=None,
+                )
+                .returning(CodeRunRecord.next_turn_ordinal)
+            )
+            if next_ordinal is None:
+                raise ConflictError("code run changed while queuing a turn")
+            ordinal = int(next_ordinal) - 1
             turn = CodeTurnRecord(
                 turn_id=new_id("turn"),
                 code_run_id=code_run_id,
@@ -371,10 +455,6 @@ class Repository:
                 instruction=instruction,
                 status=CodeTurnStatus.QUEUED.value,
             )
-            if run.status != CodeRunStatus.RUNNING.value:
-                run.status = CodeRunStatus.CREATED.value
-            run.finished_at = None
-            run.error = None
             db.add(turn)
             await db.commit()
             await db.refresh(turn)
@@ -471,6 +551,7 @@ class Repository:
         error: Optional[Dict[str, Any]] = None,
         review_revision: Optional[int] = None,
         review_manifest: Optional[Dict[str, Any]] = None,
+        active_turn_id: Any = _UNSET,
     ) -> CodeRunRecord:
         async with self._session_factory() as db:
             record = await db.get(CodeRunRecord, code_run_id)
@@ -513,6 +594,9 @@ class Repository:
                 record.review_revision = review_revision
             if review_manifest is not None:
                 record.review_manifest = review_manifest
+            if active_turn_id is not _UNSET:
+                record.active_turn_id = active_turn_id
+            record.state_version = int(record.state_version or 0) + 1
             await db.commit()
             await db.refresh(record)
             return record
@@ -532,6 +616,18 @@ class Repository:
                 record.status = CodeRunStatus.INTERRUPTED.value
                 record.finished_at = now_utc()
                 record.error = {"reason": "server_restarted"}
+                record.lease_owner = None
+                record.lease_expires_at = None
+                record.active_turn_id = None
+                record.state_version = int(record.state_version or 0) + 1
+                await db.execute(
+                    update(ToolCallRecord)
+                    .where(
+                        ToolCallRecord.code_run_id == record.code_run_id,
+                        ToolCallRecord.phase == CodeToolPhase.RUNNING.value,
+                    )
+                    .values(phase=CodeToolPhase.UNKNOWN.value, status="unknown")
+                )
                 turns = list(
                     (
                         await db.scalars(
@@ -598,6 +694,136 @@ class Repository:
                 )
             return review
 
+    async def begin_tool_call(
+        self,
+        *,
+        code_run_id: str,
+        session_id: str,
+        turn_id: Optional[str],
+        external_call_id: str,
+        step_no: int,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        request_digest: str,
+        before_hashes: Dict[str, Optional[str]],
+        expected_after_hashes: Dict[str, Optional[str]],
+    ) -> Tuple[ToolCallRecord, bool]:
+        async with self._session_factory() as db:
+            existing = await db.scalar(
+                select(ToolCallRecord).where(
+                    ToolCallRecord.code_run_id == code_run_id,
+                    ToolCallRecord.external_call_id == external_call_id,
+                )
+            )
+            if existing is not None:
+                if existing.request_digest != request_digest:
+                    raise ConflictError("tool call id was reused with different arguments")
+                return existing, False
+            record = ToolCallRecord(
+                tool_call_id=new_id("tool"),
+                code_run_id=code_run_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                external_call_id=external_call_id,
+                step_no=step_no,
+                tool_name=tool_name,
+                arguments=arguments,
+                status="running",
+                phase=CodeToolPhase.RUNNING.value,
+                request_digest=request_digest,
+                before_hashes=before_hashes,
+                expected_after_hashes=expected_after_hashes,
+                started_at=now_utc(),
+                result_excerpt="",
+                affected_paths=list(before_hashes),
+                diff_summary=[],
+                after_hashes={},
+                unified_diff="",
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+            return record, True
+
+    async def complete_tool_call(
+        self,
+        tool_call_id: str,
+        *,
+        phase: CodeToolPhase,
+        status: str,
+        result_excerpt: str,
+        result_digest: str,
+        affected_paths: List[str],
+        diff_summary: List[str],
+        before_hashes: Dict[str, Optional[str]],
+        after_hashes: Dict[str, Optional[str]],
+        unified_diff: str,
+    ) -> ToolCallRecord:
+        async with self._session_factory() as db:
+            record = await db.get(ToolCallRecord, tool_call_id)
+            if record is None:
+                raise NotFoundError(f"tool call {tool_call_id} not found")
+            record.phase = phase.value
+            record.status = status
+            record.result_excerpt = result_excerpt
+            record.result_digest = result_digest
+            record.affected_paths = affected_paths
+            record.diff_summary = diff_summary
+            record.before_hashes = before_hashes
+            record.after_hashes = after_hashes
+            record.unified_diff = unified_diff
+            record.finished_at = now_utc()
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def list_incomplete_tool_calls(self, code_run_id: str) -> List[ToolCallRecord]:
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(ToolCallRecord)
+                .where(
+                    ToolCallRecord.code_run_id == code_run_id,
+                    ToolCallRecord.phase.in_(
+                        [CodeToolPhase.RUNNING.value, CodeToolPhase.UNKNOWN.value]
+                    ),
+                )
+                .order_by(ToolCallRecord.step_no)
+            )
+            return list(rows.all())
+
+    async def resolve_incomplete_tool_call(
+        self,
+        tool_call_id: str,
+        *,
+        phase: CodeToolPhase,
+        status: str,
+        result_excerpt: str,
+        after_hashes: Dict[str, Optional[str]],
+    ) -> None:
+        async with self._session_factory() as db:
+            record = await db.get(ToolCallRecord, tool_call_id)
+            if record is None:
+                raise NotFoundError(f"tool call {tool_call_id} not found")
+            record.phase = phase.value
+            record.status = status
+            record.result_excerpt = result_excerpt
+            record.after_hashes = after_hashes
+            record.finished_at = now_utc()
+            await db.commit()
+
+    async def mark_running_tool_calls_unknown(self, code_run_id: str) -> int:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(ToolCallRecord)
+                .where(
+                    ToolCallRecord.code_run_id == code_run_id,
+                    ToolCallRecord.phase == CodeToolPhase.RUNNING.value,
+                )
+                .values(phase=CodeToolPhase.UNKNOWN.value, status="unknown")
+            )
+            await db.commit()
+            return int(cast(Any, result).rowcount or 0)
+
     async def append_tool_call(
         self,
         *,
@@ -625,6 +851,13 @@ class Repository:
                 tool_name=tool_name,
                 arguments=arguments,
                 status=status,
+                phase=(
+                    CodeToolPhase.FAILED.value
+                    if status == "error"
+                    else CodeToolPhase.SUCCEEDED.value
+                ),
+                started_at=now_utc(),
+                finished_at=now_utc(),
                 result_excerpt=result_excerpt,
                 affected_paths=affected_paths,
                 diff_summary=diff_summary,
@@ -643,6 +876,69 @@ class Repository:
                 select(ToolCallRecord)
                 .where(ToolCallRecord.code_run_id == code_run_id)
                 .order_by(ToolCallRecord.step_no)
+            )
+            return list(rows.all())
+
+    async def create_apply_journal(
+        self,
+        *,
+        code_run_id: str,
+        workspace_id: str,
+        review_revision: int,
+        paths: List[str],
+    ) -> CodeApplyJournalRecord:
+        async with self._session_factory() as db:
+            record = CodeApplyJournalRecord(
+                journal_id=new_id("apply"),
+                code_run_id=code_run_id,
+                workspace_id=workspace_id,
+                review_revision=review_revision,
+                status=CodeApplyStatus.PREPARED.value,
+                paths=paths,
+                completed_paths=[],
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def update_apply_journal(
+        self,
+        journal_id: str,
+        *,
+        status: Optional[CodeApplyStatus] = None,
+        completed_paths: Optional[List[str]] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> CodeApplyJournalRecord:
+        async with self._session_factory() as db:
+            record = await db.get(CodeApplyJournalRecord, journal_id)
+            if record is None:
+                raise NotFoundError(f"apply journal {journal_id} not found")
+            if status is not None:
+                record.status = status.value
+            if completed_paths is not None:
+                record.completed_paths = completed_paths
+            if error is not None:
+                record.error = error
+            record.updated_at = now_utc()
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def list_incomplete_apply_journals(self) -> List[CodeApplyJournalRecord]:
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(CodeApplyJournalRecord)
+                .where(
+                    CodeApplyJournalRecord.status.in_(
+                        [
+                            CodeApplyStatus.PREPARED.value,
+                            CodeApplyStatus.APPLYING.value,
+                            CodeApplyStatus.ROLLING_BACK.value,
+                        ]
+                    )
+                )
+                .order_by(CodeApplyJournalRecord.created_at)
             )
             return list(rows.all())
 
@@ -1151,24 +1447,46 @@ class Repository:
         payload: Optional[Dict[str, Any]] = None,
     ) -> EventRecord:
         async with self._session_factory() as db:
+            sequence = int(
+                (
+                    await db.execute(
+                        text(
+                            "INSERT INTO ff_event_sequences (session_id, next_sequence) "
+                            "VALUES (:session_id, 1) "
+                            "ON CONFLICT(session_id) DO UPDATE SET "
+                            "next_sequence=ff_event_sequences.next_sequence + 1 "
+                            "RETURNING next_sequence"
+                        ),
+                        {"session_id": session_id},
+                    )
+                ).scalar_one()
+            )
+            event_payload = dict(payload or {})
+            event_payload["sequence"] = sequence
             event = EventRecord(
                 event_id=new_id("evt"),
                 session_id=session_id,
+                sequence=sequence,
                 event_type=event_type,
                 message=message,
-                payload=payload or {},
+                payload=event_payload,
             )
             db.add(event)
             await db.commit()
             await db.refresh(event)
             return event
 
-    async def list_events(self, session_id: str, limit: int = 500) -> List[EventRecord]:
+    async def list_events(
+        self, session_id: str, limit: int = 500, after_sequence: int = 0
+    ) -> List[EventRecord]:
         async with self._session_factory() as db:
             rows = await db.scalars(
                 select(EventRecord)
-                .where(EventRecord.session_id == session_id)
-                .order_by(EventRecord.created_at)
+                .where(
+                    EventRecord.session_id == session_id,
+                    EventRecord.sequence > after_sequence,
+                )
+                .order_by(EventRecord.sequence)
                 .limit(limit)
             )
             return list(rows.all())

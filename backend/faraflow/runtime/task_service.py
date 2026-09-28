@@ -170,13 +170,16 @@ class TaskService:
         records = await self.repository.list_approvals(task.session_id)
         return [self._approval_view(record) for record in records]
 
-    async def events(self, task_id: str) -> List[SessionEvent]:
+    async def events(self, task_id: str, after_sequence: int = 0) -> List[SessionEvent]:
         task = await self.repository.get_task(task_id)
-        records = await self.repository.list_events(task.session_id)
+        records = await self.repository.list_events(
+            task.session_id, after_sequence=after_sequence
+        )
         return [
             SessionEvent(
                 event_id=item.event_id,
                 session_id=item.session_id,
+                sequence=getattr(item, "sequence", 0),
                 event_type=item.event_type,
                 message=item.message,
                 payload=item.payload,

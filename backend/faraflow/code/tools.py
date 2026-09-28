@@ -5,8 +5,9 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+from faraflow.domain.enums import CodeToolPhase
 from faraflow.infra.async_utils import run_sync
 from faraflow.infra.repository import Repository
 from faraflow.workspace.run_store import CodeRunStore, file_hash
@@ -59,8 +60,34 @@ class CodeToolExecutor:
         self.changed_paths: Set[str] = set()
         self.previous_calls: Set[str] = set()
 
-    async def execute(self, step_no: int, name: str, arguments: Dict[str, Any]) -> CodeToolResult:
+    async def execute(
+        self,
+        step_no: int,
+        name: str,
+        arguments: Dict[str, Any],
+        *,
+        external_call_id: Optional[str] = None,
+    ) -> CodeToolResult:
         key = json.dumps({"name": name, "args": arguments}, sort_keys=True, ensure_ascii=False)
+        request_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        before_intent, expected_after = self._intent_hashes(name, arguments)
+        call, created = await self.repository.begin_tool_call(
+            code_run_id=self.code_run_id,
+            session_id=self.session_id,
+            turn_id=self.turn_id,
+            external_call_id=external_call_id or f"legacy:{step_no}",
+            step_no=step_no,
+            tool_name=name,
+            arguments=self._redact_arguments(name, arguments),
+            request_digest=request_digest,
+            before_hashes=before_intent,
+            expected_after_hashes=expected_after,
+        )
+        if not created:
+            failed = call.phase != CodeToolPhase.SUCCEEDED.value
+            return CodeToolResult(
+                call.result_excerpt or "tool call already recorded", is_error=failed
+            )
         if key in self.previous_calls:
             result = CodeToolResult(
                 f"error: repeated identical tool call for {name}; choose a different action",
@@ -81,22 +108,44 @@ class CodeToolExecutor:
                 result = CodeToolResult(
                     f"error: {name} failed: {type(exc).__name__}: {exc}", is_error=True
                 )
-        await self.repository.append_tool_call(
-            code_run_id=self.code_run_id,
-            session_id=self.session_id,
-            turn_id=self.turn_id,
-            step_no=step_no,
-            tool_name=name,
-            arguments=self._redact_arguments(name, arguments),
+        excerpt = self.audit_summary(name, result)
+        await self.repository.complete_tool_call(
+            call.tool_call_id,
+            phase=CodeToolPhase.FAILED if result.is_error else CodeToolPhase.SUCCEEDED,
             status="error" if result.is_error else "ok",
-            result_excerpt=self.audit_summary(name, result),
+            result_excerpt=excerpt,
+            result_digest=hashlib.sha256(result.content.encode("utf-8")).hexdigest(),
             affected_paths=result.affected_paths,
             diff_summary=result.diff_summary,
-            before_hashes=result.before_hashes,
-            after_hashes=result.after_hashes,
+            before_hashes=result.before_hashes or before_intent,
+            after_hashes=result.after_hashes or expected_after,
             unified_diff=result.unified_diff,
         )
         return result
+
+    def _intent_hashes(
+        self, name: str, arguments: Dict[str, Any]
+    ) -> Tuple[Dict[str, Optional[str]], Dict[str, Optional[str]]]:
+        if name not in {"create_file", "patch_file", "delete_file"}:
+            return {}, {}
+        try:
+            path = self._path(arguments.get("path"), allow_missing=name == "create_file")
+            relative = self._relative(path)
+            before = {relative: file_hash(path)}
+            if name == "delete_file":
+                return before, {relative: None}
+            if name == "create_file":
+                content = self.policy.validate_text(arguments.get("content"))
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                return before, {relative: digest}
+            text = path.read_text(encoding="utf-8")
+            updated, _ = self.policy.exact_patch(
+                text, arguments.get("old_text"), arguments.get("new_text")
+            )
+            digest = hashlib.sha256(updated.encode("utf-8")).hexdigest()
+            return before, {relative: digest}
+        except Exception:
+            return {}, {}
 
     @staticmethod
     def audit_summary(name: str, result: CodeToolResult) -> str:
@@ -216,7 +265,7 @@ class CodeToolExecutor:
         relative = self._relative(path)
         self.run_store.preserve_baseline(self.code_run_id, relative, path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))
         return self._mutation_result(relative, None, None, content)
 
     def _patch_file(self, arguments: Dict[str, Any]) -> CodeToolResult:
@@ -230,7 +279,7 @@ class CodeToolExecutor:
             text, arguments.get("old_text"), arguments.get("new_text")
         )
         self.run_store.preserve_baseline(self.code_run_id, relative, path)
-        path.write_text(updated, encoding="utf-8")
+        path.write_bytes(updated.encode("utf-8"))
         self.policy.invalidate_read(relative)
         return self._mutation_result(relative, before_hash, text, updated)
 

@@ -50,8 +50,9 @@ export interface Task {
 }
 
 export interface SessionEvent {
-  event_id: string;
-  session_id: string;
+    event_id: string;
+    session_id: string;
+    sequence: number;
   event_type: string;
   message: string;
   payload: Record<string, unknown>;
@@ -241,6 +242,8 @@ export interface ToolCall {
   step_no: number;
   tool_name: string;
   turn_id?: string;
+  external_call_id?: string;
+  phase: string;
   status: string;
   affected_paths: string[];
   diff_summary: string[];

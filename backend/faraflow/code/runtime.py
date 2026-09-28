@@ -1,17 +1,18 @@
 import asyncio
 import subprocess
 import time
+import uuid
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from faraflow.config import Settings
-from faraflow.domain.enums import CodeRunStatus, CodeTurnStatus
+from faraflow.domain.enums import CodeRunStatus, CodeToolPhase, CodeTurnStatus
 from faraflow.domain.schemas import SessionEvent
 from faraflow.infra.async_utils import run_sync
 from faraflow.infra.events import EventBus
 from faraflow.infra.repository import ConflictError, Repository
-from faraflow.workspace.run_store import CodeRunStore
+from faraflow.workspace.run_store import CodeRunStore, file_hash
 from faraflow.workspace.service import WorkspaceService
 
 from .adapter import CodeAdapter
@@ -42,6 +43,7 @@ class CodeRuntime:
         self._capacity = asyncio.Semaphore(settings.code_max_concurrent_runs)
         self._restart_requested: Set[str] = set()
         self._cancel_preserve: Dict[str, bool] = {}
+        self._owner_id = f"code-runtime-{uuid.uuid4().hex}"
         self.tool_registry = ToolRegistry.default()
         self.engine: CodeEngine = (
             PicoCodeEngine(settings)
@@ -60,6 +62,7 @@ class CodeRuntime:
         event = SessionEvent(
             event_id=record.event_id,
             session_id=record.session_id,
+            sequence=getattr(record, "sequence", 0),
             event_type=record.event_type,
             message=record.message,
             payload=record.payload,
@@ -89,6 +92,11 @@ class CodeRuntime:
             if existing and not existing.done():
                 self._restart_requested.add(code_run_id)
                 return
+            acquired = await self.repository.acquire_code_run_lease(
+                code_run_id, self._owner_id, self.settings.code_lease_seconds
+            )
+            if not acquired:
+                raise ConflictError("code run is leased by another runtime")
             job = asyncio.create_task(self._run(code_run_id), name=f"faraflow-code:{code_run_id}")
             self._jobs[code_run_id] = job
             job.add_done_callback(partial(self._forget_job, code_run_id))
@@ -176,9 +184,18 @@ class CodeRuntime:
             isolated_root: Optional[Path] = None
             current_turn: Optional[Any] = None
             final_summary = record.final_summary or ""
+            heartbeat = asyncio.create_task(
+                self._lease_heartbeat(code_run_id),
+                name=f"faraflow-code-lease:{code_run_id}",
+            )
             try:
                 record = await self._prepare_isolation(code_run_id, record, workspace)
                 isolated_root = Path(record.isolated_path or "")
+                unknown = await self.reconcile_incomplete_tools(code_run_id, isolated_root)
+                if unknown:
+                    raise ConflictError(
+                        "incomplete tool calls require inspection: " + ", ".join(unknown)
+                    )
                 await self.emit(
                     record.session_id,
                     "code.run.started",
@@ -197,7 +214,9 @@ class CodeRuntime:
                         break
                     deadline = time.monotonic() + self.settings.code_max_runtime_minutes * 60
                     await self.repository.update_code_run(
-                        code_run_id, status=CodeRunStatus.RUNNING
+                        code_run_id,
+                        status=CodeRunStatus.RUNNING,
+                        active_turn_id=current_turn.turn_id,
                     )
                     await self.repository.update_code_turn(
                         current_turn.turn_id, CodeTurnStatus.RUNNING
@@ -266,6 +285,7 @@ class CodeRuntime:
                         arguments: Dict[str, Any],
                         call_id: str,
                         _executor: CodeToolExecutor = active_executor,
+                        _turn: Any = active_turn,
                     ) -> CodeToolResult:
                         nonlocal step_no, turn_step
                         step_no += 1
@@ -278,7 +298,17 @@ class CodeRuntime:
                             "tool_call_id": call_id,
                         }
                         await engine_event("code.tool.started", f"正在执行 {name}", details)
-                        result = await _executor.execute(step_no, name, arguments)
+                        renewed = await self.repository.renew_code_run_lease(
+                            code_run_id, self._owner_id, self.settings.code_lease_seconds
+                        )
+                        if not renewed:
+                            raise ConflictError("code run lease was lost")
+                        result = await _executor.execute(
+                            step_no,
+                            name,
+                            arguments,
+                            external_call_id=f"{_turn.turn_id}:{call_id}",
+                        )
                         await engine_event(
                             "code.tool.failed" if result.is_error else "code.tool.completed",
                             _executor.audit_summary(name, result)[:500],
@@ -321,6 +351,9 @@ class CodeRuntime:
                         CodeTurnStatus.COMPLETED,
                         summary=final_summary,
                     )
+                    await self.repository.update_code_run(
+                        code_run_id, active_turn_id=None
+                    )
                     await self.emit(
                         record.session_id,
                         "code.turn.completed",
@@ -333,6 +366,8 @@ class CodeRuntime:
                     )
                     current_turn = None
 
+                if heartbeat.done():
+                    heartbeat.result()
                 record = await self.repository.get_code_run(code_run_id)
                 await self._finalize_review(
                     record,
@@ -389,6 +424,75 @@ class CodeRuntime:
                     "代码任务执行失败",
                     {"error_type": type(exc).__name__, "message": str(exc)},
                 )
+            finally:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+                await self.repository.release_code_run_lease(
+                    code_run_id, self._owner_id
+                )
+
+    async def _lease_heartbeat(self, code_run_id: str) -> None:
+        interval = max(5, self.settings.code_lease_seconds // 3)
+        while True:
+            await asyncio.sleep(interval)
+            renewed = await self.repository.renew_code_run_lease(
+                code_run_id, self._owner_id, self.settings.code_lease_seconds
+            )
+            if not renewed:
+                raise ConflictError("code run lease was lost")
+
+    async def reconcile_incomplete_tools(
+        self, code_run_id: str, isolated_root: Path
+    ) -> List[str]:
+        unknown: List[str] = []
+        calls = await self.repository.list_incomplete_tool_calls(code_run_id)
+        for call in calls:
+            before = dict(call.before_hashes or {})
+            expected = dict(call.expected_after_hashes or {})
+            if not expected:
+                await self.repository.resolve_incomplete_tool_call(
+                    call.tool_call_id,
+                    phase=CodeToolPhase.FAILED,
+                    status="interrupted_retryable",
+                    result_excerpt="interrupted before a durable result was recorded",
+                    after_hashes={},
+                )
+                continue
+            current: Dict[str, Optional[str]] = {}
+            for relative in expected:
+                try:
+                    path = self.workspaces.safe_path(
+                        isolated_root, relative, allow_missing=True
+                    )
+                    current[relative] = file_hash(path)
+                except (OSError, PermissionError, ValueError):
+                    current[relative] = "unreadable"
+            if all(current.get(path) == digest for path, digest in expected.items()):
+                await self.repository.resolve_incomplete_tool_call(
+                    call.tool_call_id,
+                    phase=CodeToolPhase.SUCCEEDED,
+                    status="reconciled",
+                    result_excerpt="reconciled after runtime restart",
+                    after_hashes=current,
+                )
+            elif all(current.get(path) == digest for path, digest in before.items()):
+                await self.repository.resolve_incomplete_tool_call(
+                    call.tool_call_id,
+                    phase=CodeToolPhase.FAILED,
+                    status="interrupted_retryable",
+                    result_excerpt="no filesystem effect detected after interruption",
+                    after_hashes=current,
+                )
+            else:
+                unknown.append(call.tool_call_id)
+                await self.repository.resolve_incomplete_tool_call(
+                    call.tool_call_id,
+                    phase=CodeToolPhase.UNKNOWN,
+                    status="unknown",
+                    result_excerpt="filesystem state does not match before or expected hashes",
+                    after_hashes=current,
+                )
+        return unknown
 
     def _changed_paths(self, record: Any, isolated_root: Path) -> List[str]:
         current = self.workspaces.snapshot_manifest(isolated_root)

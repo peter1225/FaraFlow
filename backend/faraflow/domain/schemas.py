@@ -120,6 +120,20 @@ class CodeRunApply(BaseModel):
     review_revision: int = Field(ge=1)
 
 
+class CodeRunResume(BaseModel):
+    instruction: Optional[str] = Field(default=None, min_length=1, max_length=10_000)
+
+
+class CodeRecoveryView(BaseModel):
+    code_run_id: str
+    status: CodeRunStatus
+    recoverable: bool
+    reason: str
+    incomplete_tool_calls: List[str] = Field(default_factory=list)
+    queued_turns: int = 0
+    review_revision: int = 0
+
+
 class CodeTurnView(BaseModel):
     turn_id: str
     ordinal: int
@@ -137,6 +151,8 @@ class ToolCallView(BaseModel):
     step_no: int
     tool_name: str
     turn_id: Optional[str] = None
+    external_call_id: Optional[str] = None
+    phase: str = "SUCCEEDED"
     status: str
     affected_paths: List[str] = Field(default_factory=list)
     diff_summary: List[str] = Field(default_factory=list)
@@ -329,6 +345,7 @@ class ChatReply(BaseModel):
 class SessionEvent(BaseModel):
     event_id: str
     session_id: str
+    sequence: int = 0
     event_type: str
     message: str
     payload: Dict[str, Any] = Field(default_factory=dict)

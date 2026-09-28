@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     code_max_steps: int = Field(default=50, ge=1)
     code_max_runtime_minutes: int = Field(default=20, ge=1)
     code_max_concurrent_runs: int = Field(default=1, ge=1)
+    code_lease_seconds: int = Field(default=60, ge=15, le=3600)
     code_engine: Literal["native", "pico"] = "native"
     # Pico has its own Python 3.12 environment; never import it into the API process.
     pico_python: str = ""

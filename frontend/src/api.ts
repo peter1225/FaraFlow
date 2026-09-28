@@ -162,8 +162,10 @@ export const api = {
   getCodeRun: (codeRunId: string) => request<CodeRun>(`/v1/code-runs/${codeRunId}`),
   codeRunDiff: (codeRunId: string) =>
     request<CodeDiff>(`/v1/code-runs/${codeRunId}/diff`),
-  codeRunEvents: (codeRunId: string) =>
-    request<SessionEvent[]>(`/v1/code-runs/${codeRunId}/events`),
+  codeRunEvents: (codeRunId: string, afterSequence = 0) =>
+    request<SessionEvent[]>(
+      `/v1/code-runs/${codeRunId}/events?after_sequence=${afterSequence}`,
+    ),
   continueCodeRun: (codeRunId: string, instruction: string) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/turns`, {
       method: "POST",
@@ -171,6 +173,18 @@ export const api = {
     }),
   pauseCodeRun: (codeRunId: string) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/pause`, { method: "POST" }),
+  codeRunRecovery: (codeRunId: string) =>
+    request<{
+      recoverable: boolean;
+      reason: string;
+      incomplete_tool_calls: string[];
+      queued_turns: number;
+    }>(`/v1/code-runs/${codeRunId}/recovery`),
+  resumeCodeRun: (codeRunId: string, instruction?: string) =>
+    request<CodeRun>(`/v1/code-runs/${codeRunId}/resume`, {
+      method: "POST",
+      body: JSON.stringify({ instruction }),
+    }),
   applyCodeRun: (codeRunId: string, reviewRevision: number) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/apply`, {
       method: "POST",
@@ -228,8 +242,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ response, resume_token: resumeToken }),
     }),
-  events: (taskId: string) =>
-    request<SessionEvent[]>(`/v1/tasks/${taskId}/events`),
+  events: (taskId: string, afterSequence = 0) =>
+    request<SessionEvent[]>(
+      `/v1/tasks/${taskId}/events?after_sequence=${afterSequence}`,
+    ),
   actions: (taskId: string) =>
     request<BrowserAction[]>(`/v1/tasks/${taskId}/actions`),
   approvals: (taskId: string) =>
@@ -246,11 +262,11 @@ export const api = {
     }),
 };
 
-export function eventWebSocketUrl(sessionId: string): string {
+export function eventWebSocketUrl(sessionId: string, afterSequence = 0): string {
   const base = API_BASE || window.location.origin;
   const url = new URL(base, window.location.origin);
   const protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${url.host}/v1/sessions/${sessionId}/events`;
+  return `${protocol}//${url.host}/v1/sessions/${sessionId}/events?after_sequence=${afterSequence}`;
 }
 
 export function artifactUrl(reference?: string): string | undefined {

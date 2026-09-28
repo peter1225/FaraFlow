@@ -999,6 +999,7 @@ export default function App() {
   const [selectedChat, setSelectedChat] = useState<Chat>();
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string>();
   const [events, setEvents] = useState<SessionEvent[]>([]);
+  const taskEventCursor = useRef(0);
   const [actions, setActions] = useState<BrowserAction[]>([]);
   const [approvals, setApprovals] = useState<Approval[]>([]);
   const [showCreate, setShowCreate] = useState(false);
@@ -1052,6 +1053,7 @@ export default function App() {
     ]);
     setSelected(task);
     setEvents(eventRows);
+    taskEventCursor.current = eventRows[eventRows.length - 1]?.sequence ?? 0;
     setActions(actionRows);
     setApprovals(approvalRows);
     setTasks((current) => current.map((item) => (item.task_id === task.task_id ? task : item)));
@@ -1100,22 +1102,36 @@ export default function App() {
 
   useEffect(() => {
     if (!selected?.session_id) return;
-    const socket = new WebSocket(eventWebSocketUrl(selected.session_id));
-    socket.onmessage = (message) => {
-      const incoming = JSON.parse(message.data as string) as SessionEvent;
-      setEvents((current) => {
-        if (current.some((item) => item.event_id === incoming.event_id)) return current;
-        return [...current, incoming];
-      });
-      if (
-        ["session.completed", "session.failed", "session.approval_required", "action.completed"].includes(
-          incoming.event_type,
-        )
-      ) {
-        void loadDetail(selected.task_id);
-      }
+    let socket: WebSocket | undefined;
+    let reconnectTimer: number | undefined;
+    let closed = false;
+    const connect = () => {
+      socket = new WebSocket(
+        eventWebSocketUrl(selected.session_id, taskEventCursor.current),
+      );
+      socket.onmessage = (message) => {
+        const incoming = JSON.parse(message.data as string) as SessionEvent;
+        if (incoming.sequence <= taskEventCursor.current) return;
+        taskEventCursor.current = incoming.sequence;
+        setEvents((current) => [...current, incoming]);
+        if (
+          ["session.completed", "session.failed", "session.approval_required", "action.completed"].includes(
+            incoming.event_type,
+          )
+        ) {
+          void loadDetail(selected.task_id);
+        }
+      };
+      socket.onclose = () => {
+        if (!closed) reconnectTimer = window.setTimeout(connect, 500);
+      };
     };
-    return () => socket.close();
+    connect();
+    return () => {
+      closed = true;
+      socket?.close();
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+    };
   }, [loadDetail, selected?.session_id, selected?.task_id]);
 
   const stats = useMemo(

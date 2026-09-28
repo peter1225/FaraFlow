@@ -143,6 +143,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         app.state.container = container
         await container.database.create_schema()
         await container.repository.interrupt_running_code_runs()
+        await container.code_runs.recover_incomplete_applies()
         await container.repository.interrupt_running_desktop_runs()
         await container.tasks.seed_skills()
         logger.info("FaraFlow API started")
@@ -300,24 +301,54 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         ):
             await websocket.close(code=4403, reason="code events require loopback access")
             return
-        await websocket.accept()
-        existing = await container.repository.list_events(session_id)
-        for record in existing:
-            await websocket.send_json(
-                SessionEvent(
-                    event_id=record.event_id,
-                    session_id=record.session_id,
-                    event_type=record.event_type,
-                    message=record.message,
-                    payload=record.payload,
-                    created_at=record.created_at,
-                ).model_dump(mode="json")
-            )
-        queue = await container.event_bus.subscribe(session_id)
         try:
+            cursor = max(0, int(websocket.query_params.get("after_sequence", "0")))
+        except ValueError:
+            await websocket.close(code=4400, reason="invalid event cursor")
+            return
+        queue = await container.event_bus.subscribe(session_id)
+        await websocket.accept()
+
+        async def replay() -> None:
+            nonlocal cursor
+            while True:
+                records = await container.repository.list_events(
+                    session_id, limit=500, after_sequence=cursor
+                )
+                if not records:
+                    return
+                for record in records:
+                    if record.sequence <= cursor:
+                        continue
+                    await websocket.send_json(
+                        SessionEvent(
+                            event_id=record.event_id,
+                            session_id=record.session_id,
+                            sequence=record.sequence,
+                            event_type=record.event_type,
+                            message=record.message,
+                            payload=record.payload,
+                            created_at=record.created_at,
+                        ).model_dump(mode="json")
+                    )
+                    cursor = record.sequence
+                if len(records) < 500:
+                    return
+
+        try:
+            # Subscribe first, then replay. Events committed during replay are
+            # either in the database page or in the queue and are deduplicated by cursor.
+            await replay()
             while True:
                 event = await queue.get()
+                if event.sequence <= cursor:
+                    continue
+                if event.sequence > cursor + 1:
+                    await replay()
+                    if event.sequence <= cursor:
+                        continue
                 await websocket.send_json(event.model_dump(mode="json"))
+                cursor = event.sequence
         except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:

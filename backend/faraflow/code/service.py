@@ -1,13 +1,16 @@
 import asyncio
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from faraflow.domain.enums import CodeRunStatus
+from faraflow.domain.enums import CodeApplyStatus, CodeRunStatus, CodeToolPhase
 from faraflow.domain.schemas import (
     CodeDiffView,
+    CodeRecoveryView,
     CodeRunApply,
     CodeRunCreate,
+    CodeRunResume,
     CodeRunView,
     CodeTurnCreate,
     CodeTurnView,
@@ -191,17 +194,32 @@ class CodeRunService:
             targets[relative] = target
 
         applied: Dict[str, Dict[str, Any]] = {}
-        backed_up: List[str] = []
+        completed: List[str] = []
+        journal = await self.repository.create_apply_journal(
+            code_run_id=code_run_id,
+            workspace_id=record.workspace_id,
+            review_revision=review.revision,
+            paths=list(review.changed_paths),
+        )
         try:
             for relative, target in targets.items():
                 self.run_store.preserve_apply_backup(code_run_id, relative, target)
-                backed_up.append(relative)
+            await self.repository.update_apply_journal(
+                journal.journal_id, status=CodeApplyStatus.APPLYING
+            )
             for relative, target in targets.items():
                 source = self.run_store.review_path(code_run_id, review.revision, relative)
+                expected_original = (record.baseline_manifest or {}).get(relative)
+                if file_hash(target) != expected_original:
+                    raise ConflictError(f"workspace changed while applying: {relative}")
                 before_hash = file_hash(target)
                 if source.exists():
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, target)
+                    temporary = target.with_name(
+                        f".{target.name}.{journal.journal_id}.tmp"
+                    )
+                    shutil.copy2(source, temporary)
+                    os.replace(temporary, target)
                 elif target.exists():
                     target.unlink()
                 applied[relative] = {
@@ -209,8 +227,23 @@ class CodeRunService:
                     "after_hash": file_hash(target),
                     "existed_before": before_hash is not None,
                 }
-        except Exception:
-            self._restore_backups(code_run_id, original_root, backed_up)
+                completed.append(relative)
+                await self.repository.update_apply_journal(
+                    journal.journal_id, completed_paths=list(completed)
+                )
+        except Exception as exc:
+            await self.repository.update_apply_journal(
+                journal.journal_id,
+                status=CodeApplyStatus.ROLLING_BACK,
+                error={"type": type(exc).__name__, "message": str(exc)},
+            )
+            self._restore_backups(code_run_id, original_root, completed)
+            self._remove_apply_temps(
+                original_root, journal.journal_id, list(targets)
+            )
+            await self.repository.update_apply_journal(
+                journal.journal_id, status=CodeApplyStatus.ROLLED_BACK
+            )
             raise
 
         record = await self.repository.update_code_run(
@@ -219,6 +252,9 @@ class CodeRunService:
             applied_manifest=applied,
         )
         self.run_store.save_manifest(code_run_id, "applied-manifest", applied)
+        await self.repository.update_apply_journal(
+            journal.journal_id, status=CodeApplyStatus.APPLIED
+        )
         await self.runtime.emit(
             record.session_id,
             "code.run.applied",
@@ -227,6 +263,132 @@ class CodeRunService:
         )
         await self._cleanup(record, workspace)
         return await self.get(code_run_id)
+
+    async def recover_incomplete_applies(self) -> int:
+        journals = await self.repository.list_incomplete_apply_journals()
+        recovered = 0
+        for journal in journals:
+            run = await self.repository.get_code_run(journal.code_run_id)
+            workspace = await self.repository.get_workspace(
+                journal.workspace_id, active_only=False
+            )
+            lock = self._workspace_locks.setdefault(journal.workspace_id, asyncio.Lock())
+            async with lock:
+                await self.repository.update_apply_journal(
+                    journal.journal_id, status=CodeApplyStatus.ROLLING_BACK
+                )
+                original_root = Path(workspace.root_path)
+                rollback_paths = (
+                    journal.paths
+                    if journal.status
+                    in {
+                        CodeApplyStatus.APPLYING.value,
+                        CodeApplyStatus.ROLLING_BACK.value,
+                    }
+                    else []
+                )
+                self._restore_backups(
+                    journal.code_run_id, original_root, rollback_paths
+                )
+                await run_sync(
+                    self._remove_apply_temps,
+                    original_root,
+                    journal.journal_id,
+                    journal.paths,
+                )
+                await self.repository.update_apply_journal(
+                    journal.journal_id, status=CodeApplyStatus.ROLLED_BACK
+                )
+                await self.repository.update_code_run(
+                    run.code_run_id, status=CodeRunStatus.REVIEW_REQUIRED
+                )
+                await self.runtime.emit(
+                    run.session_id,
+                    "code.apply.recovered",
+                    "检测到未完成的应用操作，已从备份回滚",
+                    {
+                        "code_run_id": run.code_run_id,
+                        "review_revision": journal.review_revision,
+                    },
+                )
+                recovered += 1
+        return recovered
+
+    @staticmethod
+    def _remove_apply_temps(
+        original_root: Path, journal_id: str, relative_paths: List[str]
+    ) -> None:
+        for relative in relative_paths:
+            target = (original_root / Path(relative)).resolve()
+            if target != original_root and original_root not in target.parents:
+                continue
+            temporary = target.with_name(f".{target.name}.{journal_id}.tmp")
+            if temporary.exists():
+                temporary.unlink()
+
+    async def recovery(self, code_run_id: str) -> CodeRecoveryView:
+        run = await self.repository.get_code_run(code_run_id)
+        incomplete = await self.repository.list_incomplete_tool_calls(code_run_id)
+        queued = [
+            turn
+            for turn in await self.repository.list_code_turns(code_run_id)
+            if turn.status == "QUEUED"
+        ]
+        unknown = [
+            item.tool_call_id
+            for item in incomplete
+            if item.phase == CodeToolPhase.UNKNOWN.value
+        ]
+        recoverable = not unknown and CodeRunStatus(run.status) in {
+            CodeRunStatus.INTERRUPTED,
+            CodeRunStatus.PAUSED,
+            CodeRunStatus.FAILED,
+            CodeRunStatus.CREATED,
+        }
+        reason = (
+            "incomplete tool calls require inspection"
+            if unknown
+            else "safe to resume from the latest durable tool boundary"
+            if recoverable
+            else f"code run state {run.status} is not resumable"
+        )
+        return CodeRecoveryView(
+            code_run_id=code_run_id,
+            status=CodeRunStatus(run.status),
+            recoverable=recoverable,
+            reason=reason,
+            incomplete_tool_calls=[item.tool_call_id for item in incomplete],
+            queued_turns=len(queued),
+            review_revision=run.review_revision,
+        )
+
+    async def resume(
+        self, code_run_id: str, request: CodeRunResume
+    ) -> CodeRunView:
+        run = await self.repository.get_code_run(code_run_id)
+        isolation_available = False
+        if run.isolated_path:
+            isolation_available = await run_sync(Path(run.isolated_path).is_dir)
+        if isolation_available:
+            assert run.isolated_path is not None
+            await self.runtime.reconcile_incomplete_tools(
+                code_run_id, Path(run.isolated_path)
+            )
+        recovery = await self.recovery(code_run_id)
+        if not recovery.recoverable:
+            raise ConflictError(recovery.reason)
+        if recovery.queued_turns:
+            await self.runtime.start(code_run_id)
+            return await self.get(code_run_id)
+        turns = await self.repository.list_code_turns(code_run_id)
+        previous = turns[-1].instruction if turns else run.instruction
+        instruction = request.instruction or (
+            "Resume the interrupted code task. Inspect the current workspace and continue "
+            f"from the last durable tool boundary. Previous request: {previous}"
+        )
+        return await self.continue_run(
+            code_run_id, CodeTurnCreate(instruction=instruction, auto_start=True)
+        )
 
     async def revert(self, code_run_id: str) -> CodeRunView:
         run_lock = self._run_locks.setdefault(code_run_id, asyncio.Lock())
@@ -328,6 +490,8 @@ class CodeRunService:
                     step_no=item.step_no,
                     tool_name=item.tool_name,
                     turn_id=item.turn_id,
+                    external_call_id=item.external_call_id,
+                    phase=item.phase,
                     status=item.status,
                     affected_paths=list(item.affected_paths or []),
                     diff_summary=list(item.diff_summary or []),

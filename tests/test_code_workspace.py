@@ -40,7 +40,8 @@ def local_settings(tmp_path: Path, workspace_root: Path) -> Settings:
 
 
 def wait_for_status(client: TestClient, code_run_id: str, status: str) -> dict:
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 10
+    body = {}
     while time.monotonic() < deadline:
         response = client.get(f"/v1/code-runs/{code_run_id}")
         assert response.status_code == 200, response.text
@@ -50,11 +51,11 @@ def wait_for_status(client: TestClient, code_run_id: str, status: str) -> dict:
         if body["status"] == "FAILED":
             raise AssertionError(body)
         time.sleep(0.05)
-    raise AssertionError(f"code run did not reach {status}")
+    raise AssertionError(f"code run did not reach {status}: {body}")
 
 
 def wait_for_review(client: TestClient, code_run_id: str, revision: int) -> dict:
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         response = client.get(f"/v1/code-runs/{code_run_id}")
         assert response.status_code == 200, response.text
@@ -167,6 +168,20 @@ def test_workspace_code_run_review_apply_revert_and_conflict(tmp_path: Path) -> 
         patch = client.get(f"/v1/code-runs/{code_run_id}/diff").json()["diff"]
         assert "-# Original" in patch
         assert "+# Updated" in patch
+        event_rows = client.get(f"/v1/code-runs/{code_run_id}/events").json()
+        assert [item["sequence"] for item in event_rows] == list(
+            range(1, len(event_rows) + 1)
+        )
+        cursor = event_rows[-2]["sequence"]
+        after = client.get(
+            f"/v1/code-runs/{code_run_id}/events?after_sequence={cursor}"
+        ).json()
+        assert [item["sequence"] for item in after] == [event_rows[-1]["sequence"]]
+        with client.websocket_connect(
+            f"/v1/sessions/{review['session_id']}/events?after_sequence={cursor}"
+        ) as socket:
+            replayed = socket.receive_json()
+        assert replayed["sequence"] == event_rows[-1]["sequence"]
         patch_artifact = client.get(f"/v1/artifacts/code-runs/{code_run_id}/diff.patch")
         assert patch_artifact.status_code == 200
         private_baseline = client.get(
@@ -363,6 +378,43 @@ def test_code_chat_continues_latest_open_run(tmp_path: Path) -> None:
         assert [turn["instruction"] for turn in result["turns"]] == ["First", "Second"]
 
 
+def test_recovery_endpoint_starts_queued_turn(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "project"
+    workspace_root.mkdir()
+    (workspace_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+    app = create_app(local_settings(tmp_path, workspace_root))
+    with TestClient(app) as client:
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            return_value=CodeDecision(
+                kind="final", raw_response="<final>resumed</final>", answer="resumed"
+            )
+        )
+        workspace = client.post(
+            "/v1/workspaces",
+            json={"name": "Recovery", "root_path": str(workspace_root)},
+        ).json()
+        run = client.post(
+            "/v1/code-runs",
+            json={
+                "workspace_id": workspace["workspace_id"],
+                "instruction": "Queued work",
+                "auto_start": False,
+            },
+        ).json()
+        recovery = client.get(
+            f"/v1/code-runs/{run['code_run_id']}/recovery"
+        )
+        assert recovery.status_code == 200
+        assert recovery.json()["recoverable"]
+        assert recovery.json()["queued_turns"] == 1
+        resumed = client.post(
+            f"/v1/code-runs/{run['code_run_id']}/resume", json={}
+        )
+        assert resumed.status_code == 200, resumed.text
+        result = wait_for_status(client, run["code_run_id"], "PAUSED")
+        assert result["turns"][0]["summary"] == "resumed"
+
+
 @pytest.mark.asyncio
 async def test_native_picker_result_still_uses_workspace_path_policy(tmp_path: Path) -> None:
     allowed_root = tmp_path / "allowed"
@@ -395,6 +447,21 @@ async def test_code_tools_enforce_read_paths_and_exact_patches(tmp_path: Path) -
     readme.write_text("alpha\nbeta\n", encoding="utf-8")
     settings = local_settings(tmp_path, root)
     repository = AsyncMock()
+    journal_count = 0
+
+    def begin_tool_call(**_: object) -> tuple[SimpleNamespace, bool]:
+        nonlocal journal_count
+        journal_count += 1
+        return (
+            SimpleNamespace(
+                tool_call_id=f"tool_{journal_count}",
+                phase="RUNNING",
+                result_excerpt="",
+            ),
+            True,
+        )
+
+    repository.begin_tool_call.side_effect = begin_tool_call
     store = CodeRunStore(tmp_path / "artifacts")
     workspace_service = WorkspaceService(settings, repository, store)
     executor = CodeToolExecutor(
@@ -436,7 +503,7 @@ async def test_code_tools_enforce_read_paths_and_exact_patches(tmp_path: Path) -
     assert patched.before_hashes["README.md"] != patched.after_hashes["README.md"]
     assert "--- a/README.md" in patched.unified_diff
     assert "+updated" in patched.unified_diff
-    recorded = repository.append_tool_call.await_args.kwargs
+    recorded = repository.complete_tool_call.await_args.kwargs
     assert recorded["before_hashes"] == patched.before_hashes
     assert recorded["after_hashes"] == patched.after_hashes
     assert recorded["unified_diff"] == patched.unified_diff

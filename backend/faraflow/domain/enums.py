@@ -58,6 +58,23 @@ class CodeTurnStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class CodeToolPhase(str, Enum):
+    PLANNED = "PLANNED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+
+
+class CodeApplyStatus(str, Enum):
+    PREPARED = "PREPARED"
+    APPLYING = "APPLYING"
+    APPLIED = "APPLIED"
+    ROLLING_BACK = "ROLLING_BACK"
+    ROLLED_BACK = "ROLLED_BACK"
+    FAILED = "FAILED"
+
+
 class DesktopRunStatus(str, Enum):
     CREATED = "CREATED"
     WAITING_CAPTURE_CONSENT = "WAITING_CAPTURE_CONSENT"

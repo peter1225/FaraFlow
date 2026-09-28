@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api, eventWebSocketUrl } from "./api";
 import type {
@@ -47,6 +47,7 @@ export function CodeWorkspace({
   const [busy, setBusy] = useState(false);
   const [continuation, setContinuation] = useState("");
   const [error, setError] = useState("");
+  const eventCursor = useRef(0);
 
   const selectedRun = useMemo(
     () => runs.find((run) => run.code_run_id === selectedRunId),
@@ -78,35 +79,84 @@ export function CodeWorkspace({
     );
   }, [loadTree]);
 
-  const refreshRun = useCallback(async () => {
+  const refreshState = useCallback(async () => {
     if (!selectedRunId) {
       setDiff(undefined);
-      setEvents([]);
       return;
     }
-    const [run, patch, eventRows] = await Promise.all([
+    const [run, patch] = await Promise.all([
       api.getCodeRun(selectedRunId),
       api.codeRunDiff(selectedRunId),
-      api.codeRunEvents(selectedRunId),
     ]);
     setRuns((current) => [run, ...current.filter((item) => item.code_run_id !== run.code_run_id)]);
     setDiff(patch);
+  }, [selectedRunId]);
+
+  const refreshRun = useCallback(async () => {
+    if (!selectedRunId) {
+      setEvents([]);
+      await refreshState();
+      return;
+    }
+    const [eventRows] = await Promise.all([
+      api.codeRunEvents(selectedRunId),
+      refreshState(),
+    ]);
     setEvents(eventRows);
+    eventCursor.current = eventRows[eventRows.length - 1]?.sequence ?? 0;
+  }, [refreshState, selectedRunId]);
+
+  useEffect(() => {
+    eventCursor.current = 0;
+    setEvents([]);
   }, [selectedRunId]);
 
   useEffect(() => {
-    void refreshRun().catch((reason: unknown) =>
-      setError(reason instanceof Error ? reason.message : "加载代码运行失败"),
-    );
-    if (!selectedRun || !["CREATED", "RUNNING"].includes(selectedRun.status)) return;
-    const socket = new WebSocket(eventWebSocketUrl(selectedRun.session_id));
-    socket.onmessage = () => void refreshRun();
-    const timer = window.setInterval(() => void refreshRun(), 3000);
+    let socket: WebSocket | undefined;
+    let reconnectTimer: number | undefined;
+    let refreshTimer: number | undefined;
+    let closed = false;
+    const scheduleRefresh = () => {
+      if (refreshTimer !== undefined) return;
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = undefined;
+        void refreshState();
+      }, 150);
+    };
+    const connect = () => {
+      if (!selectedRun || !["CREATED", "RUNNING"].includes(selectedRun.status)) return;
+      socket = new WebSocket(
+        eventWebSocketUrl(selectedRun.session_id, eventCursor.current),
+      );
+      socket.onmessage = (message) => {
+        const incoming = JSON.parse(message.data as string) as SessionEvent;
+        if (incoming.sequence <= eventCursor.current) return;
+        eventCursor.current = incoming.sequence;
+        setEvents((current) => [...current, incoming]);
+        scheduleRefresh();
+      };
+      socket.onclose = () => {
+        if (!closed) reconnectTimer = window.setTimeout(connect, 500);
+      };
+    };
+    const initialize = async () => {
+      try {
+        await refreshRun();
+        if (!closed) connect();
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : "加载代码运行失败");
+      }
+    };
+    void initialize();
+    const timer = window.setInterval(() => void refreshState(), 5000);
     return () => {
-      socket.close();
+      closed = true;
+      socket?.close();
+      if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer);
       window.clearInterval(timer);
     };
-  }, [refreshRun, selectedRun?.session_id, selectedRun?.status]);
+  }, [refreshRun, refreshState, selectedRun?.session_id, selectedRun?.status]);
 
   async function openEntry(entry: WorkspaceTreeEntry) {
     setError("");
@@ -122,7 +172,7 @@ export function CodeWorkspace({
     }
   }
 
-  async function runAction(action: "apply" | "pause" | "discard" | "revert") {
+  async function runAction(action: "apply" | "pause" | "resume" | "discard" | "revert") {
     if (!selectedRun) return;
     setBusy(true);
     setError("");
@@ -132,6 +182,7 @@ export function CodeWorkspace({
         await api.applyCodeRun(selectedRun.code_run_id, diff.review_revision);
       }
       if (action === "pause") await api.pauseCodeRun(selectedRun.code_run_id);
+      if (action === "resume") await api.resumeCodeRun(selectedRun.code_run_id);
       if (action === "discard") await api.discardCodeRun(selectedRun.code_run_id);
       if (action === "revert") await api.revertCodeRun(selectedRun.code_run_id);
       await Promise.all([loadRuns(), refreshRun(), loadTree()]);
@@ -287,13 +338,19 @@ export function CodeWorkspace({
               <button className="button secondary danger-text" disabled={busy} onClick={() => void runAction("discard")}>丢弃任务</button>
             </div>
           )}
+          {selectedRun?.status === "INTERRUPTED" && (
+            <div className="review-actions">
+              <button className="button primary" disabled={busy} onClick={() => void runAction("resume")}>从持久化边界恢复</button>
+              <button className="button secondary danger-text" disabled={busy} onClick={() => void runAction("discard")}>丢弃任务</button>
+            </div>
+          )}
           {selectedRun?.status === "APPLIED" && (
             <div className="review-actions">
               <button className="button secondary" disabled={busy} onClick={() => void runAction("revert")}>撤销本次应用</button>
             </div>
           )}
           {selectedRun &&
-            ["CREATED", "PAUSED", "FAILED", "INTERRUPTED"].includes(selectedRun.status) && !diff?.diff && (
+            ["CREATED", "PAUSED", "FAILED"].includes(selectedRun.status) && !diff?.diff && (
               <div className="review-actions">
                 <button
                   className="button secondary"

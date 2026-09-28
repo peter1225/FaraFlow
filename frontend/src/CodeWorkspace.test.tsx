@@ -15,6 +15,7 @@ const apiMock = vi.hoisted(() => ({
   getCodeRun: vi.fn(),
   listCodeRuns: vi.fn(),
   pauseCodeRun: vi.fn(),
+  resumeCodeRun: vi.fn(),
   pickWorkspaceDirectory: vi.fn(),
   revertCodeRun: vi.fn(),
   workspaceFile: vi.fn(),
@@ -65,6 +66,7 @@ const reviewRun: CodeRun = {
       tool_call_id: "tool_test",
       step_no: 1,
       tool_name: "patch_file",
+      phase: "SUCCEEDED",
       status: "ok",
       affected_paths: ["README.md"],
       diff_summary: ["modified:README.md"],
@@ -104,8 +106,8 @@ describe("local code workspace", () => {
     apiMock.getCodeRun.mockResolvedValue(failedRun);
     apiMock.codeRunDiff.mockResolvedValue({ diff: "", changed_paths: [], review_revision: 1 });
     apiMock.codeRunEvents.mockResolvedValue([
-      { event_id: "ready", event_type: "code.engine.ready", message: "Pico 执行引擎已就绪", payload: { engine: "pico" } },
-      { event_id: "usage", event_type: "code.usage", message: "模型用量已记录", payload: { total_tokens: 12 } },
+      { event_id: "ready", sequence: 1, event_type: "code.engine.ready", message: "Pico 执行引擎已就绪", payload: { engine: "pico" } },
+      { event_id: "usage", sequence: 2, event_type: "code.usage", message: "模型用量已记录", payload: { total_tokens: 12 } },
     ]);
     render(<CodeWorkspace workspace={workspace} onCreateChat={vi.fn()} onDelete={vi.fn()} />);
     expect(await screen.findByText("Pico 执行引擎已就绪")).toBeInTheDocument();
@@ -174,6 +176,27 @@ describe("local code workspace", () => {
     await waitFor(() =>
       expect(apiMock.continueCodeRun).toHaveBeenCalledWith("code_test", "把标题改成中文"),
     );
+  });
+
+  it("resumes an interrupted run from its durable boundary", async () => {
+    const interrupted = { ...reviewRun, status: "INTERRUPTED" as const };
+    apiMock.listCodeRuns.mockResolvedValue([interrupted]);
+    apiMock.getCodeRun.mockResolvedValue(interrupted);
+    apiMock.codeRunDiff.mockResolvedValue({
+      code_run_id: interrupted.code_run_id,
+      status: "INTERRUPTED",
+      review_revision: 1,
+      changed_paths: [],
+      diff: "",
+    });
+    apiMock.resumeCodeRun.mockResolvedValue({ ...interrupted, status: "CREATED" });
+    render(
+      <CodeWorkspace workspace={workspace} onCreateChat={vi.fn()} onDelete={vi.fn()} />,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "从持久化边界恢复" }),
+    );
+    await waitFor(() => expect(apiMock.resumeCodeRun).toHaveBeenCalledWith("code_test"));
   });
 
   it("registers an absolute local folder from the modal", async () => {

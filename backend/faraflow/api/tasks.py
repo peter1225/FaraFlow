@@ -56,8 +56,12 @@ async def respond_to_task(task_id: str, payload: UserResponse, request: Request)
 
 
 @router.get("/tasks/{task_id}/events", response_model=List[SessionEvent], tags=["events"])
-async def list_task_events(task_id: str, request: Request) -> List[SessionEvent]:
-    return await get_container(request).tasks.events(task_id)
+async def list_task_events(
+    task_id: str,
+    request: Request,
+    after_sequence: int = Query(default=0, ge=0),
+) -> List[SessionEvent]:
+    return await get_container(request).tasks.events(task_id, after_sequence)
 
 
 @router.get(

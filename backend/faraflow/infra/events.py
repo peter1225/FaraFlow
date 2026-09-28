@@ -12,7 +12,7 @@ class EventBus:
         self._lock = asyncio.Lock()
 
     async def subscribe(self, session_id: str) -> asyncio.Queue[SessionEvent]:
-        queue: asyncio.Queue[SessionEvent] = asyncio.Queue(maxsize=100)
+        queue: asyncio.Queue[SessionEvent] = asyncio.Queue(maxsize=1000)
         async with self._lock:
             self._subscribers[session_id].add(queue)
         return queue
@@ -28,10 +28,11 @@ class EventBus:
             queues = list(self._subscribers.get(event.session_id, set()))
         for queue in queues:
             if queue.full():
-                try:
-                    queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    pass
+                while not queue.empty():
+                    try:
+                        queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
             queue.put_nowait(event)
 
     def subscriber_counts(self) -> dict[str, int]:
