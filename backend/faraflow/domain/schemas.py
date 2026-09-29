@@ -7,6 +7,7 @@ from .enums import (
     ApprovalStatus,
     CodeRunStatus,
     CodeTurnStatus,
+    CodeVerificationStatus,
     DesktopRunStatus,
     RiskLevel,
     SessionState,
@@ -132,6 +133,34 @@ class CodeRecoveryView(BaseModel):
     incomplete_tool_calls: List[str] = Field(default_factory=list)
     queued_turns: int = 0
     review_revision: int = 0
+
+
+class CodeVerificationCreate(BaseModel):
+    profile_id: str = Field(min_length=1, max_length=100)
+
+
+class CodeVerificationProfileView(BaseModel):
+    profile_id: str
+    argv: List[str]
+    timeout_seconds: int
+
+
+class CodeVerificationView(BaseModel):
+    verification_id: str
+    code_run_id: str
+    turn_id: Optional[str] = None
+    review_revision: int
+    profile_id: str
+    status: CodeVerificationStatus
+    exit_code: Optional[int] = None
+    stdout_excerpt: str = ""
+    stderr_excerpt: str = ""
+    duration_ms: Optional[int] = None
+    source_manifest_digest: str
+    stale: bool = False
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
 
 
 class CodeTurnView(BaseModel):

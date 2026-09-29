@@ -86,6 +86,34 @@ WS  /v1/sessions/{session_id}/events?after_sequence=120
 
 WebSocket 会先建立订阅再回放数据库事件，通过 sequence 去重；检测到队列跳号时会自动从数据库补发。前端保存最后一个 sequence，断线后从 cursor 重连，并按 150ms 合并运行状态刷新，不再为每个工具事件重新加载完整事件历史。
 
+## Fencing、Outbox 与验证闭环
+
+应用和撤销使用工作区级数据库租约。每次取得租约都会生成递增的 fencing token；文件写入前必须验证 owner、token 和过期时间，旧进程持有的 token 不能继续写入。
+
+审核文件通过 `DurableFileWriter` 应用：先写同目录临时文件并执行 `flush/fsync`，再使用 `os.replace` 原子替换。删除操作先重命名为 tombstone。Apply Journal 保存备份哈希，自动回滚前会验证备份完整性。
+
+事件写入现在同时创建 `ff_event_outbox` 记录。正常路径会即时发布并标记 Outbox；进程在提交后退出时，后台 Dispatcher 会重新发布。WebSocket 每秒按 sequence 从数据库补查，因此连接到其他 API 进程的客户端也能得到事件。
+
+验证命令来自运维配置，模型只能选择 Profile ID：
+
+```dotenv
+FARAFLOW_CODE_VERIFICATION_PROFILES={"backend-tests":["D:/Anaconda/envs/zzx/python.exe","-m","pytest","-q"]}
+FARAFLOW_CODE_VERIFICATION_TIMEOUT_SECONDS=600
+FARAFLOW_CODE_VERIFICATION_OUTPUT_BYTES=1048576
+```
+
+每次验证在隔离工作区的一次性副本中执行，不使用 Shell，并限制环境变量、运行时间和输出大小。结果绑定 `review_revision` 与完整 manifest digest；产生新审核版本后，旧结果自动显示为 `STALE`。
+
+可用接口：
+
+```text
+GET  /v1/code-runs/{id}/verification-profiles
+POST /v1/code-runs/{id}/verifications
+GET  /v1/code-runs/{id}/verifications
+```
+
+Agent 同时获得 `list_verification_profiles` 和 `run_verification` 两个受控工具，可以在同一 Turn 中根据失败输出继续修复。当前 Profile 进程仍运行在宿主机权限范围内；它适用于用户信任的本地项目，后续可接入 WSL2 或专用沙箱提供更强隔离。
+
 ## 验证
 
 后端验证使用现有 `zzx`：

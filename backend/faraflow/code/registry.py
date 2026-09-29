@@ -37,5 +37,7 @@ class ToolRegistry:
                 ToolSpec("delete_file", mutates_workspace=True),
                 ToolSpec("git_status"),
                 ToolSpec("git_diff"),
+                ToolSpec("list_verification_profiles"),
+                ToolSpec("run_verification"),
             ]
         )

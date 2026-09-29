@@ -75,6 +75,16 @@ class CodeApplyStatus(str, Enum):
     FAILED = "FAILED"
 
 
+class CodeVerificationStatus(str, Enum):
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    PASSED = "PASSED"
+    FAILED = "FAILED"
+    TIMED_OUT = "TIMED_OUT"
+    ERROR = "ERROR"
+    CANCELLED = "CANCELLED"
+
+
 class DesktopRunStatus(str, Enum):
     CREATED = "CREATED"
     WAITING_CAPTURE_CONSENT = "WAITING_CAPTURE_CONSENT"

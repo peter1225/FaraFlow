@@ -66,6 +66,9 @@ class AgentRuntime:
             created_at=record.created_at,
         )
         await self.event_bus.publish(event)
+        marker = getattr(self.repository, "mark_event_published", None)
+        if marker is not None:
+            await marker(record.event_id)
         return event
 
     async def start(self, task_id: str) -> None:

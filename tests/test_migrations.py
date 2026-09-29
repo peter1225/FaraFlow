@@ -29,6 +29,9 @@ def test_alembic_creates_fresh_database(tmp_path: Path) -> None:
             "ff_code_review_revisions",
             "ff_code_apply_journals",
             "ff_event_sequences",
+            "ff_event_outbox",
+            "ff_workspace_mutation_leases",
+            "ff_code_verifications",
             "ff_tool_calls",
             "ff_desktop_runs",
             "ff_desktop_actions",
@@ -58,11 +61,27 @@ def test_alembic_creates_fresh_database(tmp_path: Path) -> None:
             "lease_expires_at",
             "next_turn_ordinal",
             "active_turn_id",
+            "lease_token",
         } <= run_columns
         event_columns = {
             item["name"] for item in inspect(engine).get_columns("ff_events")
         }
         assert "sequence" in event_columns
+        journal_columns = {
+            item["name"]
+            for item in inspect(engine).get_columns("ff_code_apply_journals")
+        }
+        assert "backup_hashes" in journal_columns
+        verification_columns = {
+            item["name"]
+            for item in inspect(engine).get_columns("ff_code_verifications")
+        }
+        assert {
+            "review_revision",
+            "profile_id",
+            "source_manifest_digest",
+            "status",
+        } <= verification_columns
     finally:
         engine.dispose()
 

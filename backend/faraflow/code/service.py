@@ -1,10 +1,14 @@
 import asyncio
-import os
-import shutil
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
-from faraflow.domain.enums import CodeApplyStatus, CodeRunStatus, CodeToolPhase
+from faraflow.domain.enums import (
+    CodeApplyStatus,
+    CodeRunStatus,
+    CodeToolPhase,
+    CodeVerificationStatus,
+)
 from faraflow.domain.schemas import (
     CodeDiffView,
     CodeRecoveryView,
@@ -14,10 +18,13 @@ from faraflow.domain.schemas import (
     CodeRunView,
     CodeTurnCreate,
     CodeTurnView,
+    CodeVerificationProfileView,
+    CodeVerificationView,
     ToolCallView,
 )
 from faraflow.infra.async_utils import run_sync
 from faraflow.infra.repository import ConflictError, Repository
+from faraflow.workspace.durable import DurableFileWriter
 from faraflow.workspace.run_store import CodeRunStore, file_hash
 from faraflow.workspace.service import WorkspaceService
 
@@ -38,6 +45,8 @@ class CodeRunService:
         self.runtime = runtime
         self._workspace_locks: Dict[str, asyncio.Lock] = {}
         self._run_locks: Dict[str, asyncio.Lock] = {}
+        self._mutation_owner = f"code-service-{uuid.uuid4().hex}"
+        self._verification_owner = f"verification-service-{uuid.uuid4().hex}"
 
     async def create(self, request: CodeRunCreate) -> CodeRunView:
         self.workspaces.assert_enabled()
@@ -163,9 +172,23 @@ class CodeRunService:
         workspace = await self.repository.get_workspace(record.workspace_id)
         lock = self._workspace_locks.setdefault(record.workspace_id, asyncio.Lock())
         async with lock:
-            return await self._apply_locked(record, review, workspace)
+            token = await self.repository.acquire_workspace_mutation_lease(
+                record.workspace_id,
+                self._mutation_owner,
+                self.runtime.settings.code_lease_seconds,
+            )
+            if token is None:
+                raise ConflictError("workspace is being mutated by another process")
+            try:
+                return await self._apply_locked(record, review, workspace, token)
+            finally:
+                await self.repository.release_workspace_mutation_lease(
+                    record.workspace_id, self._mutation_owner, token
+                )
 
-    async def _apply_locked(self, record: Any, review: Any, workspace: Any) -> CodeRunView:
+    async def _apply_locked(
+        self, record: Any, review: Any, workspace: Any, fencing_token: int
+    ) -> CodeRunView:
         code_run_id = record.code_run_id
         latest = await self.repository.get_code_run(code_run_id)
         if (
@@ -195,6 +218,7 @@ class CodeRunService:
 
         applied: Dict[str, Dict[str, Any]] = {}
         completed: List[str] = []
+        backup_hashes: Dict[str, Optional[str]] = {}
         journal = await self.repository.create_apply_journal(
             code_run_id=code_run_id,
             workspace_id=record.workspace_id,
@@ -203,25 +227,43 @@ class CodeRunService:
         )
         try:
             for relative, target in targets.items():
-                self.run_store.preserve_apply_backup(code_run_id, relative, target)
+                backup_hashes[relative] = self.run_store.preserve_apply_backup(
+                    code_run_id, relative, target
+                )
+            await self.repository.update_apply_journal(
+                journal.journal_id, backup_hashes=backup_hashes
+            )
             await self.repository.update_apply_journal(
                 journal.journal_id, status=CodeApplyStatus.APPLYING
             )
             for relative, target in targets.items():
+                renewed = await self.repository.renew_workspace_mutation_lease(
+                    record.workspace_id,
+                    self._mutation_owner,
+                    fencing_token,
+                    self.runtime.settings.code_lease_seconds,
+                )
+                if not renewed:
+                    raise ConflictError("workspace mutation lease was lost")
+                await self.repository.assert_workspace_mutation_fence(
+                    record.workspace_id, self._mutation_owner, fencing_token
+                )
                 source = self.run_store.review_path(code_run_id, review.revision, relative)
                 expected_original = (record.baseline_manifest or {}).get(relative)
                 if file_hash(target) != expected_original:
                     raise ConflictError(f"workspace changed while applying: {relative}")
                 before_hash = file_hash(target)
                 if source.exists():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = target.with_name(
-                        f".{target.name}.{journal.journal_id}.tmp"
+                    await run_sync(
+                        DurableFileWriter.replace_from,
+                        source,
+                        target,
+                        journal.journal_id,
                     )
-                    shutil.copy2(source, temporary)
-                    os.replace(temporary, target)
                 elif target.exists():
-                    target.unlink()
+                    await run_sync(
+                        DurableFileWriter.delete, target, journal.journal_id
+                    )
                 applied[relative] = {
                     "before_hash": before_hash,
                     "after_hash": file_hash(target),
@@ -237,7 +279,13 @@ class CodeRunService:
                 status=CodeApplyStatus.ROLLING_BACK,
                 error={"type": type(exc).__name__, "message": str(exc)},
             )
-            self._restore_backups(code_run_id, original_root, completed)
+            self._restore_backups(
+                code_run_id,
+                original_root,
+                completed,
+                operation_id=journal.journal_id,
+                expected_hashes=backup_hashes,
+            )
             self._remove_apply_temps(
                 original_root, journal.journal_id, list(targets)
             )
@@ -274,44 +322,85 @@ class CodeRunService:
             )
             lock = self._workspace_locks.setdefault(journal.workspace_id, asyncio.Lock())
             async with lock:
-                await self.repository.update_apply_journal(
-                    journal.journal_id, status=CodeApplyStatus.ROLLING_BACK
+                token = await self.repository.acquire_workspace_mutation_lease(
+                    journal.workspace_id,
+                    self._mutation_owner,
+                    self.runtime.settings.code_lease_seconds,
                 )
-                original_root = Path(workspace.root_path)
-                rollback_paths = (
-                    journal.paths
-                    if journal.status
-                    in {
-                        CodeApplyStatus.APPLYING.value,
-                        CodeApplyStatus.ROLLING_BACK.value,
-                    }
-                    else []
-                )
-                self._restore_backups(
-                    journal.code_run_id, original_root, rollback_paths
-                )
-                await run_sync(
-                    self._remove_apply_temps,
-                    original_root,
-                    journal.journal_id,
-                    journal.paths,
-                )
-                await self.repository.update_apply_journal(
-                    journal.journal_id, status=CodeApplyStatus.ROLLED_BACK
-                )
-                await self.repository.update_code_run(
-                    run.code_run_id, status=CodeRunStatus.REVIEW_REQUIRED
-                )
-                await self.runtime.emit(
-                    run.session_id,
-                    "code.apply.recovered",
-                    "检测到未完成的应用操作，已从备份回滚",
-                    {
-                        "code_run_id": run.code_run_id,
-                        "review_revision": journal.review_revision,
-                    },
-                )
-                recovered += 1
+                if token is None:
+                    continue
+                try:
+                    await self.repository.assert_workspace_mutation_fence(
+                        journal.workspace_id, self._mutation_owner, token
+                    )
+                    await self.repository.update_apply_journal(
+                        journal.journal_id, status=CodeApplyStatus.ROLLING_BACK
+                    )
+                    original_root = Path(workspace.root_path)
+                    rollback_paths = (
+                        journal.paths
+                        if journal.status
+                        in {
+                            CodeApplyStatus.APPLYING.value,
+                            CodeApplyStatus.ROLLING_BACK.value,
+                        }
+                        else []
+                    )
+                    self._restore_backups(
+                        journal.code_run_id,
+                        original_root,
+                        rollback_paths,
+                        operation_id=journal.journal_id,
+                        expected_hashes=journal.backup_hashes or {},
+                    )
+                    await run_sync(
+                        self._remove_apply_temps,
+                        original_root,
+                        journal.journal_id,
+                        journal.paths,
+                    )
+                    await self.repository.update_apply_journal(
+                        journal.journal_id, status=CodeApplyStatus.ROLLED_BACK
+                    )
+                    await self.repository.update_code_run(
+                        run.code_run_id, status=CodeRunStatus.REVIEW_REQUIRED
+                    )
+                    await self.runtime.emit(
+                        run.session_id,
+                        "code.apply.recovered",
+                        "检测到未完成的应用操作，已从备份回滚",
+                        {
+                            "code_run_id": run.code_run_id,
+                            "review_revision": journal.review_revision,
+                        },
+                    )
+                    recovered += 1
+                except Exception as exc:
+                    error = {"type": type(exc).__name__, "message": str(exc)}
+                    await self.repository.update_apply_journal(
+                        journal.journal_id,
+                        status=CodeApplyStatus.FAILED,
+                        error=error,
+                    )
+                    await self.repository.update_code_run(
+                        run.code_run_id,
+                        status=CodeRunStatus.FAILED,
+                        error={"reason": "apply_recovery_failed", **error},
+                    )
+                    await self.runtime.emit(
+                        run.session_id,
+                        "code.apply.recovery_failed",
+                        "未完成的应用操作无法自动回滚，需要人工检查",
+                        {
+                            "code_run_id": run.code_run_id,
+                            "journal_id": journal.journal_id,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
+                finally:
+                    await self.repository.release_workspace_mutation_lease(
+                        journal.workspace_id, self._mutation_owner, token
+                    )
         return recovered
 
     @staticmethod
@@ -322,9 +411,7 @@ class CodeRunService:
             target = (original_root / Path(relative)).resolve()
             if target != original_root and original_root not in target.parents:
                 continue
-            temporary = target.with_name(f".{target.name}.{journal_id}.tmp")
-            if temporary.exists():
-                temporary.unlink()
+            DurableFileWriter.cleanup(target, journal_id)
 
     async def recovery(self, code_run_id: str) -> CodeRecoveryView:
         run = await self.repository.get_code_run(code_run_id)
@@ -390,6 +477,100 @@ class CodeRunService:
             code_run_id, CodeTurnCreate(instruction=instruction, auto_start=True)
         )
 
+    def verification_profiles(self) -> List[CodeVerificationProfileView]:
+        return [
+            CodeVerificationProfileView(
+                profile_id=profile_id,
+                argv=argv,
+                timeout_seconds=self.runtime.settings.code_verification_timeout_seconds,
+            )
+            for profile_id, argv in sorted(self.runtime.verification.profiles().items())
+        ]
+
+    async def verify(
+        self, code_run_id: str, profile_id: str
+    ) -> CodeVerificationView:
+        lock = self._run_locks.setdefault(code_run_id, asyncio.Lock())
+        async with lock:
+            run = await self.repository.get_code_run(code_run_id)
+            if CodeRunStatus(run.status) not in {
+                CodeRunStatus.REVIEW_REQUIRED,
+                CodeRunStatus.PAUSED,
+                CodeRunStatus.FAILED,
+            }:
+                raise ConflictError("code run is not ready for verification")
+            if not run.isolated_path or not await run_sync(Path(run.isolated_path).is_dir):
+                raise ConflictError("code run isolation is unavailable")
+            isolated_root = Path(run.isolated_path)
+            for relative, expected in dict(run.review_manifest or {}).items():
+                path = self.workspaces.safe_path(
+                    isolated_root, relative, allow_missing=True
+                )
+                if file_hash(path) != expected:
+                    raise ConflictError(
+                        f"isolated workspace changed after review: {relative}"
+                    )
+            token = await self.repository.acquire_code_run_lease(
+                code_run_id,
+                self._verification_owner,
+                self.runtime.settings.code_lease_seconds,
+            )
+            if token is None:
+                raise ConflictError("code run is being executed by another process")
+            try:
+                verification = await self.runtime.verification.run(
+                    code_run_id=code_run_id,
+                    turn_id=None,
+                    isolated_root=isolated_root,
+                    review_revision=run.review_revision,
+                    profile_id=profile_id,
+                )
+            finally:
+                await self.repository.release_code_run_lease(
+                    code_run_id, self._verification_owner, token
+                )
+            await self.runtime.emit(
+                run.session_id,
+                "code.verification.completed",
+                f"验证 {profile_id}：{verification.status}",
+                {
+                    "code_run_id": code_run_id,
+                    "verification_id": verification.verification_id,
+                    "profile_id": profile_id,
+                    "status": verification.status,
+                    "exit_code": verification.exit_code,
+                    "review_revision": run.review_revision,
+                },
+            )
+            return self._verification_view(verification, run.review_revision)
+
+    async def verifications(self, code_run_id: str) -> List[CodeVerificationView]:
+        run = await self.repository.get_code_run(code_run_id)
+        records = await self.repository.list_code_verifications(code_run_id)
+        return [
+            self._verification_view(item, run.review_revision) for item in records
+        ]
+
+    @staticmethod
+    def _verification_view(record: Any, current_revision: int) -> CodeVerificationView:
+        return CodeVerificationView(
+            verification_id=record.verification_id,
+            code_run_id=record.code_run_id,
+            turn_id=record.turn_id,
+            review_revision=record.review_revision,
+            profile_id=record.profile_id,
+            status=CodeVerificationStatus(record.status),
+            exit_code=record.exit_code,
+            stdout_excerpt=record.stdout_excerpt or "",
+            stderr_excerpt=record.stderr_excerpt or "",
+            duration_ms=record.duration_ms,
+            source_manifest_digest=record.source_manifest_digest,
+            stale=record.review_revision != current_revision,
+            created_at=record.created_at,
+            started_at=record.started_at,
+            finished_at=record.finished_at,
+        )
+
     async def revert(self, code_run_id: str) -> CodeRunView:
         run_lock = self._run_locks.setdefault(code_run_id, asyncio.Lock())
         async with run_lock:
@@ -402,7 +583,22 @@ class CodeRunService:
         workspace = await self.repository.get_workspace(record.workspace_id)
         lock = self._workspace_locks.setdefault(record.workspace_id, asyncio.Lock())
         async with lock:
-            return await self._revert_locked(record, workspace)
+            token = await self.repository.acquire_workspace_mutation_lease(
+                record.workspace_id,
+                self._mutation_owner,
+                self.runtime.settings.code_lease_seconds,
+            )
+            if token is None:
+                raise ConflictError("workspace is being mutated by another process")
+            try:
+                await self.repository.assert_workspace_mutation_fence(
+                    record.workspace_id, self._mutation_owner, token
+                )
+                return await self._revert_locked(record, workspace)
+            finally:
+                await self.repository.release_workspace_mutation_lease(
+                    record.workspace_id, self._mutation_owner, token
+                )
 
     async def _revert_locked(self, record: Any, workspace: Any) -> CodeRunView:
         code_run_id = record.code_run_id
@@ -414,7 +610,12 @@ class CodeRunService:
             target = self.workspaces.safe_path(original_root, relative, allow_missing=True)
             if file_hash(target) != metadata.get("after_hash"):
                 raise ConflictError(f"workspace file changed after apply: {relative}")
-        self._restore_backups(code_run_id, original_root, latest.applied_manifest.keys())
+        self._restore_backups(
+            code_run_id,
+            original_root,
+            latest.applied_manifest.keys(),
+            operation_id=f"revert-{code_run_id}",
+        )
         record = await self.repository.update_code_run(code_run_id, status=CodeRunStatus.REVERTED)
         await self.runtime.emit(
             record.session_id,
@@ -452,16 +653,35 @@ class CodeRunService:
         if record.isolated_path:
             await run_sync(self.workspaces.cleanup_isolation, record, workspace)
 
-    def _restore_backups(self, code_run_id: str, original_root: Path, relative_paths: Any) -> None:
+    def _restore_backups(
+        self,
+        code_run_id: str,
+        original_root: Path,
+        relative_paths: Any,
+        *,
+        operation_id: str,
+        expected_hashes: Optional[Mapping[str, Optional[str]]] = None,
+    ) -> None:
         for relative in relative_paths:
             target = self.workspaces.safe_path(original_root, relative, allow_missing=True)
-            backup = self.run_store.backup_bytes(code_run_id, relative)
-            if backup is None:
-                if target.exists():
-                    target.unlink()
+            backup = self.run_store.backup_path(code_run_id, relative)
+            expected = (expected_hashes or {}).get(relative)
+            if backup.exists():
+                if (
+                    expected_hashes is not None
+                    and relative in expected_hashes
+                    and file_hash(backup) != expected
+                ):
+                    raise ConflictError(f"apply backup integrity check failed: {relative}")
+                DurableFileWriter.replace_from(backup, target, operation_id)
             else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(backup)
+                if (
+                    expected_hashes is not None
+                    and relative in expected_hashes
+                    and expected is not None
+                ):
+                    raise ConflictError(f"apply backup is missing: {relative}")
+                DurableFileWriter.delete(target, operation_id)
 
     @staticmethod
     def _view(record: Any, calls: List[Any], turns: List[Any]) -> CodeRunView:

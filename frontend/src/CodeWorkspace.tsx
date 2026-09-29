@@ -4,6 +4,8 @@ import { api, eventWebSocketUrl } from "./api";
 import type {
   CodeDiff,
   CodeRun,
+  CodeVerification,
+  CodeVerificationProfile,
   SessionEvent,
   Workspace,
   WorkspaceFile,
@@ -44,6 +46,8 @@ export function CodeWorkspace({
   const [selectedRunId, setSelectedRunId] = useState<string>();
   const [diff, setDiff] = useState<CodeDiff>();
   const [events, setEvents] = useState<SessionEvent[]>([]);
+  const [verificationProfiles, setVerificationProfiles] = useState<CodeVerificationProfile[]>([]);
+  const [verifications, setVerifications] = useState<CodeVerification[]>([]);
   const [busy, setBusy] = useState(false);
   const [continuation, setContinuation] = useState("");
   const [error, setError] = useState("");
@@ -82,14 +86,17 @@ export function CodeWorkspace({
   const refreshState = useCallback(async () => {
     if (!selectedRunId) {
       setDiff(undefined);
+      setVerifications([]);
       return;
     }
-    const [run, patch] = await Promise.all([
+    const [run, patch, verificationRows] = await Promise.all([
       api.getCodeRun(selectedRunId),
       api.codeRunDiff(selectedRunId),
+      api.listCodeVerifications(selectedRunId),
     ]);
     setRuns((current) => [run, ...current.filter((item) => item.code_run_id !== run.code_run_id)]);
     setDiff(patch);
+    setVerifications(verificationRows);
   }, [selectedRunId]);
 
   const refreshRun = useCallback(async () => {
@@ -98,17 +105,21 @@ export function CodeWorkspace({
       await refreshState();
       return;
     }
-    const [eventRows] = await Promise.all([
+    const [eventRows, profiles] = await Promise.all([
       api.codeRunEvents(selectedRunId),
+      api.codeVerificationProfiles(selectedRunId),
       refreshState(),
     ]);
     setEvents(eventRows);
+    setVerificationProfiles(profiles);
     eventCursor.current = eventRows[eventRows.length - 1]?.sequence ?? 0;
   }, [refreshState, selectedRunId]);
 
   useEffect(() => {
     eventCursor.current = 0;
     setEvents([]);
+    setVerificationProfiles([]);
+    setVerifications([]);
   }, [selectedRunId]);
 
   useEffect(() => {
@@ -203,6 +214,20 @@ export function CodeWorkspace({
       await Promise.all([loadRuns(), refreshRun()]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "追加要求失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runVerification(profileId: string) {
+    if (!selectedRun) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.runCodeVerification(selectedRun.code_run_id, profileId);
+      await refreshState();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "验证执行失败");
     } finally {
       setBusy(false);
     }
@@ -348,6 +373,38 @@ export function CodeWorkspace({
             <div className="review-actions">
               <button className="button secondary" disabled={busy} onClick={() => void runAction("revert")}>撤销本次应用</button>
             </div>
+          )}
+          {selectedRun && verificationProfiles.length > 0 && ["REVIEW_REQUIRED", "PAUSED", "FAILED"].includes(selectedRun.status) && (
+            <section className="verification-panel">
+              <div className="panel-title">
+                <span>验证</span><small>{verifications.length} RUNS</small>
+              </div>
+              <div className="review-actions">
+                {verificationProfiles.map((profile) => (
+                  <button
+                    className="button secondary"
+                    disabled={busy}
+                    key={profile.profile_id}
+                    onClick={() => void runVerification(profile.profile_id)}
+                  >
+                    运行 {profile.profile_id}
+                  </button>
+                ))}
+              </div>
+              {verifications.map((verification) => (
+                <article className="verification-result" key={verification.verification_id}>
+                  <strong>{verification.profile_id}</strong>
+                  <small>
+                    {verification.status}
+                    {verification.stale ? " · STALE" : ""}
+                    {verification.duration_ms !== undefined ? ` · ${verification.duration_ms}ms` : ""}
+                  </small>
+                  {(verification.stdout_excerpt || verification.stderr_excerpt) && (
+                    <pre>{verification.stdout_excerpt || verification.stderr_excerpt}</pre>
+                  )}
+                </article>
+              ))}
+            </section>
           )}
           {selectedRun &&
             ["CREATED", "PAUSED", "FAILED"].includes(selectedRun.status) && !diff?.diff && (

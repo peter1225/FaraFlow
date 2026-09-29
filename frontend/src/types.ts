@@ -297,3 +297,27 @@ export interface CodeDiff {
   diff: string;
 }
 
+export interface CodeVerificationProfile {
+  profile_id: string;
+  argv: string[];
+  timeout_seconds: number;
+}
+
+export interface CodeVerification {
+  verification_id: string;
+  code_run_id: string;
+  turn_id?: string;
+  review_revision: number;
+  profile_id: string;
+  status: "QUEUED" | "RUNNING" | "PASSED" | "FAILED" | "TIMED_OUT" | "ERROR" | "CANCELLED";
+  exit_code?: number;
+  stdout_excerpt: string;
+  stderr_excerpt: string;
+  duration_ms?: number;
+  source_manifest_digest: string;
+  stale: boolean;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+}
+

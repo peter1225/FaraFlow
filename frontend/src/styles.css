@@ -2354,6 +2354,34 @@ textarea:focus {
   border-left-color: rgba(77, 217, 200, 0.5);
 }
 
+.verification-panel {
+  border-top: 1px solid var(--border);
+  padding: 12px;
+}
+
+.verification-result {
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  background: rgba(7, 13, 21, 0.72);
+}
+
+.verification-result strong,
+.verification-result small {
+  display: block;
+}
+
+.verification-result small {
+  margin-top: 3px;
+  color: var(--muted);
+}
+
+.verification-result pre {
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
 .repo-badge,
 .code-status {
   display: inline-flex;

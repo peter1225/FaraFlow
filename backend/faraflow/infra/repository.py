@@ -12,6 +12,7 @@ from faraflow.domain.enums import (
     CodeRunStatus,
     CodeToolPhase,
     CodeTurnStatus,
+    CodeVerificationStatus,
     DesktopRunStatus,
     SessionState,
 )
@@ -26,14 +27,17 @@ from .database import (
     CodeReviewRecord,
     CodeRunRecord,
     CodeTurnRecord,
+    CodeVerificationRecord,
     DesktopActionRecord,
     DesktopApprovalRecord,
     DesktopRunRecord,
+    EventOutboxRecord,
     EventRecord,
     SessionRecord,
     SkillRecord,
     TaskRecord,
     ToolCallRecord,
+    WorkspaceMutationLeaseRecord,
     WorkspaceRecord,
 )
 
@@ -317,11 +321,11 @@ class Repository:
 
     async def acquire_code_run_lease(
         self, code_run_id: str, owner: str, ttl_seconds: int
-    ) -> bool:
+    ) -> Optional[int]:
         now = now_utc()
         expires = now + timedelta(seconds=ttl_seconds)
         async with self._session_factory() as db:
-            result = await db.execute(
+            token = await db.scalar(
                 update(CodeRunRecord)
                 .where(
                     CodeRunRecord.code_run_id == code_run_id,
@@ -335,14 +339,16 @@ class Repository:
                 .values(
                     lease_owner=owner,
                     lease_expires_at=expires,
+                    lease_token=CodeRunRecord.lease_token + 1,
                     state_version=CodeRunRecord.state_version + 1,
                 )
+                .returning(CodeRunRecord.lease_token)
             )
             await db.commit()
-            return bool(cast(Any, result).rowcount)
+            return int(token) if token is not None else None
 
     async def renew_code_run_lease(
-        self, code_run_id: str, owner: str, ttl_seconds: int
+        self, code_run_id: str, owner: str, token: int, ttl_seconds: int
     ) -> bool:
         async with self._session_factory() as db:
             result = await db.execute(
@@ -350,6 +356,7 @@ class Repository:
                 .where(
                     CodeRunRecord.code_run_id == code_run_id,
                     CodeRunRecord.lease_owner == owner,
+                    CodeRunRecord.lease_token == token,
                 )
                 .values(
                     lease_expires_at=now_utc() + timedelta(seconds=ttl_seconds),
@@ -359,13 +366,16 @@ class Repository:
             await db.commit()
             return bool(cast(Any, result).rowcount)
 
-    async def release_code_run_lease(self, code_run_id: str, owner: str) -> None:
+    async def release_code_run_lease(
+        self, code_run_id: str, owner: str, token: int
+    ) -> None:
         async with self._session_factory() as db:
             await db.execute(
                 update(CodeRunRecord)
                 .where(
                     CodeRunRecord.code_run_id == code_run_id,
                     CodeRunRecord.lease_owner == owner,
+                    CodeRunRecord.lease_token == token,
                 )
                 .values(
                     lease_owner=None,
@@ -373,6 +383,90 @@ class Repository:
                     active_turn_id=None,
                     state_version=CodeRunRecord.state_version + 1,
                 )
+            )
+            await db.commit()
+
+    async def acquire_workspace_mutation_lease(
+        self, workspace_id: str, owner: str, ttl_seconds: int
+    ) -> Optional[int]:
+        now = now_utc()
+        expires = now + timedelta(seconds=ttl_seconds)
+        async with self._session_factory() as db:
+            token = (
+                await db.execute(
+                    text(
+                        "INSERT INTO ff_workspace_mutation_leases "
+                        "(workspace_id, owner, fencing_token, expires_at, updated_at) "
+                        "VALUES (:workspace_id, :owner, 1, :expires, :now) "
+                        "ON CONFLICT(workspace_id) DO UPDATE SET "
+                        "owner=:owner, fencing_token=fencing_token + 1, "
+                        "expires_at=:expires, updated_at=:now "
+                        "WHERE expires_at < :now OR owner=:owner "
+                        "RETURNING fencing_token"
+                    ),
+                    {
+                        "workspace_id": workspace_id,
+                        "owner": owner,
+                        "expires": expires,
+                        "now": now,
+                    },
+                )
+            ).scalar_one_or_none()
+            await db.commit()
+            return int(token) if token is not None else None
+
+    async def assert_workspace_mutation_fence(
+        self, workspace_id: str, owner: str, token: int
+    ) -> None:
+        async with self._session_factory() as db:
+            lease = await db.get(WorkspaceMutationLeaseRecord, workspace_id)
+            expires_at = lease.expires_at if lease is not None else None
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if (
+                lease is None
+                or lease.owner != owner
+                or lease.fencing_token != token
+                or expires_at is None
+                or expires_at < now_utc()
+            ):
+                raise ConflictError("workspace mutation lease is stale")
+
+    async def renew_workspace_mutation_lease(
+        self,
+        workspace_id: str,
+        owner: str,
+        token: int,
+        ttl_seconds: int,
+    ) -> bool:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(WorkspaceMutationLeaseRecord)
+                .where(
+                    WorkspaceMutationLeaseRecord.workspace_id == workspace_id,
+                    WorkspaceMutationLeaseRecord.owner == owner,
+                    WorkspaceMutationLeaseRecord.fencing_token == token,
+                )
+                .values(
+                    expires_at=now_utc() + timedelta(seconds=ttl_seconds),
+                    updated_at=now_utc(),
+                )
+            )
+            await db.commit()
+            return bool(cast(Any, result).rowcount)
+
+    async def release_workspace_mutation_lease(
+        self, workspace_id: str, owner: str, token: int
+    ) -> None:
+        async with self._session_factory() as db:
+            await db.execute(
+                update(WorkspaceMutationLeaseRecord)
+                .where(
+                    WorkspaceMutationLeaseRecord.workspace_id == workspace_id,
+                    WorkspaceMutationLeaseRecord.owner == owner,
+                    WorkspaceMutationLeaseRecord.fencing_token == token,
+                )
+                .values(owner="", expires_at=now_utc(), updated_at=now_utc())
             )
             await db.commit()
 
@@ -896,6 +990,7 @@ class Repository:
                 status=CodeApplyStatus.PREPARED.value,
                 paths=paths,
                 completed_paths=[],
+                backup_hashes={},
             )
             db.add(record)
             await db.commit()
@@ -908,6 +1003,7 @@ class Repository:
         *,
         status: Optional[CodeApplyStatus] = None,
         completed_paths: Optional[List[str]] = None,
+        backup_hashes: Optional[Dict[str, Any]] = None,
         error: Optional[Dict[str, Any]] = None,
     ) -> CodeApplyJournalRecord:
         async with self._session_factory() as db:
@@ -918,6 +1014,8 @@ class Repository:
                 record.status = status.value
             if completed_paths is not None:
                 record.completed_paths = completed_paths
+            if backup_hashes is not None:
+                record.backup_hashes = backup_hashes
             if error is not None:
                 record.error = error
             record.updated_at = now_utc()
@@ -939,6 +1037,83 @@ class Repository:
                     )
                 )
                 .order_by(CodeApplyJournalRecord.created_at)
+            )
+            return list(rows.all())
+
+    async def create_code_verification(
+        self,
+        *,
+        code_run_id: str,
+        turn_id: Optional[str],
+        review_revision: int,
+        profile_id: str,
+        command_digest: str,
+        source_manifest_digest: str,
+    ) -> CodeVerificationRecord:
+        async with self._session_factory() as db:
+            record = CodeVerificationRecord(
+                verification_id=new_id("verify"),
+                code_run_id=code_run_id,
+                turn_id=turn_id,
+                review_revision=review_revision,
+                profile_id=profile_id,
+                command_digest=command_digest,
+                source_manifest_digest=source_manifest_digest,
+                status=CodeVerificationStatus.QUEUED.value,
+            )
+            db.add(record)
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def update_code_verification(
+        self,
+        verification_id: str,
+        *,
+        status: CodeVerificationStatus,
+        exit_code: Optional[int] = None,
+        stdout_excerpt: Optional[str] = None,
+        stderr_excerpt: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> CodeVerificationRecord:
+        async with self._session_factory() as db:
+            record = await db.get(CodeVerificationRecord, verification_id)
+            if record is None:
+                raise NotFoundError(f"verification {verification_id} not found")
+            record.status = status.value
+            if status == CodeVerificationStatus.RUNNING:
+                record.started_at = now_utc()
+            if status in {
+                CodeVerificationStatus.PASSED,
+                CodeVerificationStatus.FAILED,
+                CodeVerificationStatus.TIMED_OUT,
+                CodeVerificationStatus.ERROR,
+                CodeVerificationStatus.CANCELLED,
+            }:
+                record.finished_at = now_utc()
+            if exit_code is not None:
+                record.exit_code = exit_code
+            if stdout_excerpt is not None:
+                record.stdout_excerpt = stdout_excerpt
+            if stderr_excerpt is not None:
+                record.stderr_excerpt = stderr_excerpt
+            if duration_ms is not None:
+                record.duration_ms = duration_ms
+            if error is not None:
+                record.error = error
+            await db.commit()
+            await db.refresh(record)
+            return record
+
+    async def list_code_verifications(
+        self, code_run_id: str
+    ) -> List[CodeVerificationRecord]:
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(CodeVerificationRecord)
+                .where(CodeVerificationRecord.code_run_id == code_run_id)
+                .order_by(CodeVerificationRecord.created_at)
             )
             return list(rows.all())
 
@@ -1472,9 +1647,58 @@ class Repository:
                 payload=event_payload,
             )
             db.add(event)
+            await db.flush()
+            db.add(
+                EventOutboxRecord(
+                    outbox_id=new_id("outbox"),
+                    event_id=event.event_id,
+                    session_id=session_id,
+                    sequence=sequence,
+                )
+            )
             await db.commit()
             await db.refresh(event)
             return event
+
+    async def list_pending_event_outbox(
+        self, limit: int = 100
+    ) -> List[Tuple[EventOutboxRecord, EventRecord]]:
+        async with self._session_factory() as db:
+            rows = await db.execute(
+                select(EventOutboxRecord, EventRecord)
+                .join(EventRecord, EventRecord.event_id == EventOutboxRecord.event_id)
+                .where(EventOutboxRecord.published_at.is_(None))
+                .order_by(EventOutboxRecord.created_at)
+                .limit(limit)
+            )
+            return cast(
+                List[Tuple[EventOutboxRecord, EventRecord]], rows.all()
+            )
+
+    async def mark_event_published(self, event_id: str) -> None:
+        async with self._session_factory() as db:
+            await db.execute(
+                update(EventOutboxRecord)
+                .where(EventOutboxRecord.event_id == event_id)
+                .values(
+                    published_at=now_utc(),
+                    attempts=EventOutboxRecord.attempts + 1,
+                    last_error=None,
+                )
+            )
+            await db.commit()
+
+    async def mark_event_publish_failed(self, event_id: str, error: str) -> None:
+        async with self._session_factory() as db:
+            await db.execute(
+                update(EventOutboxRecord)
+                .where(EventOutboxRecord.event_id == event_id)
+                .values(
+                    attempts=EventOutboxRecord.attempts + 1,
+                    last_error=error[:1000],
+                )
+            )
+            await db.commit()
 
     async def list_events(
         self, session_id: str, limit: int = 500, after_sequence: int = 0

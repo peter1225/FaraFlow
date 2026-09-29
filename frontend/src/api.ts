@@ -7,6 +7,8 @@ import type {
   ChatSummary,
   CodeDiff,
   CodeRun,
+  CodeVerification,
+  CodeVerificationProfile,
   DesktopApproval,
   DesktopRun,
   DesktopWindow,
@@ -184,6 +186,17 @@ export const api = {
     request<CodeRun>(`/v1/code-runs/${codeRunId}/resume`, {
       method: "POST",
       body: JSON.stringify({ instruction }),
+    }),
+  codeVerificationProfiles: (codeRunId: string) =>
+    request<CodeVerificationProfile[]>(
+      `/v1/code-runs/${codeRunId}/verification-profiles`,
+    ),
+  listCodeVerifications: (codeRunId: string) =>
+    request<CodeVerification[]>(`/v1/code-runs/${codeRunId}/verifications`),
+  runCodeVerification: (codeRunId: string, profileId: string) =>
+    request<CodeVerification>(`/v1/code-runs/${codeRunId}/verifications`, {
+      method: "POST",
+      body: JSON.stringify({ profile_id: profileId }),
     }),
   applyCodeRun: (codeRunId: string, reviewRevision: number) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/apply`, {

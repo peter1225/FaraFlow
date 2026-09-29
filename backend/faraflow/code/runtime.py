@@ -1,4 +1,5 @@
 import asyncio
+import json
 import subprocess
 import time
 import uuid
@@ -7,7 +8,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from faraflow.config import Settings
-from faraflow.domain.enums import CodeRunStatus, CodeToolPhase, CodeTurnStatus
+from faraflow.domain.enums import (
+    CodeRunStatus,
+    CodeToolPhase,
+    CodeTurnStatus,
+    CodeVerificationStatus,
+)
 from faraflow.domain.schemas import SessionEvent
 from faraflow.infra.async_utils import run_sync
 from faraflow.infra.events import EventBus
@@ -20,6 +26,7 @@ from .engine import CodeEngine, EngineRequest, NativeCodeEngine
 from .pico_bridge import PicoCodeEngine
 from .registry import ToolRegistry
 from .tools import CodeToolExecutor, CodeToolResult
+from .verification import VerificationRunner
 
 
 class CodeRuntime:
@@ -43,8 +50,10 @@ class CodeRuntime:
         self._capacity = asyncio.Semaphore(settings.code_max_concurrent_runs)
         self._restart_requested: Set[str] = set()
         self._cancel_preserve: Dict[str, bool] = {}
+        self._lease_tokens: Dict[str, int] = {}
         self._owner_id = f"code-runtime-{uuid.uuid4().hex}"
         self.tool_registry = ToolRegistry.default()
+        self.verification = VerificationRunner(settings, repository, workspaces)
         self.engine: CodeEngine = (
             PicoCodeEngine(settings)
             if settings.code_engine == "pico"
@@ -69,6 +78,9 @@ class CodeRuntime:
             created_at=record.created_at,
         )
         await self.event_bus.publish(event)
+        marker = getattr(self.repository, "mark_event_published", None)
+        if marker is not None:
+            await marker(record.event_id)
         return event
 
     async def start(self, code_run_id: str) -> None:
@@ -92,11 +104,12 @@ class CodeRuntime:
             if existing and not existing.done():
                 self._restart_requested.add(code_run_id)
                 return
-            acquired = await self.repository.acquire_code_run_lease(
+            token = await self.repository.acquire_code_run_lease(
                 code_run_id, self._owner_id, self.settings.code_lease_seconds
             )
-            if not acquired:
+            if token is None:
                 raise ConflictError("code run is leased by another runtime")
+            self._lease_tokens[code_run_id] = token
             job = asyncio.create_task(self._run(code_run_id), name=f"faraflow-code:{code_run_id}")
             self._jobs[code_run_id] = job
             job.add_done_callback(partial(self._forget_job, code_run_id))
@@ -191,6 +204,7 @@ class CodeRuntime:
             try:
                 record = await self._prepare_isolation(code_run_id, record, workspace)
                 isolated_root = Path(record.isolated_path or "")
+                assert isolated_root is not None
                 unknown = await self.reconcile_incomplete_tools(code_run_id, isolated_root)
                 if unknown:
                     raise ConflictError(
@@ -231,6 +245,73 @@ class CodeRuntime:
                             "ordinal": current_turn.ordinal,
                         },
                     )
+
+                    async def list_verification_profiles(
+                        _: Dict[str, Any]
+                    ) -> CodeToolResult:
+                        profiles = self.verification.profiles()
+                        content = json.dumps(
+                            [
+                                {"profile_id": profile_id, "argv": argv}
+                                for profile_id, argv in sorted(profiles.items())
+                            ],
+                            ensure_ascii=False,
+                        )
+                        return CodeToolResult(content or "[]")
+
+                    async def run_verification(
+                        arguments: Dict[str, Any],
+                        _turn: Any = current_turn,
+                        _root: Optional[Path] = isolated_root,
+                        _review_revision: int = int(record.review_revision or 0) + 1,
+                    ) -> CodeToolResult:
+                        profile_id = arguments.get("profile_id")
+                        if not isinstance(profile_id, str) or not profile_id.strip():
+                            return CodeToolResult(
+                                "error: profile_id is required", is_error=True
+                            )
+                        assert _root is not None
+                        verification = await self.verification.run(
+                            code_run_id=code_run_id,
+                            turn_id=_turn.turn_id,
+                            isolated_root=_root,
+                            review_revision=_review_revision,
+                            profile_id=profile_id.strip(),
+                        )
+                        await self.emit(
+                            record.session_id,
+                            "code.verification.completed",
+                            f"验证 {profile_id}：{verification.status}",
+                            {
+                                "code_run_id": code_run_id,
+                                "turn_id": _turn.turn_id,
+                                "verification_id": verification.verification_id,
+                                "profile_id": profile_id,
+                                "status": verification.status,
+                                "exit_code": verification.exit_code,
+                            },
+                        )
+                        content = json.dumps(
+                            {
+                                "verification_id": verification.verification_id,
+                                "status": verification.status,
+                                "exit_code": verification.exit_code,
+                                "stdout": verification.stdout_excerpt,
+                                "stderr": verification.stderr_excerpt,
+                            },
+                            ensure_ascii=False,
+                        )
+                        return CodeToolResult(
+                            content,
+                            is_error=(
+                                verification.status
+                                in {
+                                    CodeVerificationStatus.ERROR.value,
+                                    CodeVerificationStatus.CANCELLED.value,
+                                }
+                            ),
+                        )
+
                     executor = CodeToolExecutor(
                         code_run_id=code_run_id,
                         session_id=record.session_id,
@@ -241,6 +322,10 @@ class CodeRuntime:
                         workspace_service=self.workspaces,
                         run_store=self.run_store,
                         registry=self.tool_registry,
+                        external_tools={
+                            "list_verification_profiles": list_verification_profiles,
+                            "run_verification": run_verification,
+                        },
                     )
                     executor.changed_paths.update(
                         await run_sync(self._changed_paths, record, isolated_root)
@@ -299,7 +384,10 @@ class CodeRuntime:
                         }
                         await engine_event("code.tool.started", f"正在执行 {name}", details)
                         renewed = await self.repository.renew_code_run_lease(
-                            code_run_id, self._owner_id, self.settings.code_lease_seconds
+                            code_run_id,
+                            self._owner_id,
+                            self._lease_tokens[code_run_id],
+                            self.settings.code_lease_seconds,
                         )
                         if not renewed:
                             raise ConflictError("code run lease was lost")
@@ -428,7 +516,9 @@ class CodeRuntime:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
                 await self.repository.release_code_run_lease(
-                    code_run_id, self._owner_id
+                    code_run_id,
+                    self._owner_id,
+                    self._lease_tokens.pop(code_run_id, 0),
                 )
 
     async def _lease_heartbeat(self, code_run_id: str) -> None:
@@ -436,7 +526,10 @@ class CodeRuntime:
         while True:
             await asyncio.sleep(interval)
             renewed = await self.repository.renew_code_run_lease(
-                code_run_id, self._owner_id, self.settings.code_lease_seconds
+                code_run_id,
+                self._owner_id,
+                self._lease_tokens[code_run_id],
+                self.settings.code_lease_seconds,
             )
             if not renewed:
                 raise ConflictError("code run lease was lost")

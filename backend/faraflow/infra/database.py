@@ -188,6 +188,23 @@ class EventSequenceRecord(Base):
     next_sequence: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class EventOutboxRecord(Base):
+    __tablename__ = "ff_event_outbox"
+
+    outbox_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    event_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_events.event_id", ondelete="CASCADE"), unique=True
+    )
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    published_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CodeRunRecord(Base):
     __tablename__ = "ff_code_runs"
 
@@ -218,6 +235,7 @@ class CodeRunRecord(Base):
     lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True, index=True
     )
+    lease_token: Mapped[int] = mapped_column(Integer, default=0)
     next_turn_ordinal: Mapped[int] = mapped_column(Integer, default=2)
     active_turn_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
@@ -309,11 +327,51 @@ class CodeApplyJournalRecord(Base):
     status: Mapped[str] = mapped_column(String(30), index=True)
     paths: Mapped[List[str]] = mapped_column(JSON, default=list)
     completed_paths: Mapped[List[str]] = mapped_column(JSON, default=list)
+    backup_hashes: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class WorkspaceMutationLeaseRecord(Base):
+    __tablename__ = "ff_workspace_mutation_leases"
+
+    workspace_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_workspaces.workspace_id", ondelete="CASCADE"), primary_key=True
+    )
+    owner: Mapped[str] = mapped_column(String(100))
+    fencing_token: Mapped[int] = mapped_column(Integer, default=1)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+
+class CodeVerificationRecord(Base):
+    __tablename__ = "ff_code_verifications"
+
+    verification_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    code_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ff_code_runs.code_run_id", ondelete="CASCADE"), index=True
+    )
+    turn_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("ff_code_turns.turn_id", ondelete="SET NULL"), nullable=True
+    )
+    review_revision: Mapped[int] = mapped_column(Integer, index=True)
+    profile_id: Mapped[str] = mapped_column(String(100), index=True)
+    command_digest: Mapped[str] = mapped_column(String(64))
+    source_manifest_digest: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(30), index=True)
+    exit_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    stdout_excerpt: Mapped[str] = mapped_column(Text, default="")
+    stderr_excerpt: Mapped[str] = mapped_column(Text, default="")
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    error: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class DesktopRunRecord(Base):

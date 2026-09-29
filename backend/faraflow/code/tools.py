@@ -5,7 +5,7 @@ import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from faraflow.domain.enums import CodeToolPhase
 from faraflow.infra.async_utils import run_sync
@@ -46,6 +46,9 @@ class CodeToolExecutor:
         workspace_service: WorkspaceService,
         run_store: CodeRunStore,
         registry: Optional[ToolRegistry] = None,
+        external_tools: Optional[
+            Dict[str, Callable[[Dict[str, Any]], Awaitable[CodeToolResult]]]
+        ] = None,
     ) -> None:
         self.code_run_id = code_run_id
         self.session_id = session_id
@@ -56,6 +59,7 @@ class CodeToolExecutor:
         self.workspace_service = workspace_service
         self.run_store = run_store
         self.registry = registry or ToolRegistry.default()
+        self.external_tools = external_tools or {}
         self.policy = CodePolicy(self.root, workspace_service)
         self.changed_paths: Set[str] = set()
         self.previous_calls: Set[str] = set()
@@ -98,7 +102,10 @@ class CodeToolExecutor:
         else:
             self.previous_calls.add(key)
             try:
-                result = await run_sync(self._dispatch, name, arguments)
+                if name in self.external_tools:
+                    result = await self.external_tools[name](arguments)
+                else:
+                    result = await run_sync(self._dispatch, name, arguments)
                 # A fresh read or write is progress: allow a previously failed patch
                 # to be retried after reading, and allow rereading after an edit.
                 if not result.is_error and (name == "read_file" or result.after_hashes):

@@ -1,6 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Literal
+from typing import Dict, List, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     code_max_runtime_minutes: int = Field(default=20, ge=1)
     code_max_concurrent_runs: int = Field(default=1, ge=1)
     code_lease_seconds: int = Field(default=60, ge=15, le=3600)
+    code_verification_profiles: Dict[str, List[str]] = Field(default_factory=dict)
+    code_verification_timeout_seconds: int = Field(default=600, ge=1, le=3600)
+    code_verification_output_bytes: int = Field(default=1024 * 1024, ge=1024)
     code_engine: Literal["native", "pico"] = "native"
     # Pico has its own Python 3.12 environment; never import it into the API process.
     pico_python: str = ""

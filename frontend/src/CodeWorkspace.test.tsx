@@ -9,13 +9,16 @@ const apiMock = vi.hoisted(() => ({
   applyCodeRun: vi.fn(),
   codeRunDiff: vi.fn(),
   codeRunEvents: vi.fn(),
+  codeVerificationProfiles: vi.fn(),
   continueCodeRun: vi.fn(),
   createWorkspace: vi.fn(),
   discardCodeRun: vi.fn(),
   getCodeRun: vi.fn(),
   listCodeRuns: vi.fn(),
+  listCodeVerifications: vi.fn(),
   pauseCodeRun: vi.fn(),
   resumeCodeRun: vi.fn(),
+  runCodeVerification: vi.fn(),
   pickWorkspaceDirectory: vi.fn(),
   revertCodeRun: vi.fn(),
   workspaceFile: vi.fn(),
@@ -93,6 +96,8 @@ describe("local code workspace", () => {
       total_lines: 1,
     });
     apiMock.codeRunEvents.mockResolvedValue([]);
+    apiMock.codeVerificationProfiles.mockResolvedValue([]);
+    apiMock.listCodeVerifications.mockResolvedValue([]);
   });
 
   afterEach(cleanup);
@@ -197,6 +202,57 @@ describe("local code workspace", () => {
       await screen.findByRole("button", { name: "从持久化边界恢复" }),
     );
     await waitFor(() => expect(apiMock.resumeCodeRun).toHaveBeenCalledWith("code_test"));
+  });
+
+  it("runs an operator configured verification profile", async () => {
+    apiMock.listCodeRuns.mockResolvedValue([reviewRun]);
+    apiMock.getCodeRun.mockResolvedValue(reviewRun);
+    apiMock.codeRunDiff.mockResolvedValue({
+      code_run_id: reviewRun.code_run_id,
+      status: "REVIEW_REQUIRED",
+      review_revision: 1,
+      changed_paths: ["README.md"],
+      diff: "-old\n+new\n",
+    });
+    apiMock.codeVerificationProfiles.mockResolvedValue([
+      { profile_id: "tests", argv: ["python", "-m", "pytest"], timeout_seconds: 60 },
+    ]);
+    apiMock.runCodeVerification.mockResolvedValue({
+      verification_id: "verify_1",
+      code_run_id: "code_test",
+      review_revision: 1,
+      profile_id: "tests",
+      status: "PASSED",
+      stdout_excerpt: "1 passed",
+      stderr_excerpt: "",
+      source_manifest_digest: "digest",
+      stale: false,
+      created_at: "2026-08-08T00:00:02Z",
+    });
+    apiMock.listCodeVerifications
+      .mockResolvedValueOnce([])
+      .mockResolvedValue([
+        {
+          verification_id: "verify_1",
+          code_run_id: "code_test",
+          review_revision: 1,
+          profile_id: "tests",
+          status: "PASSED",
+          stdout_excerpt: "1 passed",
+          stderr_excerpt: "",
+          source_manifest_digest: "digest",
+          stale: false,
+          created_at: "2026-08-08T00:00:02Z",
+        },
+      ]);
+    render(
+      <CodeWorkspace workspace={workspace} onCreateChat={vi.fn()} onDelete={vi.fn()} />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "运行 tests" }));
+    await waitFor(() =>
+      expect(apiMock.runCodeVerification).toHaveBeenCalledWith("code_test", "tests"),
+    );
+    expect(await screen.findByText("1 passed")).toBeInTheDocument();
   });
 
   it("registers an absolute local folder from the modal", async () => {

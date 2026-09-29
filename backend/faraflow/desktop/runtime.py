@@ -55,6 +55,9 @@ class DesktopRuntime:
             created_at=record.created_at,
         )
         await self.event_bus.publish(event)
+        marker = getattr(self.repository, "mark_event_published", None)
+        if marker is not None:
+            await marker(record.event_id)
         return event
 
     async def list_windows(self) -> List[WindowInfo]:

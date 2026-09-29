@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from subprocess import run
@@ -413,6 +414,66 @@ def test_recovery_endpoint_starts_queued_turn(tmp_path: Path) -> None:
         assert resumed.status_code == 200, resumed.text
         result = wait_for_status(client, run["code_run_id"], "PAUSED")
         assert result["turns"][0]["summary"] == "resumed"
+
+
+def test_agent_can_run_operator_configured_verification(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "project"
+    workspace_root.mkdir()
+    (workspace_root / "README.md").write_text("# Demo\n", encoding="utf-8")
+    settings = local_settings(tmp_path, workspace_root)
+    settings.code_verification_profiles = {
+        "smoke": [sys.executable, "-c", "print('agent verified')"]
+    }
+    app = create_app(settings)
+    with TestClient(app) as client:
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            side_effect=[
+                CodeDecision(
+                    kind="tool",
+                    raw_response=(
+                        '<tool_call>{"name":"list_verification_profiles","args":{}}'
+                        "</tool_call>"
+                    ),
+                    tool_name="list_verification_profiles",
+                    arguments={},
+                ),
+                CodeDecision(
+                    kind="tool",
+                    raw_response=(
+                        '<tool_call>{"name":"run_verification",'
+                        '"args":{"profile_id":"smoke"}}</tool_call>'
+                    ),
+                    tool_name="run_verification",
+                    arguments={"profile_id": "smoke"},
+                ),
+                CodeDecision(
+                    kind="final",
+                    raw_response="<final>Verification passed.</final>",
+                    answer="Verification passed.",
+                ),
+            ]
+        )
+        workspace = client.post(
+            "/v1/workspaces",
+            json={"name": "Verify", "root_path": str(workspace_root)},
+        ).json()
+        run = client.post(
+            "/v1/code-runs",
+            json={
+                "workspace_id": workspace["workspace_id"],
+                "instruction": "Run the smoke verification",
+            },
+        ).json()
+        result = wait_for_status(client, run["code_run_id"], "PAUSED")
+        assert [call["tool_name"] for call in result["tool_calls"]] == [
+            "list_verification_profiles",
+            "run_verification",
+        ]
+        verifications = client.get(
+            f"/v1/code-runs/{run['code_run_id']}/verifications"
+        ).json()
+        assert verifications[0]["status"] == "PASSED"
+        assert "agent verified" in verifications[0]["stdout_excerpt"]
 
 
 @pytest.mark.asyncio

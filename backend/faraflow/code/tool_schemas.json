@@ -6,5 +6,7 @@
   {"name":"patch_file","description":"Replace exactly one matching text fragment. Requires a fresh read_file first.","parameters":{"type":"object","properties":{"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"],"additionalProperties":false}},
   {"name":"delete_file","description":"Delete an existing file from the isolated workspace. Requires a fresh read_file first.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}},
   {"name":"git_status","description":"Inspect Git status of the isolated workspace.","parameters":{"type":"object","properties":{},"additionalProperties":false}},
-  {"name":"git_diff","description":"Inspect the current staged-for-review changes.","parameters":{"type":"object","properties":{},"additionalProperties":false}}
+  {"name":"git_diff","description":"Inspect the current staged-for-review changes.","parameters":{"type":"object","properties":{},"additionalProperties":false}},
+  {"name":"list_verification_profiles","description":"List operator-configured test, lint, and build profiles available for this workspace.","parameters":{"type":"object","properties":{},"additionalProperties":false}},
+  {"name":"run_verification","description":"Run one operator-configured verification profile in a disposable copy of the isolated workspace. The profile command cannot be changed by the model.","parameters":{"type":"object","properties":{"profile_id":{"type":"string"}},"required":["profile_id"],"additionalProperties":false}}
 ]

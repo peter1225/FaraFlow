@@ -75,6 +75,8 @@ Available tools:
 - delete_file(path)
 - git_status()
 - git_diff()
+- list_verification_profiles()
+- run_verification(profile_id)
 
 Workspace context:
 {workspace_context}

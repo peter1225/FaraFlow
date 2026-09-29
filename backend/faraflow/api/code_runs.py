@@ -10,6 +10,9 @@ from faraflow.domain.schemas import (
     CodeRunResume,
     CodeRunView,
     CodeTurnCreate,
+    CodeVerificationCreate,
+    CodeVerificationProfileView,
+    CodeVerificationView,
     SessionEvent,
 )
 
@@ -79,6 +82,41 @@ async def resume_code_run(
     container = get_container(request)
     require_local_workspace_request(request, container.settings)
     return await container.code_runs.resume(code_run_id, payload)
+
+
+@router.get(
+    "/{code_run_id}/verification-profiles",
+    response_model=List[CodeVerificationProfileView],
+)
+async def list_verification_profiles(
+    code_run_id: str, request: Request
+) -> List[CodeVerificationProfileView]:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    await container.repository.get_code_run(code_run_id)
+    return container.code_runs.verification_profiles()
+
+
+@router.post(
+    "/{code_run_id}/verifications", response_model=CodeVerificationView
+)
+async def run_code_verification(
+    code_run_id: str, payload: CodeVerificationCreate, request: Request
+) -> CodeVerificationView:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.verify(code_run_id, payload.profile_id)
+
+
+@router.get(
+    "/{code_run_id}/verifications", response_model=List[CodeVerificationView]
+)
+async def list_code_verifications(
+    code_run_id: str, request: Request
+) -> List[CodeVerificationView]:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.verifications(code_run_id)
 
 
 @router.get("/{code_run_id}/events", response_model=List[SessionEvent])

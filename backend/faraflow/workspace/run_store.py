@@ -42,22 +42,33 @@ class CodeRunStore:
         else:
             marker.write_text('{"missing":true}', encoding="utf-8")
 
-    def preserve_apply_backup(self, code_run_id: str, relative: str, source: Path) -> None:
+    def preserve_apply_backup(
+        self, code_run_id: str, relative: str, source: Path
+    ) -> Optional[str]:
         target = self._safe_artifact_path(code_run_id, "apply-backup", relative)
         marker = target.with_name(target.name + ".missing.json")
         target.parent.mkdir(parents=True, exist_ok=True)
         if source.exists():
+            if marker.exists():
+                marker.unlink()
             shutil.copy2(source, target)
+            return file_hash(target)
         else:
+            if target.exists():
+                target.unlink()
             marker.write_text('{"missing":true}', encoding="utf-8")
+            return None
 
     def baseline_bytes(self, code_run_id: str, relative: str) -> Optional[bytes]:
         path = self._safe_artifact_path(code_run_id, "baseline", relative)
         return path.read_bytes() if path.exists() else None
 
     def backup_bytes(self, code_run_id: str, relative: str) -> Optional[bytes]:
-        path = self._safe_artifact_path(code_run_id, "apply-backup", relative)
+        path = self.backup_path(code_run_id, relative)
         return path.read_bytes() if path.exists() else None
+
+    def backup_path(self, code_run_id: str, relative: str) -> Path:
+        return self._safe_artifact_path(code_run_id, "apply-backup", relative)
 
     def preserve_review(
         self,

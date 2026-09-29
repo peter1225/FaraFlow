@@ -23,6 +23,7 @@ from faraflow.domain.schemas import SessionEvent
 from faraflow.infra.artifacts import ArtifactStore
 from faraflow.infra.database import Database
 from faraflow.infra.events import EventBus
+from faraflow.infra.outbox import EventOutboxDispatcher
 from faraflow.infra.repository import ConflictError, NotFoundError, Repository
 from faraflow.model.chat_adapter import ChatAdapter
 from faraflow.model.fara_adapter import FaraAdapter
@@ -49,6 +50,7 @@ class Container:
     repository: Repository
     artifacts: ArtifactStore
     event_bus: EventBus
+    event_outbox: EventOutboxDispatcher
     browser_pool: BrowserPool
     fara: FaraAdapter
     chat_model: ChatAdapter
@@ -69,6 +71,7 @@ def build_container(settings: Settings) -> Container:
     repository = Repository(database.session_factory)
     artifacts = ArtifactStore(settings.artifact_root)
     event_bus = EventBus()
+    event_outbox = EventOutboxDispatcher(repository, event_bus)
     browser_pool = BrowserPool(settings, artifacts)
     fara = FaraAdapter(settings)
     chat_model = ChatAdapter(settings)
@@ -117,6 +120,7 @@ def build_container(settings: Settings) -> Container:
         repository=repository,
         artifacts=artifacts,
         event_bus=event_bus,
+        event_outbox=event_outbox,
         browser_pool=browser_pool,
         fara=fara,
         chat_model=chat_model,
@@ -146,10 +150,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         await container.code_runs.recover_incomplete_applies()
         await container.repository.interrupt_running_desktop_runs()
         await container.tasks.seed_skills()
+        container.event_outbox.start()
         logger.info("FaraFlow API started")
         try:
             yield
         finally:
+            await container.event_outbox.close()
             await container.runtime.close()
             await container.code_runtime.close()
             await container.desktop_runtime.close()
@@ -340,7 +346,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             # either in the database page or in the queue and are deduplicated by cursor.
             await replay()
             while True:
-                event = await queue.get()
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    await replay()
+                    continue
                 if event.sequence <= cursor:
                     continue
                 if event.sequence > cursor + 1:
