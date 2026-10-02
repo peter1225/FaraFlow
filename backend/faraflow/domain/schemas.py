@@ -112,9 +112,16 @@ class CodeRunCreate(BaseModel):
     auto_start: bool = True
 
 
+class CodeAgentCreate(BaseModel):
+    instruction: str = Field(min_length=1, max_length=10_000)
+    mode: Literal["read_only", "isolated_write"] = "read_only"
+    auto_start: bool = True
+
+
 class CodeTurnCreate(BaseModel):
     instruction: str = Field(min_length=1, max_length=10_000)
     auto_start: bool = True
+    busy_policy: Literal["append", "inject", "interrupt"] = "append"
 
 
 class CodeRunApply(BaseModel):
@@ -133,6 +140,20 @@ class CodeRecoveryView(BaseModel):
     incomplete_tool_calls: List[str] = Field(default_factory=list)
     queued_turns: int = 0
     review_revision: int = 0
+    tools: List["CodeRecoveryToolView"] = Field(default_factory=list)
+
+
+class CodeRecoveryToolView(BaseModel):
+    tool_call_id: str
+    tool_name: str
+    phase: str
+    before_hashes: Dict[str, Optional[str]] = Field(default_factory=dict)
+    expected_after_hashes: Dict[str, Optional[str]] = Field(default_factory=dict)
+    current_hashes: Dict[str, Optional[str]] = Field(default_factory=dict)
+
+
+class CodeRecoveryDecision(BaseModel):
+    action: Literal["accept_current", "mark_retryable", "discard_run"]
 
 
 class CodeVerificationCreate(BaseModel):
@@ -196,6 +217,8 @@ class CodeRunView(BaseModel):
     code_run_id: str
     workspace_id: str
     chat_id: Optional[str] = None
+    parent_code_run_id: Optional[str] = None
+    agent_mode: Optional[Literal["read_only", "isolated_write"]] = None
     session_id: str
     instruction: str
     status: CodeRunStatus

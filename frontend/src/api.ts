@@ -6,6 +6,7 @@ import type {
   ChatStreamEvent,
   ChatSummary,
   CodeDiff,
+  CodeRecovery,
   CodeRun,
   CodeVerification,
   CodeVerificationProfile,
@@ -168,24 +169,43 @@ export const api = {
     request<SessionEvent[]>(
       `/v1/code-runs/${codeRunId}/events?after_sequence=${afterSequence}`,
     ),
-  continueCodeRun: (codeRunId: string, instruction: string) =>
+  continueCodeRun: (
+    codeRunId: string,
+    instruction: string,
+    busyPolicy: "append" | "inject" | "interrupt" = "append",
+  ) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/turns`, {
       method: "POST",
-      body: JSON.stringify({ instruction, auto_start: true }),
+      body: JSON.stringify({ instruction, auto_start: true, busy_policy: busyPolicy }),
     }),
   pauseCodeRun: (codeRunId: string) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/pause`, { method: "POST" }),
   codeRunRecovery: (codeRunId: string) =>
-    request<{
-      recoverable: boolean;
-      reason: string;
-      incomplete_tool_calls: string[];
-      queued_turns: number;
-    }>(`/v1/code-runs/${codeRunId}/recovery`),
+    request<CodeRecovery>(`/v1/code-runs/${codeRunId}/recovery`),
+  decideCodeRecovery: (
+    codeRunId: string,
+    toolCallId: string,
+    action: "accept_current" | "mark_retryable" | "discard_run",
+  ) =>
+    request<CodeRecovery>(
+      `/v1/code-runs/${codeRunId}/recovery/tools/${toolCallId}`,
+      { method: "POST", body: JSON.stringify({ action }) },
+    ),
   resumeCodeRun: (codeRunId: string, instruction?: string) =>
     request<CodeRun>(`/v1/code-runs/${codeRunId}/resume`, {
       method: "POST",
       body: JSON.stringify({ instruction }),
+    }),
+  listCodeAgents: (codeRunId: string) =>
+    request<CodeRun[]>(`/v1/code-runs/${codeRunId}/agents`),
+  createCodeAgent: (
+    codeRunId: string,
+    instruction: string,
+    mode: "read_only" | "isolated_write",
+  ) =>
+    request<CodeRun>(`/v1/code-runs/${codeRunId}/agents`, {
+      method: "POST",
+      body: JSON.stringify({ instruction, mode, auto_start: true }),
     }),
   codeVerificationProfiles: (codeRunId: string) =>
     request<CodeVerificationProfile[]>(

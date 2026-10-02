@@ -2334,6 +2334,65 @@ textarea:focus {
   gap: 8px;
 }
 
+.busy-policy {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.busy-policy select {
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface);
+}
+
+.agent-panel {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.agent-panel-heading,
+.agent-create-row,
+.agent-run {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-panel-heading {
+  justify-content: space-between;
+}
+
+.agent-panel textarea {
+  min-height: 58px;
+}
+
+.agent-create-row select {
+  flex: 1;
+  min-height: 34px;
+}
+
+.agent-run {
+  align-items: flex-start;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-run strong {
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.agent-run span {
+  flex: 1;
+}
+
 .code-continuation {
   display: grid;
   gap: 8px;
@@ -2380,6 +2439,33 @@ textarea:focus {
   max-height: 180px;
   overflow: auto;
   white-space: pre-wrap;
+}
+
+.recovery-panel {
+  border-top: 1px solid var(--border);
+  padding: 12px;
+}
+
+.recovery-panel > p {
+  color: var(--muted);
+}
+
+.recovery-tool {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid rgba(255, 170, 80, 0.35);
+  background: rgba(95, 54, 12, 0.14);
+}
+
+.recovery-tool small {
+  display: block;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.recovery-tool pre {
+  max-height: 220px;
+  overflow: auto;
 }
 
 .repo-badge,

@@ -272,6 +272,9 @@ npm run build
 - `POST|GET|DELETE /v1/workspaces`：注册、查看或取消注册本机工作区；
 - `GET /v1/workspaces/{id}/tree|files`：读取经过安全过滤的目录树和文本文件；
 - `POST|GET /v1/code-runs`：创建或查看隔离代码运行；
+- `POST|GET /v1/code-runs/{id}/agents`：创建或查看只读、独立写入协作 Agent；
+- `GET /v1/code-runs/{id}/recovery`：检查中断工具状态并执行人工恢复裁决；
+- `POST /v1/code-runs/maintenance/gc`：清理过期审核、Pico 状态和无引用内容 Blob；
 - `GET /v1/code-runs/{id}/diff`：查看统一 Diff；
 - `POST /v1/code-runs/{id}/apply|revert|discard`：应用、撤销或丢弃修改；
 - `POST|GET /v1/desktop-runs`：创建或查看本机桌面控制运行；

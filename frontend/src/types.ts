@@ -258,7 +258,7 @@ export interface CodeTurn {
   turn_id: string;
   ordinal: number;
   instruction: string;
-  status: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  status: "QUEUED" | "RUNNING" | "INJECTED" | "COMPLETED" | "FAILED" | "CANCELLED";
   summary?: string;
   error?: Record<string, unknown>;
   created_at: string;
@@ -270,6 +270,8 @@ export interface CodeRun {
   code_run_id: string;
   workspace_id: string;
   chat_id?: string;
+  parent_code_run_id?: string;
+  agent_mode?: "read_only" | "isolated_write";
   session_id: string;
   instruction: string;
   status: CodeRunStatus;
@@ -319,5 +321,25 @@ export interface CodeVerification {
   created_at: string;
   started_at?: string;
   finished_at?: string;
+}
+
+export interface CodeRecoveryTool {
+  tool_call_id: string;
+  tool_name: string;
+  phase: string;
+  before_hashes: Record<string, string | null>;
+  expected_after_hashes: Record<string, string | null>;
+  current_hashes: Record<string, string | null>;
+}
+
+export interface CodeRecovery {
+  code_run_id: string;
+  status: CodeRunStatus;
+  recoverable: boolean;
+  reason: string;
+  incomplete_tool_calls: string[];
+  queued_turns: number;
+  review_revision: number;
+  tools: CodeRecoveryTool[];
 }
 

@@ -227,14 +227,26 @@ async def main():
     wire = Wire()
     try:
         pico = load_pico()
-        wire.send(method="ready", params={"protocol": 1, "version": PICO_VERSION})
+        wire.send(
+            method="ready",
+            params={
+                "protocol": 1,
+                "version": PICO_VERSION,
+                "capabilities": ["persistent_turns"],
+            },
+        )
         if "--check" in sys.argv:
             return
-        frame = await wire.read()
-        if frame.get("id") != "run" or frame.get("method") != "run":
-            raise ValueError("Expected run request")
-        result = await run_turn(wire, frame["params"], pico)
-        wire.send(id="run", result=result)
+        while True:
+            frame = await wire.read()
+            method = frame.get("method")
+            if method == "shutdown":
+                wire.send(id=frame.get("id"), result={"status": "stopped"})
+                return
+            if method != "run" or not isinstance(frame.get("id"), str):
+                raise ValueError("Expected run or shutdown request")
+            result = await run_turn(wire, frame["params"], pico)
+            wire.send(id=frame["id"], result=result)
     except Exception:
         # Do not send provider exception strings, prompts or credentials over public events.
         wire.send(id="run", error={"code": -32000, "message": "Pico worker failed"})

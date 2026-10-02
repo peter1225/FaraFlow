@@ -215,6 +215,13 @@ class CodeRunRecord(Base):
     chat_id: Mapped[Optional[str]] = mapped_column(
         String(64), ForeignKey("ff_chat_threads.chat_id", ondelete="SET NULL"), nullable=True
     )
+    parent_code_run_id: Mapped[Optional[str]] = mapped_column(
+        String(64),
+        ForeignKey("ff_code_runs.code_run_id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    agent_mode: Mapped[Optional[str]] = mapped_column(String(30), nullable=True, index=True)
     session_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     instruction: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(40), index=True)

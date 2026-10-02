@@ -1,9 +1,11 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Query, Request, status
 
 from faraflow.domain.schemas import (
+    CodeAgentCreate,
     CodeDiffView,
+    CodeRecoveryDecision,
     CodeRecoveryView,
     CodeRunApply,
     CodeRunCreate,
@@ -19,6 +21,13 @@ from faraflow.domain.schemas import (
 from .dependencies import get_container, require_local_workspace_request
 
 router = APIRouter(prefix="/v1/code-runs", tags=["code"])
+
+
+@router.post("/maintenance/gc", response_model=Dict[str, Any])
+async def collect_code_artifacts(request: Request) -> Dict[str, Any]:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_gc.collect()
 
 
 @router.post("", response_model=CodeRunView, status_code=status.HTTP_201_CREATED)
@@ -43,6 +52,24 @@ async def get_code_run(code_run_id: str, request: Request) -> CodeRunView:
     container = get_container(request)
     require_local_workspace_request(request, container.settings)
     return await container.code_runs.get(code_run_id)
+
+
+@router.post(
+    "/{code_run_id}/agents", response_model=CodeRunView, status_code=status.HTTP_201_CREATED
+)
+async def create_code_agent(
+    code_run_id: str, payload: CodeAgentCreate, request: Request
+) -> CodeRunView:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.create_agent(code_run_id, payload)
+
+
+@router.get("/{code_run_id}/agents", response_model=List[CodeRunView])
+async def list_code_agents(code_run_id: str, request: Request) -> List[CodeRunView]:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.list_agents(code_run_id)
 
 
 @router.get("/{code_run_id}/diff", response_model=CodeDiffView)
@@ -75,6 +102,21 @@ async def get_code_recovery(code_run_id: str, request: Request) -> CodeRecoveryV
     return await container.code_runs.recovery(code_run_id)
 
 
+@router.post(
+    "/{code_run_id}/recovery/tools/{tool_call_id}",
+    response_model=CodeRecoveryView,
+)
+async def decide_code_recovery(
+    code_run_id: str,
+    tool_call_id: str,
+    payload: CodeRecoveryDecision,
+    request: Request,
+) -> CodeRecoveryView:
+    container = get_container(request)
+    require_local_workspace_request(request, container.settings)
+    return await container.code_runs.decide_recovery(code_run_id, tool_call_id, payload)
+
+
 @router.post("/{code_run_id}/resume", response_model=CodeRunView)
 async def resume_code_run(
     code_run_id: str, payload: CodeRunResume, request: Request
@@ -97,9 +139,7 @@ async def list_verification_profiles(
     return container.code_runs.verification_profiles()
 
 
-@router.post(
-    "/{code_run_id}/verifications", response_model=CodeVerificationView
-)
+@router.post("/{code_run_id}/verifications", response_model=CodeVerificationView)
 async def run_code_verification(
     code_run_id: str, payload: CodeVerificationCreate, request: Request
 ) -> CodeVerificationView:
@@ -108,12 +148,8 @@ async def run_code_verification(
     return await container.code_runs.verify(code_run_id, payload.profile_id)
 
 
-@router.get(
-    "/{code_run_id}/verifications", response_model=List[CodeVerificationView]
-)
-async def list_code_verifications(
-    code_run_id: str, request: Request
-) -> List[CodeVerificationView]:
+@router.get("/{code_run_id}/verifications", response_model=List[CodeVerificationView])
+async def list_code_verifications(code_run_id: str, request: Request) -> List[CodeVerificationView]:
     container = get_container(request)
     require_local_workspace_request(request, container.settings)
     return await container.code_runs.verifications(code_run_id)
@@ -128,9 +164,7 @@ async def list_code_events(
     container = get_container(request)
     require_local_workspace_request(request, container.settings)
     record = await container.repository.get_code_run(code_run_id)
-    rows = await container.repository.list_events(
-        record.session_id, after_sequence=after_sequence
-    )
+    rows = await container.repository.list_events(record.session_id, after_sequence=after_sequence)
     return [
         SessionEvent(
             event_id=item.event_id,
@@ -146,9 +180,7 @@ async def list_code_events(
 
 
 @router.post("/{code_run_id}/apply", response_model=CodeRunView)
-async def apply_code_run(
-    code_run_id: str, payload: CodeRunApply, request: Request
-) -> CodeRunView:
+async def apply_code_run(code_run_id: str, payload: CodeRunApply, request: Request) -> CodeRunView:
     container = get_container(request)
     require_local_workspace_request(request, container.settings)
     return await container.code_runs.apply(code_run_id, payload)

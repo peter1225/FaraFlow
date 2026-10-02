@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, eventWebSocketUrl } from "./api";
 import type {
   CodeDiff,
+  CodeRecovery,
   CodeRun,
   CodeVerification,
   CodeVerificationProfile,
@@ -48,8 +49,13 @@ export function CodeWorkspace({
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [verificationProfiles, setVerificationProfiles] = useState<CodeVerificationProfile[]>([]);
   const [verifications, setVerifications] = useState<CodeVerification[]>([]);
+  const [recovery, setRecovery] = useState<CodeRecovery>();
+  const [agentRuns, setAgentRuns] = useState<CodeRun[]>([]);
+  const [agentInstruction, setAgentInstruction] = useState("");
+  const [agentMode, setAgentMode] = useState<"read_only" | "isolated_write">("read_only");
   const [busy, setBusy] = useState(false);
   const [continuation, setContinuation] = useState("");
+  const [busyPolicy, setBusyPolicy] = useState<"append" | "inject" | "interrupt">("append");
   const [error, setError] = useState("");
   const eventCursor = useRef(0);
 
@@ -87,16 +93,19 @@ export function CodeWorkspace({
     if (!selectedRunId) {
       setDiff(undefined);
       setVerifications([]);
+      setRecovery(undefined);
       return;
     }
-    const [run, patch, verificationRows] = await Promise.all([
+    const [run, patch, verificationRows, recoveryState] = await Promise.all([
       api.getCodeRun(selectedRunId),
       api.codeRunDiff(selectedRunId),
       api.listCodeVerifications(selectedRunId),
+      api.codeRunRecovery(selectedRunId),
     ]);
     setRuns((current) => [run, ...current.filter((item) => item.code_run_id !== run.code_run_id)]);
     setDiff(patch);
     setVerifications(verificationRows);
+    setRecovery(recoveryState);
   }, [selectedRunId]);
 
   const refreshRun = useCallback(async () => {
@@ -120,6 +129,7 @@ export function CodeWorkspace({
     setEvents([]);
     setVerificationProfiles([]);
     setVerifications([]);
+    setRecovery(undefined);
   }, [selectedRunId]);
 
   useEffect(() => {
@@ -209,7 +219,7 @@ export function CodeWorkspace({
     setBusy(true);
     setError("");
     try {
-      await api.continueCodeRun(selectedRun.code_run_id, continuation.trim());
+      await api.continueCodeRun(selectedRun.code_run_id, continuation.trim(), busyPolicy);
       setContinuation("");
       await Promise.all([loadRuns(), refreshRun()]);
     } catch (reason) {
@@ -228,6 +238,57 @@ export function CodeWorkspace({
       await refreshState();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "验证执行失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createAgent() {
+    if (!selectedRun || !agentInstruction.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      await api.createCodeAgent(selectedRun.code_run_id, agentInstruction.trim(), agentMode);
+      setAgentInstruction("");
+      setAgentRuns(await api.listCodeAgents(selectedRun.code_run_id));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "创建协作 Agent 失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function loadAgents() {
+    if (!selectedRun) return;
+    try {
+      setAgentRuns(await api.listCodeAgents(selectedRun.code_run_id));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "加载协作 Agent 失败");
+    }
+  }
+
+  function openAgent(agent: CodeRun) {
+    setRuns((current) => [agent, ...current.filter((item) => item.code_run_id !== agent.code_run_id)]);
+    setSelectedRunId(agent.code_run_id);
+  }
+
+  async function decideRecovery(
+    toolCallId: string,
+    action: "accept_current" | "mark_retryable" | "discard_run",
+  ) {
+    if (!selectedRun) return;
+    setBusy(true);
+    setError("");
+    try {
+      const updated = await api.decideCodeRecovery(
+        selectedRun.code_run_id,
+        toolCallId,
+        action,
+      );
+      setRecovery(updated);
+      await refreshState();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "恢复裁决失败");
     } finally {
       setBusy(false);
     }
@@ -342,18 +403,76 @@ export function CodeWorkspace({
                 onChange={(event) => setContinuation(event.target.value)}
                 placeholder="继续修改当前任务，例如：把错误提示改成中文"
               />
+              {selectedRun.status === "RUNNING" && (
+                <label className="busy-policy">
+                  忙时处理
+                  <select
+                    aria-label="忙时处理策略"
+                    value={busyPolicy}
+                    onChange={(event) => setBusyPolicy(event.target.value as typeof busyPolicy)}
+                  >
+                    <option value="append">APPEND · 当前轮结束后执行</option>
+                    <option value="inject">INJECT · 下一工具边界注入</option>
+                    <option value="interrupt">INTERRUPT · 停止当前轮并执行</option>
+                  </select>
+                </label>
+              )}
               <button
                 className="button primary"
                 disabled={busy || !continuation.trim()}
                 onClick={() => void continueRun()}
               >
-                {selectedRun.status === "RUNNING" ? "排队追加要求" : "继续修改"}
+                {selectedRun.status === "RUNNING" ? "提交忙时指令" : "继续修改"}
               </button>
+            </div>
+          )}
+          {selectedRun && !selectedRun.parent_code_run_id && (
+            <div className="agent-panel">
+              <div className="agent-panel-heading">
+                <strong>协作 Agent</strong>
+                <button className="button secondary" disabled={busy} onClick={() => void loadAgents()}>
+                  刷新
+                </button>
+              </div>
+              <textarea
+                aria-label="Agent 任务"
+                value={agentInstruction}
+                onChange={(event) => setAgentInstruction(event.target.value)}
+                placeholder="例如：分析认证模块的并发风险"
+              />
+              <div className="agent-create-row">
+                <select
+                  aria-label="Agent 模式"
+                  value={agentMode}
+                  onChange={(event) => setAgentMode(event.target.value as typeof agentMode)}
+                >
+                  <option value="read_only">只读分析</option>
+                  <option value="isolated_write">独立隔离区写入</option>
+                </select>
+                <button
+                  className="button secondary"
+                  disabled={busy || !agentInstruction.trim()}
+                  onClick={() => void createAgent()}
+                >
+                  创建 Agent
+                </button>
+              </div>
+              {agentRuns.map((agent) => (
+                <div className="agent-run" key={agent.code_run_id}>
+                  <strong>{agent.agent_mode === "read_only" ? "只读" : "写入"}</strong>
+                  <span>{STATUS_TEXT[agent.status]} · {agent.final_summary ?? agent.instruction}</span>
+                  <button className="button secondary" onClick={() => openAgent(agent)}>
+                    查看
+                  </button>
+                </div>
+              ))}
             </div>
           )}
           {selectedRun && ["REVIEW_REQUIRED", "PAUSED", "FAILED"].includes(selectedRun.status) && Boolean(diff?.diff) && (
             <div className="review-actions">
-              <button className="button primary" disabled={busy} onClick={() => void runAction("apply")}>应用修改</button>
+              <button className="button primary" disabled={busy} onClick={() => void runAction("apply")}>
+                {selectedRun.parent_code_run_id ? "合并到主任务" : "应用修改"}
+              </button>
               <button className="button secondary" disabled={busy} onClick={() => void runAction("discard")}>丢弃修改</button>
             </div>
           )}
@@ -368,6 +487,26 @@ export function CodeWorkspace({
               <button className="button primary" disabled={busy} onClick={() => void runAction("resume")}>从持久化边界恢复</button>
               <button className="button secondary danger-text" disabled={busy} onClick={() => void runAction("discard")}>丢弃任务</button>
             </div>
+          )}
+          {recovery && recovery.tools.length > 0 && (
+            <section className="recovery-panel">
+              <div className="panel-title">
+                <span>恢复检查</span><small>{recovery.tools.length} UNKNOWN</small>
+              </div>
+              <p>{recovery.reason}</p>
+              {recovery.tools.map((tool) => (
+                <article className="recovery-tool" key={tool.tool_call_id}>
+                  <strong>{tool.tool_name}</strong>
+                  <small>{tool.phase} · {tool.tool_call_id}</small>
+                  <pre>{JSON.stringify({ before: tool.before_hashes, expected: tool.expected_after_hashes, current: tool.current_hashes }, null, 2)}</pre>
+                  <div className="review-actions">
+                    <button className="button primary" disabled={busy} onClick={() => void decideRecovery(tool.tool_call_id, "accept_current")}>接受当前状态</button>
+                    <button className="button secondary" disabled={busy} onClick={() => void decideRecovery(tool.tool_call_id, "mark_retryable")}>标记为可重试</button>
+                    <button className="button secondary danger-text" disabled={busy} onClick={() => void decideRecovery(tool.tool_call_id, "discard_run")}>丢弃任务</button>
+                  </div>
+                </article>
+              ))}
+            </section>
           )}
           {selectedRun?.status === "APPLIED" && (
             <div className="review-actions">

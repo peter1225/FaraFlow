@@ -1,9 +1,9 @@
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 
-from sqlalchemy import Select, case, desc, or_, select, text, update
+from sqlalchemy import Select, case, delete, desc, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from faraflow.domain.enums import (
@@ -144,9 +144,7 @@ class Repository:
             await db.refresh(message)
             return message
 
-    async def list_chat_messages(
-        self, chat_id: str, limit: int = 200
-    ) -> List[ChatMessageRecord]:
+    async def list_chat_messages(self, chat_id: str, limit: int = 200) -> List[ChatMessageRecord]:
         await self.get_chat(chat_id)
         async with self._session_factory() as db:
             rows = await db.scalars(
@@ -266,6 +264,8 @@ class Repository:
         chat_id: Optional[str] = None,
         engine: str = "native",
         model: str = "",
+        parent_code_run_id: Optional[str] = None,
+        agent_mode: Optional[str] = None,
     ) -> CodeRunRecord:
         async with self._session_factory() as db:
             workspace = await db.get(WorkspaceRecord, workspace_id)
@@ -277,6 +277,10 @@ class Repository:
                     raise NotFoundError(f"chat {chat_id} not found")
                 if chat.workspace_id != workspace_id:
                     raise ConflictError("chat is not bound to this workspace")
+            if parent_code_run_id is not None:
+                parent = await db.get(CodeRunRecord, parent_code_run_id)
+                if parent is None or parent.workspace_id != workspace_id:
+                    raise ConflictError("parent code run is unavailable")
             record = CodeRunRecord(
                 code_run_id=new_id("code"),
                 workspace_id=workspace_id,
@@ -286,6 +290,8 @@ class Repository:
                 status=CodeRunStatus.CREATED.value,
                 engine=engine,
                 model=model,
+                parent_code_run_id=parent_code_run_id,
+                agent_mode=agent_mode,
                 next_turn_ordinal=2,
             )
             db.add(record)
@@ -302,6 +308,16 @@ class Repository:
             await db.commit()
             await db.refresh(record)
             return record
+
+    async def list_code_agent_runs(self, parent_code_run_id: str) -> List[CodeRunRecord]:
+        await self.get_code_run(parent_code_run_id)
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(CodeRunRecord)
+                .where(CodeRunRecord.parent_code_run_id == parent_code_run_id)
+                .order_by(CodeRunRecord.created_at)
+            )
+            return list(rows.all())
 
     async def get_code_run(self, code_run_id: str) -> CodeRunRecord:
         async with self._session_factory() as db:
@@ -366,9 +382,7 @@ class Repository:
             await db.commit()
             return bool(cast(Any, result).rowcount)
 
-    async def release_code_run_lease(
-        self, code_run_id: str, owner: str, token: int
-    ) -> None:
+    async def release_code_run_lease(self, code_run_id: str, owner: str, token: int) -> None:
         async with self._session_factory() as db:
             await db.execute(
                 update(CodeRunRecord)
@@ -473,7 +487,12 @@ class Repository:
     async def list_code_runs(
         self, workspace_id: Optional[str] = None, limit: int = 100
     ) -> List[CodeRunRecord]:
-        statement = select(CodeRunRecord).order_by(desc(CodeRunRecord.created_at)).limit(limit)
+        statement = (
+            select(CodeRunRecord)
+            .where(CodeRunRecord.parent_code_run_id.is_(None))
+            .order_by(desc(CodeRunRecord.created_at))
+            .limit(limit)
+        )
         if workspace_id:
             statement = statement.where(CodeRunRecord.workspace_id == workspace_id)
         async with self._session_factory() as db:
@@ -500,7 +519,7 @@ class Repository:
                     )
                     .order_by(desc(CodeRunRecord.created_at))
                     .limit(1)
-                )
+                ),
             )
 
     async def create_code_turn(self, code_run_id: str, instruction: str) -> CodeTurnRecord:
@@ -576,7 +595,7 @@ class Repository:
                     )
                     .order_by(CodeTurnRecord.ordinal)
                     .limit(1)
-                )
+                ),
             )
 
     async def update_code_turn(
@@ -592,7 +611,7 @@ class Repository:
             if turn is None:
                 raise NotFoundError(f"code turn {turn_id} not found")
             turn.status = status.value
-            if status == CodeTurnStatus.RUNNING:
+            if status in {CodeTurnStatus.RUNNING, CodeTurnStatus.INJECTED}:
                 turn.started_at = now_utc()
                 turn.finished_at = None
             if status in {
@@ -609,16 +628,66 @@ class Repository:
             await db.refresh(turn)
             return turn
 
-    async def cancel_open_code_turns(self, code_run_id: str) -> int:
+    async def complete_code_turn_with_injections(
+        self, code_run_id: str, turn_id: str, summary: str
+    ) -> None:
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(CodeTurnRecord).where(
+                    CodeTurnRecord.code_run_id == code_run_id,
+                    or_(
+                        CodeTurnRecord.turn_id == turn_id,
+                        CodeTurnRecord.status == CodeTurnStatus.INJECTED.value,
+                    ),
+                )
+            )
+            for turn in rows:
+                turn.status = CodeTurnStatus.COMPLETED.value
+                turn.finished_at = now_utc()
+                turn.summary = summary if turn.turn_id == turn_id else "已随活动轮次完成注入要求"
+            await db.commit()
+
+    async def retry_code_injections(
+        self, code_run_id: str, pending_turn_ids: Optional[List[str]] = None
+    ) -> None:
+        async with self._session_factory() as db:
+            await db.execute(
+                update(CodeTurnRecord)
+                .where(
+                    CodeTurnRecord.code_run_id == code_run_id,
+                    or_(
+                        CodeTurnRecord.status == CodeTurnStatus.INJECTED.value,
+                        (
+                            CodeTurnRecord.turn_id.in_(pending_turn_ids or [])
+                            & CodeTurnRecord.status.in_(
+                                [CodeTurnStatus.QUEUED.value, CodeTurnStatus.CANCELLED.value]
+                            )
+                        ),
+                    ),
+                )
+                .values(
+                    status=CodeTurnStatus.QUEUED.value,
+                    started_at=None,
+                    finished_at=None,
+                    summary="注入轮次未完成，已恢复为排队要求",
+                    error=None,
+                )
+            )
+            await db.commit()
+
+    async def cancel_open_code_turns(
+        self, code_run_id: str, *, include_injected: bool = True
+    ) -> int:
+        statuses = [CodeTurnStatus.QUEUED.value, CodeTurnStatus.RUNNING.value]
+        if include_injected:
+            statuses.append(CodeTurnStatus.INJECTED.value)
         async with self._session_factory() as db:
             rows = list(
                 (
                     await db.scalars(
                         select(CodeTurnRecord).where(
                             CodeTurnRecord.code_run_id == code_run_id,
-                            CodeTurnRecord.status.in_(
-                                [CodeTurnStatus.QUEUED.value, CodeTurnStatus.RUNNING.value]
-                            ),
+                            CodeTurnRecord.status.in_(statuses),
                         )
                     )
                 ).all()
@@ -715,6 +784,18 @@ class Repository:
                 record.active_turn_id = None
                 record.state_version = int(record.state_version or 0) + 1
                 await db.execute(
+                    update(CodeTurnRecord)
+                    .where(
+                        CodeTurnRecord.code_run_id == record.code_run_id,
+                        CodeTurnRecord.status == CodeTurnStatus.INJECTED.value,
+                    )
+                    .values(
+                        status=CodeTurnStatus.QUEUED.value,
+                        started_at=None,
+                        finished_at=None,
+                    )
+                )
+                await db.execute(
                     update(ToolCallRecord)
                     .where(
                         ToolCallRecord.code_run_id == record.code_run_id,
@@ -787,6 +868,47 @@ class Repository:
                     f"review revision {revision} for code run {code_run_id} not found"
                 )
             return review
+
+    async def list_expired_terminal_code_runs(
+        self, finished_before: datetime
+    ) -> List[CodeRunRecord]:
+        terminal = [
+            CodeRunStatus.APPLIED.value,
+            CodeRunStatus.REVERTED.value,
+            CodeRunStatus.DISCARDED.value,
+        ]
+        async with self._session_factory() as db:
+            rows = await db.scalars(
+                select(CodeRunRecord).where(
+                    CodeRunRecord.status.in_(terminal),
+                    CodeRunRecord.finished_at.is_not(None),
+                    CodeRunRecord.finished_at < finished_before,
+                )
+            )
+            return list(rows.all())
+
+    async def expire_code_run_artifacts(self, code_run_id: str) -> None:
+        async with self._session_factory() as db:
+            await db.execute(
+                delete(CodeReviewRecord).where(CodeReviewRecord.code_run_id == code_run_id)
+            )
+            run = await db.get(CodeRunRecord, code_run_id)
+            if run is not None:
+                run.review_manifest = {}
+                run.diff_ref = None
+            await db.commit()
+
+    async def list_referenced_review_hashes(self) -> List[str]:
+        async with self._session_factory() as db:
+            manifests = await db.scalars(select(CodeReviewRecord.manifest))
+            result: Set[str] = set()
+            for manifest in manifests:
+                result.update(
+                    digest
+                    for digest in dict(manifest or {}).values()
+                    if isinstance(digest, str) and len(digest) == 64
+                )
+            return sorted(result)
 
     async def begin_tool_call(
         self,
@@ -884,6 +1006,13 @@ class Repository:
                 .order_by(ToolCallRecord.step_no)
             )
             return list(rows.all())
+
+    async def get_tool_call(self, tool_call_id: str) -> ToolCallRecord:
+        async with self._session_factory() as db:
+            record = await db.get(ToolCallRecord, tool_call_id)
+            if record is None:
+                raise NotFoundError(f"tool call {tool_call_id} not found")
+            return record
 
     async def resolve_incomplete_tool_call(
         self,
@@ -1106,9 +1235,7 @@ class Repository:
             await db.refresh(record)
             return record
 
-    async def list_code_verifications(
-        self, code_run_id: str
-    ) -> List[CodeVerificationRecord]:
+    async def list_code_verifications(self, code_run_id: str) -> List[CodeVerificationRecord]:
         async with self._session_factory() as db:
             rows = await db.scalars(
                 select(CodeVerificationRecord)
@@ -1162,9 +1289,7 @@ class Repository:
         self, chat_id: Optional[str] = None, limit: int = 100
     ) -> List[DesktopRunRecord]:
         statement = (
-            select(DesktopRunRecord)
-            .order_by(desc(DesktopRunRecord.created_at))
-            .limit(limit)
+            select(DesktopRunRecord).order_by(desc(DesktopRunRecord.created_at)).limit(limit)
         )
         if chat_id:
             statement = statement.where(DesktopRunRecord.chat_id == chat_id)
@@ -1671,9 +1796,7 @@ class Repository:
                 .order_by(EventOutboxRecord.created_at)
                 .limit(limit)
             )
-            return cast(
-                List[Tuple[EventOutboxRecord, EventRecord]], rows.all()
-            )
+            return cast(List[Tuple[EventOutboxRecord, EventRecord]], rows.all())
 
     async def mark_event_published(self, event_id: str) -> None:
         async with self._session_factory() as db:

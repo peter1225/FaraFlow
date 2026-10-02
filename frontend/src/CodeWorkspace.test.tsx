@@ -9,9 +9,11 @@ const apiMock = vi.hoisted(() => ({
   applyCodeRun: vi.fn(),
   codeRunDiff: vi.fn(),
   codeRunEvents: vi.fn(),
+  codeRunRecovery: vi.fn(),
   codeVerificationProfiles: vi.fn(),
   continueCodeRun: vi.fn(),
   createWorkspace: vi.fn(),
+  decideCodeRecovery: vi.fn(),
   discardCodeRun: vi.fn(),
   getCodeRun: vi.fn(),
   listCodeRuns: vi.fn(),
@@ -98,6 +100,16 @@ describe("local code workspace", () => {
     apiMock.codeRunEvents.mockResolvedValue([]);
     apiMock.codeVerificationProfiles.mockResolvedValue([]);
     apiMock.listCodeVerifications.mockResolvedValue([]);
+    apiMock.codeRunRecovery.mockResolvedValue({
+      code_run_id: "code_test",
+      status: "REVIEW_REQUIRED",
+      recoverable: false,
+      reason: "no recovery needed",
+      incomplete_tool_calls: [],
+      queued_turns: 0,
+      review_revision: 1,
+      tools: [],
+    });
   });
 
   afterEach(cleanup);
@@ -179,7 +191,11 @@ describe("local code workspace", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "继续修改" }));
     await waitFor(() =>
-      expect(apiMock.continueCodeRun).toHaveBeenCalledWith("code_test", "把标题改成中文"),
+      expect(apiMock.continueCodeRun).toHaveBeenCalledWith(
+        "code_test",
+        "把标题改成中文",
+        "append",
+      ),
     );
   });
 
@@ -202,6 +218,60 @@ describe("local code workspace", () => {
       await screen.findByRole("button", { name: "从持久化边界恢复" }),
     );
     await waitFor(() => expect(apiMock.resumeCodeRun).toHaveBeenCalledWith("code_test"));
+  });
+
+  it("shows unknown tool hashes and records a recovery decision", async () => {
+    const interrupted = { ...reviewRun, status: "INTERRUPTED" as const };
+    apiMock.listCodeRuns.mockResolvedValue([interrupted]);
+    apiMock.getCodeRun.mockResolvedValue(interrupted);
+    apiMock.codeRunDiff.mockResolvedValue({
+      code_run_id: interrupted.code_run_id,
+      status: "INTERRUPTED",
+      review_revision: 1,
+      changed_paths: ["README.md"],
+      diff: "",
+    });
+    apiMock.codeRunRecovery.mockResolvedValue({
+      code_run_id: "code_test",
+      status: "INTERRUPTED",
+      recoverable: false,
+      reason: "incomplete tool calls require inspection",
+      incomplete_tool_calls: ["tool_unknown"],
+      queued_turns: 0,
+      review_revision: 1,
+      tools: [
+        {
+          tool_call_id: "tool_unknown",
+          tool_name: "patch_file",
+          phase: "UNKNOWN",
+          before_hashes: { "README.md": "before" },
+          expected_after_hashes: { "README.md": "expected" },
+          current_hashes: { "README.md": "current" },
+        },
+      ],
+    });
+    apiMock.decideCodeRecovery.mockResolvedValue({
+      code_run_id: "code_test",
+      status: "INTERRUPTED",
+      recoverable: true,
+      reason: "safe to resume",
+      incomplete_tool_calls: [],
+      queued_turns: 0,
+      review_revision: 1,
+      tools: [],
+    });
+    render(
+      <CodeWorkspace workspace={workspace} onCreateChat={vi.fn()} onDelete={vi.fn()} />,
+    );
+    expect(await screen.findByText("tool_unknown", { exact: false })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "接受当前状态" }));
+    await waitFor(() =>
+      expect(apiMock.decideCodeRecovery).toHaveBeenCalledWith(
+        "code_test",
+        "tool_unknown",
+        "accept_current",
+      ),
+    );
   });
 
   it("runs an operator configured verification profile", async () => {

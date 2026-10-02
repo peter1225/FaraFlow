@@ -101,6 +101,76 @@ def code_decisions(old_title: str, new_title: str) -> list[CodeDecision]:
     ]
 
 
+def test_linked_agents_use_read_only_and_independent_write_isolation(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "project"
+    workspace_root.mkdir()
+    readme = workspace_root / "README.md"
+    readme.write_text("# Original\n", encoding="utf-8")
+    app = create_app(local_settings(tmp_path, workspace_root))
+
+    with TestClient(app) as client:
+        workspace = client.post(
+            "/v1/workspaces",
+            json={"name": "Agents", "root_path": str(workspace_root)},
+        ).json()
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            return_value=CodeDecision(
+                kind="final", raw_response="<final>Ready.</final>", answer="Ready."
+            )
+        )
+        parent_id = client.post(
+            "/v1/code-runs",
+            json={"workspace_id": workspace["workspace_id"], "instruction": "Prepare"},
+        ).json()["code_run_id"]
+        wait_for_status(client, parent_id, "PAUSED")
+
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            side_effect=[
+                CodeDecision(
+                    kind="tool",
+                    raw_response='<tool_call>{"name":"patch_file","args":{}}</tool_call>',
+                    tool_name="patch_file",
+                    arguments={"path": "README.md", "old_text": "Original", "new_text": "Bad"},
+                ),
+                CodeDecision(
+                    kind="final",
+                    raw_response="<final>Read-only report.</final>",
+                    answer="Read-only report.",
+                ),
+            ]
+        )
+        read_only = client.post(
+            f"/v1/code-runs/{parent_id}/agents",
+            json={"instruction": "Review only", "mode": "read_only"},
+        ).json()
+        read_only = wait_for_status(client, read_only["code_run_id"], "PAUSED")
+        assert read_only["tool_calls"][0]["status"] == "error"
+
+        app.state.container.code_adapter.next_decision = AsyncMock(
+            side_effect=code_decisions("# Original", "# Agent")
+        )
+        writer = client.post(
+            f"/v1/code-runs/{parent_id}/agents",
+            json={"instruction": "Update title", "mode": "isolated_write"},
+        ).json()
+        writer = wait_for_status(client, writer["code_run_id"], "REVIEW_REQUIRED")
+        assert writer["parent_code_run_id"] == parent_id
+        assert readme.read_text(encoding="utf-8") == "# Original\n"
+
+        merged = client.post(
+            f"/v1/code-runs/{writer['code_run_id']}/apply",
+            json={"review_revision": writer["review_revision"]},
+        )
+        assert merged.status_code == 200, merged.text
+        assert readme.read_text(encoding="utf-8") == "# Original\n"
+        parent_readme = app.state.container.settings.code_work_root / parent_id / "README.md"
+        assert parent_readme.read_text(encoding="utf-8") == "# Agent\n"
+        parent_review = wait_for_status(client, parent_id, "REVIEW_REQUIRED")
+        assert parent_review["changed_paths"] == ["README.md"]
+        agents = client.get(f"/v1/code-runs/{parent_id}/agents").json()
+        assert {item["agent_mode"] for item in agents} == {"read_only", "isolated_write"}
+
+
 def test_workspace_code_run_review_apply_revert_and_conflict(tmp_path: Path) -> None:
     workspace_root = tmp_path / "project"
     workspace_root.mkdir()
@@ -170,13 +240,9 @@ def test_workspace_code_run_review_apply_revert_and_conflict(tmp_path: Path) -> 
         assert "-# Original" in patch
         assert "+# Updated" in patch
         event_rows = client.get(f"/v1/code-runs/{code_run_id}/events").json()
-        assert [item["sequence"] for item in event_rows] == list(
-            range(1, len(event_rows) + 1)
-        )
+        assert [item["sequence"] for item in event_rows] == list(range(1, len(event_rows) + 1))
         cursor = event_rows[-2]["sequence"]
-        after = client.get(
-            f"/v1/code-runs/{code_run_id}/events?after_sequence={cursor}"
-        ).json()
+        after = client.get(f"/v1/code-runs/{code_run_id}/events?after_sequence={cursor}").json()
         assert [item["sequence"] for item in after] == [event_rows[-1]["sequence"]]
         with client.websocket_connect(
             f"/v1/sessions/{review['session_id']}/events?after_sequence={cursor}"
@@ -185,9 +251,7 @@ def test_workspace_code_run_review_apply_revert_and_conflict(tmp_path: Path) -> 
         assert replayed["sequence"] == event_rows[-1]["sequence"]
         patch_artifact = client.get(f"/v1/artifacts/code-runs/{code_run_id}/diff.patch")
         assert patch_artifact.status_code == 200
-        private_baseline = client.get(
-            f"/v1/artifacts/code-runs/{code_run_id}/baseline/README.md"
-        )
+        private_baseline = client.get(f"/v1/artifacts/code-runs/{code_run_id}/baseline/README.md")
         assert private_baseline.status_code == 404
 
         applied = client.post(
@@ -284,16 +348,12 @@ def test_code_run_continues_in_same_isolation_and_versions_review(tmp_path: Path
             turn["turn_id"] for turn in second["turns"]
         }
 
-        stale = client.post(
-            f"/v1/code-runs/{run_id}/apply", json={"review_revision": 1}
-        )
+        stale = client.post(f"/v1/code-runs/{run_id}/apply", json={"review_revision": 1})
         assert stale.status_code == 409
 
         # Apply the immutable reviewed snapshot rather than the mutable isolation.
         (isolation / "README.md").write_text("# Tampered\n", encoding="utf-8")
-        applied = client.post(
-            f"/v1/code-runs/{run_id}/apply", json={"review_revision": 2}
-        )
+        applied = client.post(f"/v1/code-runs/{run_id}/apply", json={"review_revision": 2})
         assert applied.status_code == 200, applied.text
         assert readme.read_text("utf-8") == "# Second\n"
         assert first["session_id"] == second["session_id"]
@@ -330,10 +390,7 @@ def test_queued_code_turns_run_in_order(tmp_path: Path) -> None:
         )
         assert queued.status_code == 200, queued.text
         paused = wait_for_status(client, run_id, "PAUSED")
-        assert [
-            (turn["ordinal"], turn["status"], turn["summary"])
-            for turn in paused["turns"]
-        ] == [
+        assert [(turn["ordinal"], turn["status"], turn["summary"]) for turn in paused["turns"]] == [
             (1, "COMPLETED", "one"),
             (2, "COMPLETED", "two"),
         ]
@@ -402,15 +459,11 @@ def test_recovery_endpoint_starts_queued_turn(tmp_path: Path) -> None:
                 "auto_start": False,
             },
         ).json()
-        recovery = client.get(
-            f"/v1/code-runs/{run['code_run_id']}/recovery"
-        )
+        recovery = client.get(f"/v1/code-runs/{run['code_run_id']}/recovery")
         assert recovery.status_code == 200
         assert recovery.json()["recoverable"]
         assert recovery.json()["queued_turns"] == 1
-        resumed = client.post(
-            f"/v1/code-runs/{run['code_run_id']}/resume", json={}
-        )
+        resumed = client.post(f"/v1/code-runs/{run['code_run_id']}/resume", json={})
         assert resumed.status_code == 200, resumed.text
         result = wait_for_status(client, run["code_run_id"], "PAUSED")
         assert result["turns"][0]["summary"] == "resumed"
@@ -431,8 +484,7 @@ def test_agent_can_run_operator_configured_verification(tmp_path: Path) -> None:
                 CodeDecision(
                     kind="tool",
                     raw_response=(
-                        '<tool_call>{"name":"list_verification_profiles","args":{}}'
-                        "</tool_call>"
+                        '<tool_call>{"name":"list_verification_profiles","args":{}}</tool_call>'
                     ),
                     tool_name="list_verification_profiles",
                     arguments={},
@@ -469,9 +521,7 @@ def test_agent_can_run_operator_configured_verification(tmp_path: Path) -> None:
             "list_verification_profiles",
             "run_verification",
         ]
-        verifications = client.get(
-            f"/v1/code-runs/{run['code_run_id']}/verifications"
-        ).json()
+        verifications = client.get(f"/v1/code-runs/{run['code_run_id']}/verifications").json()
         assert verifications[0]["status"] == "PASSED"
         assert "agent verified" in verifications[0]["stdout_excerpt"]
 
@@ -571,9 +621,7 @@ async def test_code_tools_enforce_read_paths_and_exact_patches(tmp_path: Path) -
 
     escaped = await executor.execute(5, "read_file", {"path": "../outside.txt"})
     assert escaped.is_error
-    sensitive = await executor.execute(
-        6, "create_file", {"path": ".env", "content": "SECRET=1"}
-    )
+    sensitive = await executor.execute(6, "create_file", {"path": ".env", "content": "SECRET=1"})
     assert sensitive.is_error
 
     first_status = await executor.execute(7, "git_status", {})
@@ -592,7 +640,7 @@ async def test_code_adapter_corrects_invalid_protocol_twice(tmp_path: Path) -> N
         [
             "not a protocol response",
             '<tool_call>{"name":</tool_call>',
-            '<final>Protocol corrected.</final>',
+            "<final>Protocol corrected.</final>",
         ]
     )
     requests = []

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from faraflow.code.adapter import CodeAdapter
@@ -11,7 +12,7 @@ from faraflow.code.runtime import CodeRuntime
 from faraflow.code.service import CodeRunService
 from faraflow.config import Settings
 from faraflow.domain.enums import CodeApplyStatus, CodeRunStatus, CodeToolPhase
-from faraflow.domain.schemas import WorkspaceCreate
+from faraflow.domain.schemas import CodeTurnCreate, WorkspaceCreate
 from faraflow.infra.database import Database
 from faraflow.infra.events import EventBus
 from faraflow.infra.outbox import EventOutboxDispatcher
@@ -44,9 +45,7 @@ async def durable_services(tmp_path: Path, root: Path):
     store = CodeRunStore(settings.artifact_root)
     workspaces = WorkspaceService(settings, repository, store)
     adapter = CodeAdapter(settings)
-    runtime = CodeRuntime(
-        settings, repository, workspaces, store, adapter, EventBus()
-    )
+    runtime = CodeRuntime(settings, repository, workspaces, store, adapter, EventBus())
     service = CodeRunService(repository, workspaces, store, runtime)
     return database, repository, store, workspaces, adapter, runtime, service
 
@@ -55,23 +54,17 @@ async def durable_services(tmp_path: Path, root: Path):
 async def test_event_sequences_are_ordered_and_cursor_addressable(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    database, repository, _, _, adapter, runtime, _ = await durable_services(
-        tmp_path, root
-    )
+    database, repository, _, _, adapter, runtime, _ = await durable_services(tmp_path, root)
     try:
         for number in range(1, 8):
-            event = await repository.append_event(
-                "session", "test.event", f"event {number}"
-            )
+            event = await repository.append_event("session", "test.event", f"event {number}")
             assert event.sequence == number
             assert event.payload["sequence"] == number
         rows = await repository.list_events("session", after_sequence=4)
         assert [item.sequence for item in rows] == [5, 6, 7]
         event_bus = EventBus()
         queue = await event_bus.subscribe("session")
-        dispatcher = EventOutboxDispatcher(
-            repository, event_bus, poll_interval_seconds=0.01
-        )
+        dispatcher = EventOutboxDispatcher(repository, event_bus, poll_interval_seconds=0.01)
         dispatcher.start()
         try:
             delivered = await asyncio.wait_for(queue.get(), timeout=2)
@@ -94,9 +87,7 @@ async def test_event_sequences_are_ordered_and_cursor_addressable(tmp_path: Path
 async def test_code_run_lease_has_single_owner(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    database, repository, _, _, adapter, runtime, _ = await durable_services(
-        tmp_path, root
-    )
+    database, repository, _, _, adapter, runtime, _ = await durable_services(tmp_path, root)
     try:
         workspace = await repository.create_workspace(
             WorkspaceCreate(name="Lease", root_path=str(root)),
@@ -121,13 +112,59 @@ async def test_code_run_lease_has_single_owner(tmp_path: Path) -> None:
         await database.dispose()
 
 
+def test_content_addressed_reviews_deduplicate_and_enforce_quota(tmp_path: Path) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    source = root / "same.txt"
+    source.write_text("same content", encoding="utf-8")
+    store = CodeRunStore(tmp_path / "artifacts", quota_bytes=32)
+
+    first = store.preserve_review("code_one", 1, root, ["same.txt"])
+    second = store.preserve_review("code_two", 1, root, ["same.txt"])
+    assert first == second
+    assert len(list(store.blob_root.glob("*/*"))) == 1
+
+    source.write_text("x" * 40, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="quota"):
+        store.preserve_review("code_three", 1, root, ["same.txt"])
+
+
+@pytest.mark.asyncio
+async def test_busy_turn_policies_are_routed_to_runtime(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    database, repository, _, _, adapter, runtime, service = await durable_services(tmp_path, root)
+    try:
+        workspace = await repository.create_workspace(
+            WorkspaceCreate(name="Busy", root_path=str(root)),
+            root_path=str(root),
+            repository_kind="directory",
+            git_root=None,
+            branch=None,
+        )
+        run = await repository.create_code_run(
+            workspace_id=workspace.workspace_id,
+            instruction="initial",
+            model="test-coder",
+        )
+        await repository.update_code_run(run.code_run_id, status=CodeRunStatus.RUNNING)
+        runtime.inject = AsyncMock()  # type: ignore[method-assign]
+        await service.continue_run(
+            run.code_run_id,
+            CodeTurnCreate(instruction="inject now", auto_start=False, busy_policy="inject"),
+        )
+        runtime.inject.assert_awaited_once()  # type: ignore[attr-defined]
+    finally:
+        await runtime.close()
+        await adapter.close()
+        await database.dispose()
+
+
 @pytest.mark.asyncio
 async def test_concurrent_turns_receive_unique_ordinals(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    database, repository, _, _, adapter, runtime, _ = await durable_services(
-        tmp_path, root
-    )
+    database, repository, _, _, adapter, runtime, _ = await durable_services(tmp_path, root)
     try:
         workspace = await repository.create_workspace(
             WorkspaceCreate(name="Turns", root_path=str(root)),
@@ -142,10 +179,7 @@ async def test_concurrent_turns_receive_unique_ordinals(tmp_path: Path) -> None:
             model="test-coder",
         )
         turns = await asyncio.gather(
-            *(
-                repository.create_code_turn(run.code_run_id, f"turn {number}")
-                for number in range(5)
-            )
+            *(repository.create_code_turn(run.code_run_id, f"turn {number}") for number in range(5))
         )
         assert sorted(turn.ordinal for turn in turns) == [2, 3, 4, 5, 6]
     finally:
@@ -158,9 +192,7 @@ async def test_concurrent_turns_receive_unique_ordinals(tmp_path: Path) -> None:
 async def test_workspace_fencing_rejects_stale_owner(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()
-    database, repository, _, _, adapter, runtime, _ = await durable_services(
-        tmp_path, root
-    )
+    database, repository, _, _, adapter, runtime, _ = await durable_services(tmp_path, root)
     try:
         workspace = await repository.create_workspace(
             WorkspaceCreate(name="Fence", root_path=str(root)),
@@ -169,27 +201,19 @@ async def test_workspace_fencing_rejects_stale_owner(tmp_path: Path) -> None:
             git_root=None,
             branch=None,
         )
-        first = await repository.acquire_workspace_mutation_lease(
-            workspace.workspace_id, "one", 60
-        )
+        first = await repository.acquire_workspace_mutation_lease(workspace.workspace_id, "one", 60)
         assert first == 1
         assert (
-            await repository.acquire_workspace_mutation_lease(
-                workspace.workspace_id, "two", 60
-            )
+            await repository.acquire_workspace_mutation_lease(workspace.workspace_id, "two", 60)
             is None
         )
-        await repository.release_workspace_mutation_lease(
-            workspace.workspace_id, "one", first
-        )
+        await repository.release_workspace_mutation_lease(workspace.workspace_id, "one", first)
         second = await repository.acquire_workspace_mutation_lease(
             workspace.workspace_id, "two", 60
         )
         assert second == 2
         with pytest.raises(ConflictError, match="stale"):
-            await repository.assert_workspace_mutation_fence(
-                workspace.workspace_id, "one", first
-            )
+            await repository.assert_workspace_mutation_fence(workspace.workspace_id, "one", first)
     finally:
         await runtime.close()
         await adapter.close()
@@ -239,9 +263,7 @@ async def test_incomplete_write_is_reconciled_from_hashes(tmp_path: Path) -> Non
         )
         target.write_bytes(after_content.encode("utf-8"))
 
-        assert await runtime.reconcile_incomplete_tools(
-            run.code_run_id, isolated_root
-        ) == []
+        assert await runtime.reconcile_incomplete_tools(run.code_run_id, isolated_root) == []
         assert await repository.list_incomplete_tool_calls(run.code_run_id) == []
         calls = await repository.list_tool_calls(run.code_run_id)
         assert calls[0].tool_call_id == call.tool_call_id
@@ -260,9 +282,9 @@ async def test_incomplete_write_is_reconciled_from_hashes(tmp_path: Path) -> Non
             before_hashes={"README.md": "not-before"},
             expected_after_hashes={"README.md": "not-after"},
         )
-        assert await runtime.reconcile_incomplete_tools(
-            run.code_run_id, isolated_root
-        ) == [unknown_call.tool_call_id]
+        assert await runtime.reconcile_incomplete_tools(run.code_run_id, isolated_root) == [
+            unknown_call.tool_call_id
+        ]
         recovery = await service.recovery(run.code_run_id)
         assert not recovery.recoverable
         assert recovery.incomplete_tool_calls == [unknown_call.tool_call_id]
@@ -294,9 +316,7 @@ async def test_incomplete_apply_is_rolled_back_on_startup_recovery(tmp_path: Pat
             instruction="apply",
             model="test-coder",
         )
-        await repository.update_code_run(
-            run.code_run_id, status=CodeRunStatus.REVIEW_REQUIRED
-        )
+        await repository.update_code_run(run.code_run_id, status=CodeRunStatus.REVIEW_REQUIRED)
         store.preserve_apply_backup(run.code_run_id, "README.md", source)
         journal = await repository.create_apply_journal(
             code_run_id=run.code_run_id,
@@ -346,9 +366,7 @@ async def test_corrupt_apply_backup_is_reported_without_blocking_startup(
             instruction="apply",
             model="test-coder",
         )
-        await repository.update_code_run(
-            run.code_run_id, status=CodeRunStatus.REVIEW_REQUIRED
-        )
+        await repository.update_code_run(run.code_run_id, status=CodeRunStatus.REVIEW_REQUIRED)
         digest = store.preserve_apply_backup(run.code_run_id, "README.md", source)
         journal = await repository.create_apply_journal(
             code_run_id=run.code_run_id,
@@ -361,9 +379,7 @@ async def test_corrupt_apply_backup_is_reported_without_blocking_startup(
             status=CodeApplyStatus.APPLYING,
             backup_hashes={"README.md": digest},
         )
-        store.backup_path(run.code_run_id, "README.md").write_text(
-            "corrupt\n", encoding="utf-8"
-        )
+        store.backup_path(run.code_run_id, "README.md").write_text("corrupt\n", encoding="utf-8")
         source.write_text("partially applied\n", encoding="utf-8")
 
         assert await service.recover_incomplete_applies() == 0

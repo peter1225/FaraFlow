@@ -19,7 +19,7 @@ from faraflow.config import Settings
 from fastapi.testclient import TestClient
 from test_code_workspace import local_settings, wait_for_status
 
-PREAMBLE = '''
+PREAMBLE = """
 import json, sys, time
 def send(**frame):
     print(json.dumps(dict(jsonrpc="2.0", **frame)), flush=True)
@@ -29,8 +29,10 @@ send(method="ready", params={"protocol": 1, "version": "0.1.7"})
 if "--check" in sys.argv:
     sys.exit(0)
 request = read()["params"]
-'''
-FAKE_WORKER = PREAMBLE + '''
+"""
+FAKE_WORKER = (
+    PREAMBLE
+    + """
 calls = [
     ("read_file", {"path": "../outside.txt"}),
     ("read_file", {"path": ".env"}),
@@ -47,7 +49,8 @@ send(method="event", params={"kind": "usage", "total_tokens": 12})
 send(method="event", params={"kind": "text", "text": "Updated README"})
 send(id="run", result={"status": "completed", "summary": "Updated README"})
 time.sleep(60)
-'''
+"""
+)
 
 
 @pytest.fixture
@@ -70,18 +73,31 @@ def test_pico_review_apply_revert_and_conflict(tmp_path, worker):
     settings.pico_state_root = tmp_path / "private-pico"
     app = create_app(settings)
     with TestClient(app) as client:
-        workspace = client.post("/v1/workspaces", json={
-            "name": "Pico", "root_path": str(root),
-        }).json()
-        created = client.post("/v1/code-runs", json={
-            "workspace_id": workspace["workspace_id"], "instruction": "Update README",
-        })
+        workspace = client.post(
+            "/v1/workspaces",
+            json={
+                "name": "Pico",
+                "root_path": str(root),
+            },
+        ).json()
+        created = client.post(
+            "/v1/code-runs",
+            json={
+                "workspace_id": workspace["workspace_id"],
+                "instruction": "Update README",
+            },
+        )
         assert created.status_code == 201, created.text
         run_id = created.json()["code_run_id"]
         record = wait_for_status(client, run_id, "REVIEW_REQUIRED")
         assert readme.read_text("utf-8") == "# Original\n"
         assert [call["status"] for call in record["tool_calls"]] == [
-            "error", "error", "error", "ok", "ok", "ok",
+            "error",
+            "error",
+            "error",
+            "ok",
+            "ok",
+            "ok",
         ]
         assert "+# Updated" in client.get(f"/v1/code-runs/{run_id}/diff").json()["diff"]
         events = client.get(f"/v1/code-runs/{run_id}/events").json()
@@ -90,15 +106,21 @@ def test_pico_review_apply_revert_and_conflict(tmp_path, worker):
         assert "TOKEN=secret" not in json.dumps(events)
         assert (settings.pico_state_root / run_id).is_dir()
         readme.write_text("# User edit\n", encoding="utf-8")
-        assert client.post(
-            f"/v1/code-runs/{run_id}/apply",
-            json={"review_revision": record["review_revision"]},
-        ).status_code == 409
+        assert (
+            client.post(
+                f"/v1/code-runs/{run_id}/apply",
+                json={"review_revision": record["review_revision"]},
+            ).status_code
+            == 409
+        )
         readme.write_text("# Original\n", encoding="utf-8")
-        assert client.post(
-            f"/v1/code-runs/{run_id}/apply",
-            json={"review_revision": record["review_revision"]},
-        ).status_code == 200
+        assert (
+            client.post(
+                f"/v1/code-runs/{run_id}/apply",
+                json={"review_revision": record["review_revision"]},
+            ).status_code
+            == 200
+        )
         assert readme.read_text("utf-8") == "# Updated\n"
         assert client.post(f"/v1/code-runs/{run_id}/revert").status_code == 200
         assert readme.read_text("utf-8") == "# Original\n"
@@ -106,31 +128,40 @@ def test_pico_review_apply_revert_and_conflict(tmp_path, worker):
 
 def bridge_settings(tmp_path):
     return Settings(
-        _env_file=None, pico_python=sys.executable, pico_state_root=tmp_path / "state",
-        artifact_root=tmp_path / "artifacts", code_base_url="http://test/v1", code_model="test",
+        _env_file=None,
+        pico_python=sys.executable,
+        pico_state_root=tmp_path / "state",
+        artifact_root=tmp_path / "artifacts",
+        code_base_url="http://test/v1",
+        code_model="test",
     )
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("attack", [
-    'send(id="bad", method="tool.execute", params={"name":"exec", "arguments":{}})',
-    'print("not json", flush=True)',
-    'send(id="run", result={"status":"interrupted", "summary":"partial"})',
-    'sys.exit(1)',
-])
+@pytest.mark.parametrize(
+    "attack",
+    [
+        'send(id="bad", method="tool.execute", params={"name":"exec", "arguments":{}})',
+        'print("not json", flush=True)',
+        'send(id="run", result={"status":"interrupted", "summary":"partial"})',
+        "sys.exit(1)",
+    ],
+)
 async def test_protocol_failure_never_executes_tools(tmp_path, worker, attack):
     worker.write_text(PREAMBLE + attack, encoding="utf-8")
     execute = AsyncMock()
     with pytest.raises((RuntimeError, ValueError)):
         await PicoCodeEngine(bridge_settings(tmp_path)).run(
-            EngineRequest("run", "task", tmp_path / "isolated", ""), execute, AsyncMock(),
+            EngineRequest("run", "task", tmp_path / "isolated", ""),
+            execute,
+            AsyncMock(),
         )
     execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_cancel_reaps_worker(tmp_path, worker, monkeypatch):
-    worker.write_text(PREAMBLE + 'time.sleep(60)', encoding="utf-8")
+    worker.write_text(PREAMBLE + "time.sleep(60)", encoding="utf-8")
     processes = []
     create = asyncio.create_subprocess_exec
 
@@ -145,9 +176,13 @@ async def test_cancel_reaps_worker(tmp_path, worker, monkeypatch):
     async def emit(*args):
         ready.set()
 
-    task = asyncio.create_task(PicoCodeEngine(bridge_settings(tmp_path)).run(
-        EngineRequest("run", "task", tmp_path / "isolated", ""), AsyncMock(), emit,
-    ))
+    task = asyncio.create_task(
+        PicoCodeEngine(bridge_settings(tmp_path)).run(
+            EngineRequest("run", "task", tmp_path / "isolated", ""),
+            AsyncMock(),
+            emit,
+        )
+    )
     await asyncio.wait_for(ready.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -177,7 +212,9 @@ async def test_startup_timeout_reaps_worker(tmp_path, worker):
     settings.pico_startup_timeout_seconds = 0.1
     with pytest.raises(asyncio.TimeoutError):
         await PicoCodeEngine(settings).run(
-            EngineRequest("run", "task", tmp_path / "isolated", ""), AsyncMock(), AsyncMock(),
+            EngineRequest("run", "task", tmp_path / "isolated", ""),
+            AsyncMock(),
+            AsyncMock(),
         )
 
 
@@ -189,7 +226,8 @@ async def test_private_state_cannot_be_inside_public_or_code_roots(tmp_path, loc
     with pytest.raises(ValueError, match="STATE_ROOT"):
         await PicoCodeEngine(settings).run(
             EngineRequest("run", "task", tmp_path / "isolated", "", tmp_path / "source"),
-            AsyncMock(), AsyncMock(),
+            AsyncMock(),
+            AsyncMock(),
         )
 
 
@@ -203,13 +241,152 @@ async def test_worker_health_is_checked_and_cached(tmp_path, worker, monkeypatch
     create.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_persistent_worker_is_reused_across_turns(tmp_path, worker, monkeypatch):
+    worker.write_text(
+        PREAMBLE.replace(
+            'send(method="ready", params={"protocol": 1, "version": "0.1.7"})',
+            'send(method="ready", params={"protocol": 1, "version": "0.1.7", '
+            '"capabilities": ["persistent_turns"]})',
+        ).replace(
+            'request = read()["params"]',
+            'request = None\nfor _ in range(2):\n request = read()["params"]\n '
+            'send(id="run", result={"status":"completed", "summary":request["instruction"]})',
+        ),
+        encoding="utf-8",
+    )
+    created = 0
+    create = asyncio.create_subprocess_exec
+
+    async def count(*args, **kwargs):
+        nonlocal created
+        created += 1
+        return await create(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", count)
+    engine = PicoCodeEngine(bridge_settings(tmp_path))
+    try:
+        first = await engine.run(
+            EngineRequest("same", "one", tmp_path / "isolated", ""),
+            AsyncMock(),
+            AsyncMock(),
+        )
+        second = await engine.run(
+            EngineRequest("same", "two", tmp_path / "isolated", ""),
+            AsyncMock(),
+            AsyncMock(),
+        )
+        assert (first, second) == ("one", "two")
+        assert created == 1
+    finally:
+        await engine.close()
+
+
+PERSISTENT_WORKER = """
+import json,sys
+def send(**frame):
+    print(json.dumps(dict(jsonrpc="2.0", **frame)), flush=True)
+send(method="ready", params={"protocol":1,"version":"0.1.7",
+     "capabilities":["persistent_turns"]})
+if "--check" in sys.argv:
+    sys.exit(0)
+for line in sys.stdin:
+    frame = json.loads(line)
+    send(id=frame["id"], result={"status":"completed", "summary":"Ready"})
+"""
+
+
+@pytest.mark.asyncio
+async def test_idle_worker_is_reaped(tmp_path, worker):
+    worker.write_text(PERSISTENT_WORKER, encoding="utf-8")
+    settings = bridge_settings(tmp_path)
+    settings.pico_worker_idle_seconds = 0.05
+    engine = PicoCodeEngine(settings)
+    try:
+        await engine.run(
+            EngineRequest("idle", "task", tmp_path / "isolated", ""),
+            AsyncMock(),
+            AsyncMock(),
+        )
+        process = engine._workers["idle"].process
+        await asyncio.wait_for(process.wait(), timeout=5)
+        assert "idle" not in engine._workers
+    finally:
+        await engine.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_capacity_evicts_idle_process(tmp_path, worker):
+    worker.write_text(PERSISTENT_WORKER, encoding="utf-8")
+    settings = bridge_settings(tmp_path)
+    settings.pico_max_workers = 1
+    engine = PicoCodeEngine(settings)
+    try:
+        await engine.run(
+            EngineRequest("one", "task", tmp_path / "isolated", ""),
+            AsyncMock(),
+            AsyncMock(),
+        )
+        previous = engine._workers["one"].process
+        await engine.run(
+            EngineRequest("two", "task", tmp_path / "isolated", ""),
+            AsyncMock(),
+            AsyncMock(),
+        )
+        assert previous.returncode is not None
+        assert set(engine._workers) == {"two"}
+        current = engine._workers["two"].process
+        await engine.release("two")
+        assert current.returncode is not None
+        assert not engine._workers
+    finally:
+        await engine.close()
+
+
+def test_discard_releases_successful_persistent_worker(tmp_path, worker):
+    worker.write_text(PERSISTENT_WORKER, encoding="utf-8")
+    root = tmp_path / "project"
+    root.mkdir()
+    settings = local_settings(tmp_path, root)
+    settings.code_engine = "pico"
+    settings.pico_python = sys.executable
+    settings.pico_state_root = tmp_path / "private-pico"
+    app = create_app(settings)
+    with TestClient(app) as client:
+        workspace = client.post(
+            "/v1/workspaces",
+            json={
+                "name": "Pico",
+                "root_path": str(root),
+            },
+        ).json()
+        run_id = client.post(
+            "/v1/code-runs",
+            json={
+                "workspace_id": workspace["workspace_id"],
+                "instruction": "Prepare",
+            },
+        ).json()["code_run_id"]
+        wait_for_status(client, run_id, "PAUSED")
+        engine = app.state.container.code_runtime.engine
+        process = engine._workers[run_id].process
+        response = client.post(f"/v1/code-runs/{run_id}/discard")
+        assert response.status_code == 200, response.text
+        assert process.returncode is not None
+        assert run_id not in engine._workers
+
+
 def test_discard_waits_for_inflight_write_before_cleanup(tmp_path, worker, monkeypatch):
-    worker.write_text(PREAMBLE + '''
+    worker.write_text(
+        PREAMBLE
+        + """
 send(id="write", method="tool.execute", params={
     "name":"create_file", "arguments":{"path":"new.txt", "content":"staged"}})
 read()
 time.sleep(60)
-''', encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     started, release, cancelling = threading.Event(), threading.Event(), threading.Event()
     dispatch = CodeToolExecutor._dispatch
 
@@ -234,12 +411,20 @@ time.sleep(60)
             await original_cancel(run_id)
 
         app.state.container.code_runtime.cancel = cancel
-        workspace = client.post("/v1/workspaces", json={
-            "name": "Pico", "root_path": str(root),
-        }).json()
-        run_id = client.post("/v1/code-runs", json={
-            "workspace_id": workspace["workspace_id"], "instruction": "Create file",
-        }).json()["code_run_id"]
+        workspace = client.post(
+            "/v1/workspaces",
+            json={
+                "name": "Pico",
+                "root_path": str(root),
+            },
+        ).json()
+        run_id = client.post(
+            "/v1/code-runs",
+            json={
+                "workspace_id": workspace["workspace_id"],
+                "instruction": "Create file",
+            },
+        ).json()["code_run_id"]
         try:
             assert started.wait(5)
             with ThreadPoolExecutor(max_workers=1) as pool:
@@ -261,12 +446,16 @@ time.sleep(60)
 
 
 def test_pause_waits_for_write_and_keeps_reviewable_changes(tmp_path, worker, monkeypatch):
-    worker.write_text(PREAMBLE + '''
+    worker.write_text(
+        PREAMBLE
+        + """
 send(id="write", method="tool.execute", params={
     "name":"create_file", "arguments":{"path":"new.txt", "content":"staged"}})
 read()
 time.sleep(60)
-''', encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     started, release = threading.Event(), threading.Event()
     dispatch = CodeToolExecutor._dispatch
 
@@ -285,12 +474,20 @@ time.sleep(60)
     app = create_app(settings)
 
     with TestClient(app) as client:
-        workspace = client.post("/v1/workspaces", json={
-            "name": "Pico", "root_path": str(root),
-        }).json()
-        run_id = client.post("/v1/code-runs", json={
-            "workspace_id": workspace["workspace_id"], "instruction": "Create file",
-        }).json()["code_run_id"]
+        workspace = client.post(
+            "/v1/workspaces",
+            json={
+                "name": "Pico",
+                "root_path": str(root),
+            },
+        ).json()
+        run_id = client.post(
+            "/v1/code-runs",
+            json={
+                "workspace_id": workspace["workspace_id"],
+                "instruction": "Create file",
+            },
+        ).json()["code_run_id"]
         try:
             assert started.wait(5)
             with ThreadPoolExecutor(max_workers=1) as pool:

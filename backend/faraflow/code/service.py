@@ -1,7 +1,10 @@
 import asyncio
+import json
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from types import SimpleNamespace
+from typing import Any, AsyncIterator, Dict, List, Mapping, Optional
 
 from faraflow.domain.enums import (
     CodeApplyStatus,
@@ -10,7 +13,10 @@ from faraflow.domain.enums import (
     CodeVerificationStatus,
 )
 from faraflow.domain.schemas import (
+    CodeAgentCreate,
     CodeDiffView,
+    CodeRecoveryDecision,
+    CodeRecoveryToolView,
     CodeRecoveryView,
     CodeRunApply,
     CodeRunCreate,
@@ -77,16 +83,42 @@ class CodeRunService:
         records = await self.repository.list_code_runs(workspace_id)
         return [await self.get(record.code_run_id) for record in records]
 
-    async def continue_run(
-        self, code_run_id: str, request: CodeTurnCreate
-    ) -> CodeRunView:
+    async def create_agent(self, parent_code_run_id: str, request: CodeAgentCreate) -> CodeRunView:
+        parent = await self.repository.get_code_run(parent_code_run_id)
+        if not parent.isolated_path or not await run_sync(Path(parent.isolated_path).is_dir):
+            raise ConflictError("start the parent code run before creating agents")
+        record = await self.repository.create_code_run(
+            workspace_id=parent.workspace_id,
+            instruction=request.instruction,
+            engine=self.runtime.settings.code_engine,
+            model=self.runtime.settings.code_model,
+            parent_code_run_id=parent_code_run_id,
+            agent_mode=request.mode,
+        )
+        await self.runtime.emit(
+            record.session_id,
+            "code.agent.created",
+            "只读分析 Agent 已创建" if request.mode == "read_only" else "独立写入 Agent 已创建",
+            {
+                "code_run_id": record.code_run_id,
+                "parent_code_run_id": parent_code_run_id,
+                "agent_mode": request.mode,
+            },
+        )
+        if request.auto_start:
+            await self.runtime.start(record.code_run_id)
+        return await self.get(record.code_run_id)
+
+    async def list_agents(self, parent_code_run_id: str) -> List[CodeRunView]:
+        records = await self.repository.list_code_agent_runs(parent_code_run_id)
+        return [await self.get(record.code_run_id) for record in records]
+
+    async def continue_run(self, code_run_id: str, request: CodeTurnCreate) -> CodeRunView:
         lock = self._run_locks.setdefault(code_run_id, asyncio.Lock())
         async with lock:
             return await self._continue_locked(code_run_id, request)
 
-    async def _continue_locked(
-        self, code_run_id: str, request: CodeTurnCreate
-    ) -> CodeRunView:
+    async def _continue_locked(self, code_run_id: str, request: CodeTurnCreate) -> CodeRunView:
         record = await self.repository.get_code_run(code_run_id)
         if (
             record.engine != self.runtime.settings.code_engine
@@ -95,6 +127,11 @@ class CodeRunService:
             raise ConflictError(
                 "code run was created with a different engine/model; start a new task"
             )
+        was_running = CodeRunStatus(record.status) == CodeRunStatus.RUNNING
+        if was_running and request.busy_policy == "interrupt":
+            await self.runtime.pause(code_run_id)
+            record = await self.repository.get_code_run(code_run_id)
+            was_running = False
         turn = await self.repository.create_code_turn(code_run_id, request.instruction)
         await self.runtime.emit(
             record.session_id,
@@ -104,8 +141,12 @@ class CodeRunService:
                 "code_run_id": code_run_id,
                 "turn_id": turn.turn_id,
                 "ordinal": turn.ordinal,
+                "busy_policy": request.busy_policy,
             },
         )
+        if was_running and request.busy_policy == "inject":
+            if await self.runtime.inject(code_run_id, turn.turn_id, request.instruction):
+                return await self.get(code_run_id)
         if request.auto_start:
             await self.runtime.start(code_run_id)
         return await self.get(code_run_id)
@@ -154,9 +195,7 @@ class CodeRunService:
         async with run_lock:
             return await self._apply_current(code_run_id, request)
 
-    async def _apply_current(
-        self, code_run_id: str, request: CodeRunApply
-    ) -> CodeRunView:
+    async def _apply_current(self, code_run_id: str, request: CodeRunApply) -> CodeRunView:
         record = await self.repository.get_code_run(code_run_id)
         if CodeRunStatus(record.status) not in {
             CodeRunStatus.REVIEW_REQUIRED,
@@ -166,10 +205,50 @@ class CodeRunService:
             raise ConflictError("code run is not waiting for review")
         if record.review_revision != request.review_revision:
             raise ConflictError("review revision is stale; reload the latest diff")
-        review = await self.repository.get_code_review(
-            code_run_id, request.review_revision
-        )
+        review = await self.repository.get_code_review(code_run_id, request.review_revision)
+        if not review.changed_paths or not record.changed_paths:
+            raise ConflictError("code run has no current changes to apply")
+        async with self._mutation_target(record) as workspace:
+            return await self._apply_to_target(record, review, workspace)
+
+    @asynccontextmanager
+    async def _mutation_target(self, record: Any) -> AsyncIterator[Any]:
         workspace = await self.repository.get_workspace(record.workspace_id)
+        parent_id = record.parent_code_run_id
+        if not parent_id:
+            yield workspace
+            return
+        lock = self._run_locks.setdefault(parent_id, asyncio.Lock())
+        async with lock:
+            token = await self.repository.acquire_code_run_lease(
+                parent_id, self._mutation_owner, self.runtime.settings.code_lease_seconds
+            )
+            if token is None:
+                raise ConflictError("parent code run is currently in use")
+            try:
+                parent = await self.repository.get_code_run(parent_id)
+                if CodeRunStatus(parent.status) not in {
+                    CodeRunStatus.PAUSED,
+                    CodeRunStatus.REVIEW_REQUIRED,
+                    CodeRunStatus.FAILED,
+                    CodeRunStatus.INTERRUPTED,
+                }:
+                    raise ConflictError("parent code run is not paused for an agent mutation")
+                if await self.repository.next_queued_code_turn(parent_id) is not None:
+                    raise ConflictError("parent code run has queued work")
+                if not parent.isolated_path or not await run_sync(
+                    Path(parent.isolated_path).is_dir
+                ):
+                    raise ConflictError("parent code run isolation is unavailable")
+                yield SimpleNamespace(
+                    workspace_id=workspace.workspace_id,
+                    root_path=parent.isolated_path,
+                    git_root=parent.isolated_path,
+                )
+            finally:
+                await self.repository.release_code_run_lease(parent_id, self._mutation_owner, token)
+
+    async def _apply_to_target(self, record: Any, review: Any, workspace: Any) -> CodeRunView:
         lock = self._workspace_locks.setdefault(record.workspace_id, asyncio.Lock())
         async with lock:
             token = await self.repository.acquire_workspace_mutation_lease(
@@ -191,19 +270,20 @@ class CodeRunService:
     ) -> CodeRunView:
         code_run_id = record.code_run_id
         latest = await self.repository.get_code_run(code_run_id)
-        if (
-            latest.review_revision != review.revision
-            or CodeRunStatus(latest.status)
-            not in {
-                CodeRunStatus.REVIEW_REQUIRED,
-                CodeRunStatus.PAUSED,
-                CodeRunStatus.FAILED,
-            }
-        ):
+        if latest.review_revision != review.revision or CodeRunStatus(latest.status) not in {
+            CodeRunStatus.REVIEW_REQUIRED,
+            CodeRunStatus.PAUSED,
+            CodeRunStatus.FAILED,
+        }:
             raise ConflictError("review revision changed before apply")
         if await self.repository.next_queued_code_turn(code_run_id) is not None:
             raise ConflictError("code run has a queued turn; wait for the latest review")
         original_root = Path(workspace.root_path)
+        parent = (
+            await self.repository.get_code_run(record.parent_code_run_id)
+            if record.parent_code_run_id
+            else None
+        )
 
         targets: Dict[str, Path] = {}
         for relative in review.changed_paths:
@@ -215,6 +295,18 @@ class CodeRunService:
             if file_hash(source) != (review.manifest or {}).get(relative):
                 raise ConflictError(f"review snapshot changed after review: {relative}")
             targets[relative] = target
+
+        if parent is not None:
+            # A child's first write must preserve the parent's original bytes,
+            # including paths never touched by the parent's own file tools.
+            for relative, target in targets.items():
+                await run_sync(
+                    self.run_store.ensure_baseline,
+                    parent.code_run_id,
+                    relative,
+                    target,
+                    (parent.baseline_manifest or {}).get(relative),
+                )
 
         applied: Dict[str, Dict[str, Any]] = {}
         completed: List[str] = []
@@ -261,9 +353,7 @@ class CodeRunService:
                         journal.journal_id,
                     )
                 elif target.exists():
-                    await run_sync(
-                        DurableFileWriter.delete, target, journal.journal_id
-                    )
+                    await run_sync(DurableFileWriter.delete, target, journal.journal_id)
                 applied[relative] = {
                     "before_hash": before_hash,
                     "after_hash": file_hash(target),
@@ -286,9 +376,7 @@ class CodeRunService:
                 operation_id=journal.journal_id,
                 expected_hashes=backup_hashes,
             )
-            self._remove_apply_temps(
-                original_root, journal.journal_id, list(targets)
-            )
+            self._remove_apply_temps(original_root, journal.journal_id, list(targets))
             await self.repository.update_apply_journal(
                 journal.journal_id, status=CodeApplyStatus.ROLLED_BACK
             )
@@ -306,9 +394,22 @@ class CodeRunService:
         await self.runtime.emit(
             record.session_id,
             "code.run.applied",
-            "代码修改已应用到原工作区",
-            {"code_run_id": code_run_id, "changed_paths": record.changed_paths},
+            "Agent 修改已合并到主任务隔离区"
+            if record.parent_code_run_id
+            else "代码修改已应用到原工作区",
+            {
+                "code_run_id": code_run_id,
+                "changed_paths": record.changed_paths,
+                "parent_code_run_id": record.parent_code_run_id,
+            },
         )
+        if record.parent_code_run_id:
+            parent = await self.repository.get_code_run(record.parent_code_run_id)
+            await self.runtime.refresh_review(
+                parent,
+                original_root,
+                f"已合并写入 Agent {record.code_run_id} 的修改",
+            )
         await self._cleanup(record, workspace)
         return await self.get(code_run_id)
 
@@ -317,9 +418,20 @@ class CodeRunService:
         recovered = 0
         for journal in journals:
             run = await self.repository.get_code_run(journal.code_run_id)
-            workspace = await self.repository.get_workspace(
+            workspace: Any = await self.repository.get_workspace(
                 journal.workspace_id, active_only=False
             )
+            if run.parent_code_run_id:
+                parent = await self.repository.get_code_run(run.parent_code_run_id)
+                if not parent.isolated_path or not await run_sync(
+                    Path(parent.isolated_path).is_dir
+                ):
+                    continue
+                workspace = SimpleNamespace(
+                    workspace_id=workspace.workspace_id,
+                    root_path=parent.isolated_path,
+                    git_root=parent.isolated_path,
+                )
             lock = self._workspace_locks.setdefault(journal.workspace_id, asyncio.Lock())
             async with lock:
                 token = await self.repository.acquire_workspace_mutation_lease(
@@ -422,9 +534,7 @@ class CodeRunService:
             if turn.status == "QUEUED"
         ]
         unknown = [
-            item.tool_call_id
-            for item in incomplete
-            if item.phase == CodeToolPhase.UNKNOWN.value
+            item.tool_call_id for item in incomplete if item.phase == CodeToolPhase.UNKNOWN.value
         ]
         recoverable = not unknown and CodeRunStatus(run.status) in {
             CodeRunStatus.INTERRUPTED,
@@ -447,20 +557,91 @@ class CodeRunService:
             incomplete_tool_calls=[item.tool_call_id for item in incomplete],
             queued_turns=len(queued),
             review_revision=run.review_revision,
+            tools=[
+                CodeRecoveryToolView(
+                    tool_call_id=item.tool_call_id,
+                    tool_name=item.tool_name,
+                    phase=item.phase,
+                    before_hashes=dict(item.before_hashes or {}),
+                    expected_after_hashes=dict(item.expected_after_hashes or {}),
+                    current_hashes=self._current_tool_hashes(run, item),
+                )
+                for item in incomplete
+            ],
         )
 
-    async def resume(
-        self, code_run_id: str, request: CodeRunResume
-    ) -> CodeRunView:
+    def _current_tool_hashes(self, run: Any, tool_call: Any) -> Dict[str, Optional[str]]:
+        if not run.isolated_path:
+            return {}
+        root = Path(run.isolated_path)
+        current: Dict[str, Optional[str]] = {}
+        for relative in set(tool_call.before_hashes or {}) | set(
+            tool_call.expected_after_hashes or {}
+        ):
+            try:
+                path = self.workspaces.safe_path(root, relative, allow_missing=True)
+                current[relative] = file_hash(path)
+            except (OSError, PermissionError, ValueError):
+                current[relative] = None
+        return current
+
+    async def decide_recovery(
+        self,
+        code_run_id: str,
+        tool_call_id: str,
+        request: CodeRecoveryDecision,
+    ) -> CodeRecoveryView:
+        tool_call = await self.repository.get_tool_call(tool_call_id)
+        if tool_call.code_run_id != code_run_id:
+            raise ConflictError("tool call does not belong to this code run")
+        if request.action == "discard_run":
+            await self.discard(code_run_id)
+            return await self.recovery(code_run_id)
+        run = await self.repository.get_code_run(code_run_id)
+        if tool_call.phase not in {
+            CodeToolPhase.RUNNING.value,
+            CodeToolPhase.UNKNOWN.value,
+        }:
+            raise ConflictError("tool call no longer requires recovery")
+        current = self._current_tool_hashes(run, tool_call)
+        if request.action == "mark_retryable":
+            before = dict(tool_call.before_hashes or {})
+            if not before or any(current.get(path) != digest for path, digest in before.items()):
+                raise ConflictError("current files do not match the pre-tool state")
+            phase = CodeToolPhase.FAILED
+            status = "operator_retryable"
+            message = "已确认文件仍处于工具执行前状态，可安全重试"
+        else:
+            phase = CodeToolPhase.SUCCEEDED
+            status = "operator_accepted"
+            message = "已接受当前文件状态作为工具执行结果"
+        await self.repository.resolve_incomplete_tool_call(
+            tool_call_id,
+            phase=phase,
+            status=status,
+            result_excerpt=message,
+            after_hashes=current,
+        )
+        await self.runtime.emit(
+            run.session_id,
+            "code.recovery.decided",
+            message,
+            {
+                "code_run_id": code_run_id,
+                "tool_call_id": tool_call_id,
+                "action": request.action,
+            },
+        )
+        return await self.recovery(code_run_id)
+
+    async def resume(self, code_run_id: str, request: CodeRunResume) -> CodeRunView:
         run = await self.repository.get_code_run(code_run_id)
         isolation_available = False
         if run.isolated_path:
             isolation_available = await run_sync(Path(run.isolated_path).is_dir)
         if isolation_available:
             assert run.isolated_path is not None
-            await self.runtime.reconcile_incomplete_tools(
-                code_run_id, Path(run.isolated_path)
-            )
+            await self.runtime.reconcile_incomplete_tools(code_run_id, Path(run.isolated_path))
         recovery = await self.recovery(code_run_id)
         if not recovery.recoverable:
             raise ConflictError(recovery.reason)
@@ -487,9 +668,7 @@ class CodeRunService:
             for profile_id, argv in sorted(self.runtime.verification.profiles().items())
         ]
 
-    async def verify(
-        self, code_run_id: str, profile_id: str
-    ) -> CodeVerificationView:
+    async def verify(self, code_run_id: str, profile_id: str) -> CodeVerificationView:
         lock = self._run_locks.setdefault(code_run_id, asyncio.Lock())
         async with lock:
             run = await self.repository.get_code_run(code_run_id)
@@ -503,13 +682,9 @@ class CodeRunService:
                 raise ConflictError("code run isolation is unavailable")
             isolated_root = Path(run.isolated_path)
             for relative, expected in dict(run.review_manifest or {}).items():
-                path = self.workspaces.safe_path(
-                    isolated_root, relative, allow_missing=True
-                )
+                path = self.workspaces.safe_path(isolated_root, relative, allow_missing=True)
                 if file_hash(path) != expected:
-                    raise ConflictError(
-                        f"isolated workspace changed after review: {relative}"
-                    )
+                    raise ConflictError(f"isolated workspace changed after review: {relative}")
             token = await self.repository.acquire_code_run_lease(
                 code_run_id,
                 self._verification_owner,
@@ -547,9 +722,7 @@ class CodeRunService:
     async def verifications(self, code_run_id: str) -> List[CodeVerificationView]:
         run = await self.repository.get_code_run(code_run_id)
         records = await self.repository.list_code_verifications(code_run_id)
-        return [
-            self._verification_view(item, run.review_revision) for item in records
-        ]
+        return [self._verification_view(item, run.review_revision) for item in records]
 
     @staticmethod
     def _verification_view(record: Any, current_revision: int) -> CodeVerificationView:
@@ -580,7 +753,10 @@ class CodeRunService:
         record = await self.repository.get_code_run(code_run_id)
         if CodeRunStatus(record.status) != CodeRunStatus.APPLIED or not record.applied_manifest:
             raise ConflictError("code run has no applied changes to revert")
-        workspace = await self.repository.get_workspace(record.workspace_id)
+        async with self._mutation_target(record) as workspace:
+            return await self._revert_target(record, workspace)
+
+    async def _revert_target(self, record: Any, workspace: Any) -> CodeRunView:
         lock = self._workspace_locks.setdefault(record.workspace_id, asyncio.Lock())
         async with lock:
             token = await self.repository.acquire_workspace_mutation_lease(
@@ -615,6 +791,10 @@ class CodeRunService:
             original_root,
             latest.applied_manifest.keys(),
             operation_id=f"revert-{code_run_id}",
+            expected_hashes={
+                relative: metadata.get("before_hash")
+                for relative, metadata in latest.applied_manifest.items()
+            },
         )
         record = await self.repository.update_code_run(code_run_id, status=CodeRunStatus.REVERTED)
         await self.runtime.emit(
@@ -623,6 +803,12 @@ class CodeRunService:
             "代码修改已撤销",
             {"code_run_id": code_run_id, "changed_paths": record.changed_paths},
         )
+        if record.parent_code_run_id:
+            parent = await self.repository.get_code_run(record.parent_code_run_id)
+            await self.runtime.refresh_review(
+                parent, original_root, f"已撤销 Agent {record.code_run_id} 的合并"
+            )
+        await self.runtime.release_worker(code_run_id)
         return await self.get(code_run_id)
 
     async def discard(self, code_run_id: str) -> CodeRunView:
@@ -650,6 +836,7 @@ class CodeRunService:
         return await self.get(code_run_id)
 
     async def _cleanup(self, record: Any, workspace: Any) -> None:
+        await self.runtime.release_worker(record.code_run_id)
         if record.isolated_path:
             await run_sync(self.workspaces.cleanup_isolation, record, workspace)
 
@@ -662,7 +849,31 @@ class CodeRunService:
         operation_id: str,
         expected_hashes: Optional[Mapping[str, Optional[str]]] = None,
     ) -> None:
-        for relative in relative_paths:
+        paths = list(relative_paths)
+        # Validate every backup before restoring any file. Missing evidence must
+        # never be treated as evidence that the original file did not exist.
+        for relative in paths:
+            backup = self.run_store.backup_path(code_run_id, relative)
+            expected = (expected_hashes or {}).get(relative)
+            if backup.exists():
+                if (
+                    expected_hashes is not None
+                    and relative in expected_hashes
+                    and file_hash(backup) != expected
+                ):
+                    raise ConflictError(f"apply backup integrity check failed: {relative}")
+                continue
+            if expected is not None:
+                raise ConflictError(f"apply backup is missing: {relative}")
+            marker = backup.with_name(backup.name + ".missing.json")
+            try:
+                missing = json.loads(marker.read_text(encoding="utf-8")) == {"missing": True}
+            except (OSError, ValueError):
+                missing = False
+            if not missing:
+                raise ConflictError(f"apply backup absence marker is missing: {relative}")
+
+        for relative in paths:
             target = self.workspaces.safe_path(original_root, relative, allow_missing=True)
             backup = self.run_store.backup_path(code_run_id, relative)
             expected = (expected_hashes or {}).get(relative)
@@ -689,6 +900,8 @@ class CodeRunService:
             code_run_id=record.code_run_id,
             workspace_id=record.workspace_id,
             chat_id=record.chat_id,
+            parent_code_run_id=record.parent_code_run_id,
+            agent_mode=record.agent_mode,
             session_id=record.session_id,
             instruction=record.instruction,
             status=CodeRunStatus(record.status),

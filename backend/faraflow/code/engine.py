@@ -29,6 +29,10 @@ class CodeEngine(Protocol):
 
     async def run(self, request: EngineRequest, execute: ExecuteTool, emit: EmitEvent) -> str: ...
 
+    async def close(self) -> None: ...
+
+    async def release(self, run_id: str) -> None: ...
+
 
 class NativeCodeEngine:
     def __init__(self, settings: Settings, adapter: CodeAdapter) -> None:
@@ -58,3 +62,9 @@ class NativeCodeEngine:
                 }
             )
         raise RuntimeError("code run exceeded maximum model steps")
+
+    async def close(self) -> None:
+        return None
+
+    async def release(self, run_id: str) -> None:
+        return None

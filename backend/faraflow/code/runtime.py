@@ -5,7 +5,8 @@ import time
 import uuid
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from faraflow.config import Settings
 from faraflow.domain.enums import (
@@ -24,7 +25,7 @@ from faraflow.workspace.service import WorkspaceService
 from .adapter import CodeAdapter
 from .engine import CodeEngine, EngineRequest, NativeCodeEngine
 from .pico_bridge import PicoCodeEngine
-from .registry import ToolRegistry
+from .registry import ToolRegistry, ToolSpec
 from .tools import CodeToolExecutor, CodeToolResult
 from .verification import VerificationRunner
 
@@ -51,6 +52,8 @@ class CodeRuntime:
         self._restart_requested: Set[str] = set()
         self._cancel_preserve: Dict[str, bool] = {}
         self._lease_tokens: Dict[str, int] = {}
+        self._injections: Dict[str, List[Tuple[str, str]]] = {}
+        self._closing = False
         self._owner_id = f"code-runtime-{uuid.uuid4().hex}"
         self.tool_registry = ToolRegistry.default()
         self.verification = VerificationRunner(settings, repository, workspaces)
@@ -115,7 +118,9 @@ class CodeRuntime:
             job.add_done_callback(partial(self._forget_job, code_run_id))
 
     def _forget_job(
-        self, code_run_id: str, finished: asyncio.Task  # type: ignore[type-arg]
+        self,
+        code_run_id: str,
+        finished: asyncio.Task,  # type: ignore[type-arg]
     ) -> None:
         if self._jobs.get(code_run_id) is finished:
             self._jobs.pop(code_run_id, None)
@@ -139,17 +144,57 @@ class CodeRuntime:
     async def cancel(self, code_run_id: str) -> None:
         await self._cancel(code_run_id, preserve=False)
 
+    async def inject(self, code_run_id: str, turn_id: str, instruction: str) -> bool:
+        """Queue an instruction for the next completed tool boundary.
+
+        The database turn remains QUEUED until the boundary is reached. If the
+        process exits first, normal recovery treats it as an appended turn.
+        """
+        async with self._lock:
+            job = self._jobs.get(code_run_id)
+            if job is None or job.done():
+                return False
+            self._injections.setdefault(code_run_id, []).append((turn_id, instruction))
+            return True
+
+    async def _drain_injections(
+        self, code_run_id: str, session_id: str, active_turn_id: str
+    ) -> str:
+        async with self._lock:
+            pending = self._injections.pop(code_run_id, [])
+        if not pending:
+            return ""
+        instructions: List[str] = []
+        for turn_id, instruction in pending:
+            if turn_id == active_turn_id:
+                continue
+            await self.repository.update_code_turn(
+                turn_id,
+                CodeTurnStatus.INJECTED,
+                summary="已在工具边界注入，等待活动轮次完成",
+            )
+            await self.emit(
+                session_id,
+                "code.turn.injected",
+                "新的要求已注入当前协作轮次",
+                {"code_run_id": code_run_id, "turn_id": turn_id},
+            )
+            instructions.append(instruction)
+        return "\n".join(instructions)
+
     async def _cancel(self, code_run_id: str, *, preserve: bool) -> None:
         self._cancel_preserve[code_run_id] = preserve
         self._restart_requested.discard(code_run_id)
+        self._injections.pop(code_run_id, None)
         async with self._lock:
             job = self._jobs.get(code_run_id)
-            if job and not job.done():
-                job.cancel()
-                results = await asyncio.gather(job, return_exceptions=True)
-                if results and isinstance(results[0], Exception):
-                    raise results[0]
-                return
+        if job and not job.done():
+            job.cancel()
+            results = await asyncio.gather(job, return_exceptions=True)
+            if results and isinstance(results[0], Exception):
+                raise results[0]
+            await self.release_worker(code_run_id)
+            return
         await self.repository.cancel_open_code_turns(code_run_id)
         record = await self.repository.get_code_run(code_run_id)
         if preserve:
@@ -172,14 +217,28 @@ class CodeRuntime:
                     final_summary="代码任务已停止，尚未产生修改",
                 )
         self._cancel_preserve.pop(code_run_id, None)
+        await self.release_worker(code_run_id)
+
+    async def release_worker(self, code_run_id: str) -> None:
+        await self.engine.release(code_run_id)
 
     async def _prepare_isolation(self, code_run_id: str, record: Any, workspace: Any) -> Any:
         if record.isolated_path and await run_sync(Path(record.isolated_path).is_dir):
             return record
 
+        source_workspace = workspace
+        if record.parent_code_run_id:
+            parent = await self.repository.get_code_run(record.parent_code_run_id)
+            if not parent.isolated_path or not await run_sync(Path(parent.isolated_path).is_dir):
+                raise ConflictError("parent code run isolation is unavailable")
+            source_workspace = SimpleNamespace(
+                root_path=parent.isolated_path,
+                git_root=parent.isolated_path,
+            )
+
         async def prepare() -> Any:
             isolation = await run_sync(
-                self.workspaces.prepare_isolation, code_run_id, workspace
+                self.workspaces.prepare_isolation, code_run_id, source_workspace
             )
             return await self.repository.update_code_run(code_run_id, **isolation)
 
@@ -246,9 +305,7 @@ class CodeRuntime:
                         },
                     )
 
-                    async def list_verification_profiles(
-                        _: Dict[str, Any]
-                    ) -> CodeToolResult:
+                    async def list_verification_profiles(_: Dict[str, Any]) -> CodeToolResult:
                         profiles = self.verification.profiles()
                         content = json.dumps(
                             [
@@ -267,9 +324,7 @@ class CodeRuntime:
                     ) -> CodeToolResult:
                         profile_id = arguments.get("profile_id")
                         if not isinstance(profile_id, str) or not profile_id.strip():
-                            return CodeToolResult(
-                                "error: profile_id is required", is_error=True
-                            )
+                            return CodeToolResult("error: profile_id is required", is_error=True)
                         assert _root is not None
                         verification = await self.verification.run(
                             code_run_id=code_run_id,
@@ -312,6 +367,24 @@ class CodeRuntime:
                             ),
                         )
 
+                    context = await run_sync(self._workspace_context, isolated_root)
+                    registry = self.tool_registry
+                    if record.agent_mode == "read_only":
+                        registry = ToolRegistry(
+                            ToolSpec(name)
+                            for name in (
+                                "list_files",
+                                "read_file",
+                                "search",
+                                "git_status",
+                                "git_diff",
+                            )
+                        )
+                        context += (
+                            "\n\nAgent mode: READ ONLY. Inspect and report. "
+                            "Never call create_file, patch_file, delete_file, "
+                            "or verification tools."
+                        )
                     executor = CodeToolExecutor(
                         code_run_id=code_run_id,
                         session_id=record.session_id,
@@ -321,7 +394,7 @@ class CodeRuntime:
                         repository=self.repository,
                         workspace_service=self.workspaces,
                         run_store=self.run_store,
-                        registry=self.tool_registry,
+                        registry=registry,
                         external_tools={
                             "list_verification_profiles": list_verification_profiles,
                             "run_verification": run_verification,
@@ -330,7 +403,6 @@ class CodeRuntime:
                     executor.changed_paths.update(
                         await run_sync(self._changed_paths, record, isolated_root)
                     )
-                    context = await run_sync(self._workspace_context, isolated_root)
                     turns = await self.repository.list_code_turns(code_run_id)
                     prior = [
                         f"{item.ordinal}. {item.instruction}: {item.summary or item.status}"
@@ -406,14 +478,20 @@ class CodeRuntime:
                                 "diff_summary": result.diff_summary,
                             },
                         )
+                        injected = await self._drain_injections(
+                            code_run_id, record.session_id, _turn.turn_id
+                        )
+                        if injected:
+                            result.content += (
+                                "\n\n[New user instructions injected at this tool boundary]\n"
+                                + injected
+                            )
                         return result
 
                     async def execute(
                         name: str, arguments: Dict[str, Any], call_id: str
                     ) -> CodeToolResult:
-                        operation = asyncio.create_task(
-                            execute_and_audit(name, arguments, call_id)
-                        )
+                        operation = asyncio.create_task(execute_and_audit(name, arguments, call_id))
                         try:
                             return await asyncio.shield(operation)
                         except asyncio.CancelledError:
@@ -434,14 +512,13 @@ class CodeRuntime:
                         ),
                         timeout=max(0.1, deadline - time.monotonic()),
                     )
-                    await self.repository.update_code_turn(
-                        current_turn.turn_id,
-                        CodeTurnStatus.COMPLETED,
-                        summary=final_summary,
+                    await self.repository.complete_code_turn_with_injections(
+                        code_run_id, current_turn.turn_id, final_summary
                     )
-                    await self.repository.update_code_run(
-                        code_run_id, active_turn_id=None
-                    )
+                    # Requests that missed a tool boundary remain queued as
+                    # APPEND; do not inject them into their own subsequent turn.
+                    self._injections.pop(code_run_id, None)
+                    await self.repository.update_code_run(code_run_id, active_turn_id=None)
                     await self.emit(
                         record.session_id,
                         "code.turn.completed",
@@ -464,17 +541,34 @@ class CodeRuntime:
                     final_summary or "代码协作轮次已完成",
                 )
             except asyncio.CancelledError:
-                await self.repository.cancel_open_code_turns(code_run_id)
+                await self.repository.cancel_open_code_turns(
+                    code_run_id, include_injected=not self._closing
+                )
+                if self._closing:
+                    pending = self._injections.pop(code_run_id, [])
+                    await self.repository.retry_code_injections(
+                        code_run_id, [turn_id for turn_id, _ in pending]
+                    )
                 preserve = self._cancel_preserve.pop(code_run_id, False)
                 if preserve:
                     record = await self.repository.get_code_run(code_run_id)
                     if isolated_root is not None and isolated_root.is_dir():
-                        await self._finalize_review(
-                            record,
-                            isolated_root,
-                            CodeRunStatus.PAUSED,
-                            final_summary or "代码任务已停止，修改已保留",
-                        )
+                        try:
+                            await self._finalize_review(
+                                record,
+                                isolated_root,
+                                CodeRunStatus.PAUSED,
+                                final_summary or "代码任务已停止，修改已保留",
+                            )
+                        except Exception as exc:
+                            await self.repository.update_code_run(
+                                code_run_id,
+                                status=CodeRunStatus.FAILED,
+                                error={"type": type(exc).__name__, "message": str(exc)},
+                                active_turn_id=None,
+                                final_summary="审核保存失败，隔离区修改已保留，可恢复后重试",
+                            )
+                            return
                     else:
                         await self.repository.update_code_run(
                             code_run_id,
@@ -494,17 +588,24 @@ class CodeRuntime:
                     await self.repository.update_code_turn(
                         current_turn.turn_id, CodeTurnStatus.FAILED, error=error
                     )
-                await self.repository.cancel_open_code_turns(code_run_id)
+                await self.repository.cancel_open_code_turns(code_run_id, include_injected=False)
+                pending = self._injections.pop(code_run_id, [])
+                await self.repository.retry_code_injections(
+                    code_run_id, [turn_id for turn_id, _ in pending]
+                )
                 record = await self.repository.get_code_run(code_run_id)
                 if isolated_root is not None and isolated_root.is_dir():
-                    await self._finalize_review(
-                        record,
-                        isolated_root,
-                        CodeRunStatus.FAILED,
-                        final_summary or "代码任务执行失败，已保留现有修改",
-                    )
+                    try:
+                        await self._finalize_review(
+                            record,
+                            isolated_root,
+                            CodeRunStatus.FAILED,
+                            final_summary or "代码任务执行失败，已保留现有修改",
+                        )
+                    except Exception as review_exc:
+                        error["review_error"] = str(review_exc)
                 await self.repository.update_code_run(
-                    code_run_id, status=CodeRunStatus.FAILED, error=error
+                    code_run_id, status=CodeRunStatus.FAILED, error=error, active_turn_id=None
                 )
                 await self.emit(
                     record.session_id,
@@ -534,9 +635,7 @@ class CodeRuntime:
             if not renewed:
                 raise ConflictError("code run lease was lost")
 
-    async def reconcile_incomplete_tools(
-        self, code_run_id: str, isolated_root: Path
-    ) -> List[str]:
+    async def reconcile_incomplete_tools(self, code_run_id: str, isolated_root: Path) -> List[str]:
         unknown: List[str] = []
         calls = await self.repository.list_incomplete_tool_calls(code_run_id)
         for call in calls:
@@ -554,9 +653,7 @@ class CodeRuntime:
             current: Dict[str, Optional[str]] = {}
             for relative in expected:
                 try:
-                    path = self.workspaces.safe_path(
-                        isolated_root, relative, allow_missing=True
-                    )
+                    path = self.workspaces.safe_path(isolated_root, relative, allow_missing=True)
                     current[relative] = file_hash(path)
                 except (OSError, PermissionError, ValueError):
                     current[relative] = "unreadable"
@@ -591,9 +688,7 @@ class CodeRuntime:
         current = self.workspaces.snapshot_manifest(isolated_root)
         baseline = dict(record.baseline_manifest or {})
         return sorted(
-            path
-            for path in set(baseline) | set(current)
-            if baseline.get(path) != current.get(path)
+            path for path in set(baseline) | set(current) if baseline.get(path) != current.get(path)
         )
 
     async def _finalize_review(
@@ -605,11 +700,9 @@ class CodeRuntime:
     ) -> None:
         changed = await run_sync(self._changed_paths, record, isolated_root)
         diff, changed = self.run_store.build_diff(record.code_run_id, isolated_root, changed)
-        if not changed:
+        if not changed and not record.review_revision:
             final_status = (
-                CodeRunStatus.PAUSED
-                if status == CodeRunStatus.REVIEW_REQUIRED
-                else status
+                CodeRunStatus.PAUSED if status == CodeRunStatus.REVIEW_REQUIRED else status
             )
             await self.repository.update_code_run(
                 record.code_run_id,
@@ -620,6 +713,8 @@ class CodeRuntime:
                 review_manifest={},
             )
             return
+        if not changed and status == CodeRunStatus.REVIEW_REQUIRED:
+            status = CodeRunStatus.PAUSED
         revision = int(record.review_revision or 0) + 1
         manifest = self.run_store.preserve_review(
             record.code_run_id, revision, isolated_root, changed
@@ -639,9 +734,7 @@ class CodeRuntime:
             "code.review.required"
             if status == CodeRunStatus.REVIEW_REQUIRED
             else "code.review.saved",
-            "代码修改已生成，等待确认应用"
-            if status == CodeRunStatus.REVIEW_REQUIRED
-            else summary,
+            "代码修改已生成，等待确认应用" if status == CodeRunStatus.REVIEW_REQUIRED else summary,
             {
                 "code_run_id": record.code_run_id,
                 "review_revision": revision,
@@ -649,6 +742,15 @@ class CodeRuntime:
                 "diff_ref": diff_ref,
                 "diff_size": len(diff.encode("utf-8")),
             },
+        )
+
+    async def refresh_review(self, record: Any, isolated_root: Path, summary: str) -> None:
+        """Publish a new immutable review after an agent merges into its parent."""
+        await self._finalize_review(
+            record,
+            isolated_root,
+            CodeRunStatus.REVIEW_REQUIRED,
+            summary,
         )
 
     @staticmethod
@@ -683,6 +785,7 @@ class CodeRuntime:
         return "\n\n".join(sections)
 
     async def close(self) -> None:
+        self._closing = True
         jobs = list(self._jobs.items())
         for run_id, job in jobs:
             self._cancel_preserve[run_id] = False
@@ -691,3 +794,4 @@ class CodeRuntime:
                 job.cancel()
         if jobs:
             await asyncio.gather(*(job for _, job in jobs), return_exceptions=True)
+        await self.engine.close()

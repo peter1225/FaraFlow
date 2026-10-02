@@ -5,8 +5,9 @@ import json
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from faraflow.config import Settings
 
@@ -19,12 +20,24 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 WORKER = Path(__file__).with_name("pico_worker.py")
 
 
+@dataclass
+class _WorkerHandle:
+    process: asyncio.subprocess.Process
+    lock: asyncio.Lock
+    persistent: bool
+    busy: bool = True
+    last_used: float = 0.0
+    idle_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
+
+
 class PicoCodeEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self._health_cache: Dict[str, Any] = {}
         self._health_checked = 0.0
         self._health_lock = asyncio.Lock()
+        self._workers: Dict[str, _WorkerHandle] = {}
+        self._workers_lock = asyncio.Lock()
 
     async def health(self) -> Dict[str, Any]:
         async with self._health_lock:
@@ -34,6 +47,9 @@ class PicoCodeEngine:
             if self.settings.pico_python:
                 process = None
                 try:
+                    options: Dict[str, Any] = (
+                        {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+                    )
                     process = await asyncio.create_subprocess_exec(
                         self.settings.pico_python,
                         "-I",
@@ -43,19 +59,12 @@ class PicoCodeEngine:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.DEVNULL,
                         limit=MAX_FRAME_BYTES,
-                        **(
-                            {"creationflags": subprocess.CREATE_NO_WINDOW}
-                            if os.name == "nt"
-                            else {}
-                        ),
+                        **options,
                     )
                     hello = await asyncio.wait_for(
                         self._read(process), self.settings.pico_startup_timeout_seconds
                     )
-                    if hello.get("method") == "ready" and hello.get("params") == {
-                        "protocol": 1,
-                        "version": PICO_VERSION,
-                    }:
+                    if self._valid_hello(hello):
                         result["status"] = "ok"
                 except (OSError, ValueError, RuntimeError, asyncio.TimeoutError):
                     pass
@@ -102,112 +111,216 @@ class PicoCodeEngine:
         }
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
-        process = await asyncio.create_subprocess_exec(
-            self.settings.pico_python,
-            "-I",
-            "-u",
-            str(WORKER),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            cwd=str(state),
-            env=env,
-            limit=MAX_FRAME_BYTES,
-            **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
-        )
+        handle = await self._worker(request.run_id, state, env)
+        process = handle.process
         seen = set()
+        failed = False
         try:
-            hello = await asyncio.wait_for(
-                self._read(process), timeout=self.settings.pico_startup_timeout_seconds
+            async with handle.lock:
+                if process.returncode is not None:
+                    raise RuntimeError("Pico worker exited before the turn started")
+                await emit(
+                    "code.engine.ready",
+                    "Pico 长驻执行引擎已就绪",
+                    {
+                        "engine": "pico",
+                        "version": PICO_VERSION,
+                        "upstream_commit": PICO_COMMIT,
+                        "persistent": handle.persistent,
+                    },
+                )
+                await self._write(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "run",
+                        "method": "run",
+                        "params": {
+                            "run_id": request.run_id,
+                            "instruction": request.instruction,
+                            "root": str(request.root),
+                            "state": str(state),
+                            "context": request.workspace_context,
+                            "base_url": self.settings.code_base_url,
+                            "api_key": self.settings.code_api_key,
+                            "model": self.settings.code_model,
+                            "max_steps": self.settings.code_max_steps,
+                            "max_tokens": self.settings.code_max_tokens,
+                            "model_timeout": self.settings.code_timeout_seconds,
+                            "context_window_tokens": self.settings.pico_context_window_tokens,
+                        },
+                    },
+                )
+                while True:
+                    frame = await self._read(process)
+                    if frame.get("method") == "tool.execute":
+                        call_id = frame.get("id")
+                        params = frame.get("params", {})
+                        if not isinstance(call_id, str) or call_id in seen:
+                            raise RuntimeError(
+                                "Pico worker sent a duplicate or invalid tool request"
+                            )
+                        seen.add(call_id)
+                        name, arguments = params.get("name"), params.get("arguments")
+                        if name not in ToolRegistry.default() or not isinstance(arguments, dict):
+                            raise RuntimeError(
+                                "Pico worker requested a tool outside the allow-list"
+                            )
+                        result = await execute(name, arguments, call_id)
+                        await self._write(
+                            process,
+                            {
+                                "jsonrpc": "2.0",
+                                "id": call_id,
+                                "result": {
+                                    "content": result.content,
+                                    "is_error": result.is_error,
+                                },
+                            },
+                        )
+                    elif frame.get("method") == "event":
+                        params = frame.get("params", {})
+                        kind = params.get("kind")
+                        if kind == "text":
+                            await emit("code.text", str(params.get("text", ""))[:16000], {})
+                        elif kind == "usage":
+                            usage = {
+                                key: int(params.get(key, 0))
+                                for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                            }
+                            await emit("code.usage", "模型用量已记录", usage)
+                        else:
+                            raise RuntimeError("Pico worker sent an unsupported event")
+                    elif frame.get("id") == "run":
+                        if "error" in frame:
+                            raise RuntimeError("Pico turn failed; check model/tool compatibility")
+                        result = frame.get("result", {})
+                        if result.get("status") != "completed":
+                            raise RuntimeError(
+                                "Pico turn did not complete within its execution budget"
+                            )
+                        return str(result.get("summary", ""))[:16000]
+                    else:
+                        raise RuntimeError("Pico worker sent an invalid protocol frame")
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            if failed or not handle.persistent:
+                await self._remove_worker(request.run_id, handle)
+            else:
+                async with self._workers_lock:
+                    handle.busy = False
+                    handle.last_used = time.monotonic()
+                    if self._workers.get(request.run_id) is handle:
+                        handle.idle_task = asyncio.create_task(
+                            self._expire_idle_worker(request.run_id, handle)
+                        )
+
+    async def _worker(self, run_id: str, state: Path, env: Dict[str, str]) -> _WorkerHandle:
+        async with self._workers_lock:
+            current = self._workers.get(run_id)
+            if current is not None and current.process.returncode is None:
+                if current.busy:
+                    raise RuntimeError("Pico worker already has an active turn")
+                self._cancel_idle(current)
+                current.busy = True
+                return current
+            if current is not None:
+                self._cancel_idle(current)
+                self._workers.pop(run_id, None)
+            capacity = max(self.settings.pico_max_workers, self.settings.code_max_concurrent_runs)
+            if len(self._workers) >= capacity:
+                idle = [(key, item) for key, item in self._workers.items() if not item.busy]
+                if not idle:
+                    raise RuntimeError("Pico worker capacity is exhausted")
+                key, evicted = min(idle, key=lambda pair: pair[1].last_used)
+                self._workers.pop(key)
+                self._cancel_idle(evicted)
+                await self._stop(evicted.process)
+            options: Dict[str, Any] = (
+                {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
             )
-            if hello.get("method") != "ready" or hello.get("params") != {
-                "protocol": 1,
-                "version": PICO_VERSION,
-            }:
+            process = await asyncio.create_subprocess_exec(
+                self.settings.pico_python,
+                "-I",
+                "-u",
+                str(WORKER),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                cwd=str(state),
+                env=env,
+                limit=MAX_FRAME_BYTES,
+                **options,
+            )
+            try:
+                hello = await asyncio.wait_for(
+                    self._read(process), timeout=self.settings.pico_startup_timeout_seconds
+                )
+            except BaseException:
+                await self._stop(process)
+                raise
+            if not self._valid_hello(hello):
+                await self._stop(process)
                 raise RuntimeError(
                     "Pico worker unavailable: install the pinned Python 3.12 runtime"
                 )
-            await emit(
-                "code.engine.ready",
-                "Pico 执行引擎已就绪",
-                {
-                    "engine": "pico",
-                    "version": PICO_VERSION,
-                    "upstream_commit": PICO_COMMIT,
-                },
+            capabilities = hello.get("params", {}).get("capabilities", [])
+            handle = _WorkerHandle(
+                process=process,
+                lock=asyncio.Lock(),
+                persistent="persistent_turns" in capabilities,
             )
-            await self._write(
-                process,
-                {
-                    "jsonrpc": "2.0",
-                    "id": "run",
-                    "method": "run",
-                    "params": {
-                        "run_id": request.run_id,
-                        "instruction": request.instruction,
-                        "root": str(request.root),
-                        "state": str(state),
-                        "context": request.workspace_context,
-                        "base_url": self.settings.code_base_url,
-                        "api_key": self.settings.code_api_key,
-                        "model": self.settings.code_model,
-                        "max_steps": self.settings.code_max_steps,
-                        "max_tokens": self.settings.code_max_tokens,
-                        "model_timeout": self.settings.code_timeout_seconds,
-                        "context_window_tokens": self.settings.pico_context_window_tokens,
-                    },
-                },
-            )
-            while True:
-                frame = await self._read(process)
-                if frame.get("method") == "tool.execute":
-                    call_id = frame.get("id")
-                    params = frame.get("params", {})
-                    if not isinstance(call_id, str) or call_id in seen:
-                        raise RuntimeError("Pico worker sent a duplicate or invalid tool request")
-                    seen.add(call_id)
-                    name, arguments = params.get("name"), params.get("arguments")
-                    if name not in ToolRegistry.default() or not isinstance(arguments, dict):
-                        raise RuntimeError("Pico worker requested a tool outside the allow-list")
-                    # The host supplies run identity, path root and step numbering, never the model.
-                    result = await execute(name, arguments, call_id)
-                    await self._write(
-                        process,
-                        {
-                            "jsonrpc": "2.0",
-                            "id": call_id,
-                            "result": {
-                                "content": result.content,
-                                "is_error": result.is_error,
-                            },
-                        },
-                    )
-                elif frame.get("method") == "event":
-                    params = frame.get("params", {})
-                    kind = params.get("kind")
-                    if kind == "text":
-                        await emit("code.text", str(params.get("text", ""))[:16000], {})
-                    elif kind == "usage":
-                        usage = {
-                            key: int(params.get(key, 0))
-                            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
-                        }
-                        await emit("code.usage", "模型用量已记录", usage)
-                    else:
-                        raise RuntimeError("Pico worker sent an unsupported event")
-                elif frame.get("id") == "run":
-                    if "error" in frame:
-                        # Do not expose raw provider errors, which can include keys and prompts.
-                        raise RuntimeError("Pico turn failed; check model/tool compatibility")
-                    result = frame.get("result", {})
-                    if result.get("status") != "completed":
-                        raise RuntimeError("Pico turn did not complete within its execution budget")
-                    return str(result.get("summary", ""))[:16000]
-                else:
-                    raise RuntimeError("Pico worker sent an invalid protocol frame")
-        finally:
-            # No local shell or child-process tools are registered in this worker.
-            await self._stop(process)
+            self._workers[run_id] = handle
+            return handle
+
+    async def _remove_worker(self, run_id: str, handle: _WorkerHandle) -> None:
+        async with self._workers_lock:
+            if self._workers.get(run_id) is handle:
+                self._workers.pop(run_id, None)
+            self._cancel_idle(handle)
+        await self._stop(handle.process)
+
+    @staticmethod
+    def _cancel_idle(handle: _WorkerHandle) -> None:
+        if handle.idle_task is not None and handle.idle_task is not asyncio.current_task():
+            handle.idle_task.cancel()
+        handle.idle_task = None
+
+    async def _expire_idle_worker(self, run_id: str, handle: _WorkerHandle) -> None:
+        await asyncio.sleep(self.settings.pico_worker_idle_seconds)
+        async with self._workers_lock:
+            if self._workers.get(run_id) is not handle or handle.busy:
+                return
+            self._workers.pop(run_id, None)
+            handle.idle_task = None
+        await self._stop(handle.process)
+
+    async def release(self, run_id: str) -> None:
+        async with self._workers_lock:
+            handle = self._workers.pop(run_id, None)
+            if handle is not None:
+                self._cancel_idle(handle)
+        if handle is not None:
+            await self._stop(handle.process)
+
+    async def close(self) -> None:
+        async with self._workers_lock:
+            workers = list(self._workers.values())
+            self._workers.clear()
+            for handle in workers:
+                self._cancel_idle(handle)
+        await asyncio.gather(*(self._stop(item.process) for item in workers))
+
+    @staticmethod
+    def _valid_hello(frame: Dict[str, Any]) -> bool:
+        params = frame.get("params", {})
+        return (
+            frame.get("method") == "ready"
+            and params.get("protocol") == 1
+            and params.get("version") == PICO_VERSION
+        )
 
     @staticmethod
     async def _stop(process: asyncio.subprocess.Process) -> None:

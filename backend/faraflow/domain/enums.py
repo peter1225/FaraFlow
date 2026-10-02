@@ -53,6 +53,7 @@ class CodeRunStatus(str, Enum):
 class CodeTurnStatus(str, Enum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    INJECTED = "INJECTED"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"

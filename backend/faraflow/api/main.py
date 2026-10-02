@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, ORJSONResponse
 
 from faraflow.browser.playwright_runner import BrowserPool
 from faraflow.code import CodeAdapter, CodeRunService, CodeRuntime
+from faraflow.code.gc import CodeArtifactGarbageCollector
 from faraflow.config import Settings, get_settings
 from faraflow.desktop import (
     DesktopAdapter,
@@ -21,6 +22,7 @@ from faraflow.desktop import (
 )
 from faraflow.domain.schemas import SessionEvent
 from faraflow.infra.artifacts import ArtifactStore
+from faraflow.infra.async_utils import run_sync
 from faraflow.infra.database import Database
 from faraflow.infra.events import EventBus
 from faraflow.infra.outbox import EventOutboxDispatcher
@@ -59,6 +61,7 @@ class Container:
     code_adapter: CodeAdapter
     code_runtime: CodeRuntime
     code_runs: CodeRunService
+    code_gc: CodeArtifactGarbageCollector
     workspaces: WorkspaceService
     desktop_adapter: DesktopAdapter
     desktop_runtime: DesktopRuntime
@@ -78,7 +81,10 @@ def build_container(settings: Settings) -> Container:
     runtime = AgentRuntime(repository, browser_pool, fara, event_bus)
     task_service = TaskService(repository, runtime)
     code_adapter = CodeAdapter(settings)
-    code_run_store = CodeRunStore(artifacts.root)
+    code_run_store = CodeRunStore(
+        artifacts.root,
+        quota_bytes=int(settings.code_artifact_quota_gb * 1024 * 1024 * 1024),
+    )
     workspace_service = WorkspaceService(settings, repository, code_run_store)
     code_runtime = CodeRuntime(
         settings,
@@ -88,9 +94,8 @@ def build_container(settings: Settings) -> Container:
         code_adapter,
         event_bus,
     )
-    code_run_service = CodeRunService(
-        repository, workspace_service, code_run_store, code_runtime
-    )
+    code_run_service = CodeRunService(repository, workspace_service, code_run_store, code_runtime)
+    code_gc = CodeArtifactGarbageCollector(settings, repository, code_run_store)
     desktop_adapter = DesktopAdapter(settings)
     desktop_bridge = DesktopBridge()
     desktop_policy = DesktopPolicy(
@@ -129,6 +134,7 @@ def build_container(settings: Settings) -> Container:
         code_adapter=code_adapter,
         code_runtime=code_runtime,
         code_runs=code_run_service,
+        code_gc=code_gc,
         workspaces=workspace_service,
         desktop_adapter=desktop_adapter,
         desktop_runtime=desktop_runtime,
@@ -148,6 +154,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         await container.database.create_schema()
         await container.repository.interrupt_running_code_runs()
         await container.code_runs.recover_incomplete_applies()
+        await run_sync(container.code_runtime.run_store.detach_legacy_review_links)
+        gc_result = await container.code_gc.collect()
+        if gc_result["quota_exceeded"]:
+            logger.warning("Code artifact quota exceeded: %s", gc_result)
         await container.repository.interrupt_running_desktop_runs()
         await container.tasks.seed_skills()
         container.event_outbox.start()
@@ -217,14 +227,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             container.desktop_adapter.health(),
             container.code_runtime.engine.health(),
         )
-        code_ready = (
-            not container.settings.enable_local_workspaces
-            or (coding_model["status"] == "ok" and code_engine["status"] == "ok")
+        code_ready = not container.settings.enable_local_workspaces or (
+            coding_model["status"] == "ok" and code_engine["status"] == "ok"
         )
         chat_ready = chat_model["status"] == "ok"
         desktop_ready = (
-            not container.settings.enable_desktop_control
-            or desktop_model["status"] == "ok"
+            not container.settings.enable_desktop_control or desktop_model["status"] == "ok"
         )
         return {
             "status": (
@@ -247,15 +255,22 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             },
             "local_workspaces": {
                 "enabled": container.settings.enable_local_workspaces,
-                "allowed_roots": [
-                    str(path) for path in container.settings.workspace_allowed_roots
-                ],
+                "allowed_roots": [str(path) for path in container.settings.workspace_allowed_roots],
             },
         }
 
     @app.get("/v1/artifacts/{artifact_path:path}", tags=["artifacts"])
     async def get_artifact(artifact_path: str, request: Request) -> FileResponse:
         normalized = artifact_path.replace("\\", "/").strip("/")
+        # Authorize the resolved path so aliases containing '..' cannot bypass
+        # the private code storage boundary.
+        try:
+            path = get_container(request).artifacts.resolve_public_path(normalized)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        normalized = path.relative_to(get_container(request).artifacts.root).as_posix()
+        if normalized == "blobs" or normalized.startswith("blobs/"):
+            raise HTTPException(status_code=404, detail="artifact not found")
         if normalized.startswith("code-runs/"):
             parts = normalized.split("/")
             filename = parts[-1] if parts else ""
@@ -269,10 +284,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             require_local_workspace_request(request, get_container(request).settings)
         elif len(normalized.split("/")) >= 2 and normalized.split("/")[1] == "desktop":
             require_desktop_request(request, get_container(request).settings)
-        try:
-            path = get_container(request).artifacts.resolve_public_path(normalized)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not path.is_file():
             raise HTTPException(status_code=404, detail="artifact not found")
         media_type = {

@@ -61,12 +61,17 @@ class Settings(BaseSettings):
     code_verification_profiles: Dict[str, List[str]] = Field(default_factory=dict)
     code_verification_timeout_seconds: int = Field(default=600, ge=1, le=3600)
     code_verification_output_bytes: int = Field(default=1024 * 1024, ge=1024)
+    code_review_retention_days: int = Field(default=30, ge=1)
+    pico_state_retention_days: int = Field(default=14, ge=1)
+    code_artifact_quota_gb: float = Field(default=10.0, gt=0)
     code_engine: Literal["native", "pico"] = "native"
     # Pico has its own Python 3.12 environment; never import it into the API process.
     pico_python: str = ""
     pico_state_root: Path = Path("./data/pico-runs")
     pico_startup_timeout_seconds: float = Field(default=45.0, gt=0)
     pico_context_window_tokens: int = Field(default=32768, ge=4096)
+    pico_worker_idle_seconds: float = Field(default=300.0, gt=0)
+    pico_max_workers: int = Field(default=2, ge=1)
 
     # Desktop control is opt-in and intentionally separate from browser automation.
     enable_desktop_control: bool = False

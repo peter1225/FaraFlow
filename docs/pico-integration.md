@@ -20,6 +20,8 @@ FARAFLOW_PICO_PYTHON=C:/path/to/pico-env/python.exe
 FARAFLOW_PICO_STATE_ROOT=./data/pico-runs
 FARAFLOW_PICO_STARTUP_TIMEOUT_SECONDS=45
 FARAFLOW_PICO_CONTEXT_WINDOW_TOKENS=32768
+FARAFLOW_PICO_WORKER_IDLE_SECONDS=300
+FARAFLOW_PICO_MAX_WORKERS=2
 FARAFLOW_CODE_LEASE_SECONDS=60
 ```
 
@@ -29,9 +31,11 @@ FARAFLOW_CODE_LEASE_SECONDS=60
 
 切换回 `FARAFLOW_CODE_ENGINE=native` 并重启后端即可恢复原引擎。失败任务不会自动换引擎或重放。
 
+Worker 默认空闲 300 秒后回收；缓存容量至少覆盖 `CODE_MAX_CONCURRENT_RUNS`，超过容量时优先回收最久空闲的进程。暂停、应用、撤销和丢弃任务也会释放对应 Worker，恢复任务时按需重建进程。
+
 ## 运行边界
 
-1. `CodeRuntime` 继续创建 worktree 或托管快照，并为单次 CodeRun 启动 Worker。
+1. `CodeRuntime` 继续创建 worktree 或托管快照，并为每个 CodeRun 维护一个长驻 Worker；多个 Turn 复用同一进程和私有状态目录。
 2. Worker 组装 Pico Scheduler、AgentTurnRunner 和 AgentLoop，只注册八个 FaraFlow 文件与 Git 查询代理工具。
 3. Shell、spawn、Web、MCP、消息、定时任务和插件入口均不注册。
 4. 工具请求回到宿主 `CodeToolExecutor`，继续执行路径、敏感文件、读后写、基线和审计检查。
@@ -56,7 +60,9 @@ Pico 状态位于 `<PICO_STATE_ROOT>/<code_run_id>`，可能包含代码与模�
 
 “停止并保留修改”会取消当前及排队 Turn，等待正在进行的文件操作与审计完成，然后把任务置为 `PAUSED`。存在修改时仍可应用或继续修改。“丢弃任务”才会清理隔离目录。
 
-后端重启会把执行中的 CodeRun 标记为 `INTERRUPTED`，保留隔离目录和历史记录；可以追加新 Turn 继续处理。当前版本尚未自动重放中断中的模型调用，也不开放测试命令、Shell、逐 token 输出或多 Agent 写入。
+运行中的新要求支持三种策略：`APPEND` 在当前 Turn 后排队，`INJECT` 在下一次工具结果边界注入当前 Turn，`INTERRUPT` 停止并保留当前修改后立即开始新 Turn。注入请求先持久化为排队 Turn；交付后保持 `INJECTED`，仅在活动轮次成功时一起提交为完成。连接失败、服务关闭或重启后，未完成的注入要求恢复为排队 Turn，由恢复操作继续处理。主动停止或丢弃仍会取消未完成要求。
+
+后端重启会把执行中的 CodeRun 标记为 `INTERRUPTED`，保留隔离目录和历史记录；可以追加新 Turn 继续处理。当前版本不会自动重放中断中的模型调用，也不开放 Shell 或逐 token 输出。
 
 ## 持久化恢复与可靠事件流
 
@@ -72,8 +78,11 @@ Pico 状态位于 `<PICO_STATE_ROOT>/<code_run_id>`，可能包含代码与模�
 
 ```text
 GET  /v1/code-runs/{code_run_id}/recovery
+POST /v1/code-runs/{code_run_id}/recovery/tools/{tool_call_id}
 POST /v1/code-runs/{code_run_id}/resume
 ```
+
+恢复视图会显示执行前、预期结果和当前文件哈希。人工可以接受当前状态、在确认文件仍等于执行前状态时标记为可重试，或丢弃整个运行；裁决会写入持久化事件审计。
 
 多文件应用使用 `CodeApplyJournal`。所有原文件先完成备份，之后逐文件通过同目录临时文件和 `os.replace` 替换。后端启动时发现未完成的应用会自动回滚，包括“文件已经替换、completed_paths 尚未落库”的崩溃窗口。
 
@@ -114,6 +123,31 @@ GET  /v1/code-runs/{id}/verifications
 
 Agent 同时获得 `list_verification_profiles` 和 `run_verification` 两个受控工具，可以在同一 Turn 中根据失败输出继续修复。当前 Profile 进程仍运行在宿主机权限范围内；它适用于用户信任的本地项目，后续可接入 WSL2 或专用沙箱提供更强隔离。
 
+## 内容寻址存储、配额与协作 Agent
+
+审核内容按 SHA-256 存入 `artifacts/blobs/sha256`，相同内容共用一个 CAS 对象。每个审核版本使用独立文件副本，避免修改一份快照影响其他审核或 CAS 对象；Blob 和内部审核文件不能通过公开工件接口读取。代码审核和 Pico 私有状态分别按以下配置清理：
+
+服务启动时会拆开旧版本审核文件的硬链接，保留原有文件内容和审核哈希；已损坏的快照仍会在应用时被完整性检查拒绝。
+
+```dotenv
+FARAFLOW_CODE_REVIEW_RETENTION_DAYS=30
+FARAFLOW_PICO_STATE_RETENTION_DAYS=14
+FARAFLOW_CODE_ARTIFACT_QUOTA_GB=10
+```
+
+服务启动时执行一次 GC，也可以从 loopback 调用 `POST /v1/code-runs/maintenance/gc`。GC 清理终态运行的过期审核，但保留仍处于 `APPLIED` 状态的撤销备份；撤销后备份按保留期清理。撤销会在写入前校验全部备份哈希和缺失标记，证据不完整时返回冲突，不会删除原文件。CAS 配额不包含快照副本和撤销备份；超过配额时任务记录为 `FAILED`，保留隔离区修改，腾出空间后可以恢复并重新生成审核。
+
+主 CodeRun 可以创建两类子 Agent：
+
+```text
+POST /v1/code-runs/{id}/agents
+GET  /v1/code-runs/{id}/agents
+```
+
+`read_only` Agent 只有目录、读取、搜索和 Git 查询工具；即使模型请求写工具，宿主执行器也会拒绝。`isolated_write` Agent 从主任务当前隔离区创建自己的 worktree 或快照，生成独立 Diff。写入 Agent 的审核版本只能在主任务暂停后合并到主任务隔离区，不能直接修改原工作区；原工作区仍由主任务的最终 apply 流程统一更新。
+
+合并和撤销子 Agent 会锁定主任务、取得主任务执行租约，并刷新累计审核版本；主任务已经应用、丢弃或撤销后，子 Agent 的撤销会返回冲突。首次合并一个文件前保存主任务原始基线，文件恢复到原内容时生成新的空审核版本，旧 Diff 不能再次应用。
+
 ## 验证
 
 后端验证使用现有 `zzx`：
@@ -122,7 +156,7 @@ Agent 同时获得 `list_verification_profiles` 和 `run_verification` 两个受
 conda run -n zzx python -m pytest tests/test_code_workspace.py tests/test_pico_bridge.py tests/test_migrations.py tests/test_api.py tests/test_chat_service.py tests/test_chat_adapter.py -q
 ```
 
-测试覆盖越界路径、敏感文件、读后写、多轮累计修改、轮次排队、暂停保留、审核版本冲突、不可变快照、撤销、畸形协议、启动超时和取消回收。它不能替代 Pico 与实际 CodingModel 的集成验收。
+测试覆盖越界路径、敏感文件、读后写、多轮累计修改、长驻 Worker 复用、忙时策略、恢复裁决、内容去重与配额、只读/独立写入 Agent、审核版本冲突、不可变快照、撤销、畸形协议、启动超时和取消回收。它不能替代 Pico 与实际 CodingModel 的集成验收。
 
 ## 升级约束
 

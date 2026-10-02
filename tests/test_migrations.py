@@ -37,9 +37,7 @@ def test_alembic_creates_fresh_database(tmp_path: Path) -> None:
             "ff_desktop_actions",
             "ff_desktop_approvals",
         } <= tables
-        tool_columns = {
-            item["name"] for item in inspect(engine).get_columns("ff_tool_calls")
-        }
+        tool_columns = {item["name"] for item in inspect(engine).get_columns("ff_tool_calls")}
         assert {
             "before_hashes",
             "after_hashes",
@@ -51,9 +49,7 @@ def test_alembic_creates_fresh_database(tmp_path: Path) -> None:
             "result_digest",
             "expected_after_hashes",
         } <= tool_columns
-        run_columns = {
-            item["name"] for item in inspect(engine).get_columns("ff_code_runs")
-        }
+        run_columns = {item["name"] for item in inspect(engine).get_columns("ff_code_runs")}
         assert {"engine", "model", "review_revision", "review_manifest"} <= run_columns
         assert {
             "state_version",
@@ -62,19 +58,17 @@ def test_alembic_creates_fresh_database(tmp_path: Path) -> None:
             "next_turn_ordinal",
             "active_turn_id",
             "lease_token",
+            "parent_code_run_id",
+            "agent_mode",
         } <= run_columns
-        event_columns = {
-            item["name"] for item in inspect(engine).get_columns("ff_events")
-        }
+        event_columns = {item["name"] for item in inspect(engine).get_columns("ff_events")}
         assert "sequence" in event_columns
         journal_columns = {
-            item["name"]
-            for item in inspect(engine).get_columns("ff_code_apply_journals")
+            item["name"] for item in inspect(engine).get_columns("ff_code_apply_journals")
         }
         assert "backup_hashes" in journal_columns
         verification_columns = {
-            item["name"]
-            for item in inspect(engine).get_columns("ff_code_verifications")
+            item["name"] for item in inspect(engine).get_columns("ff_code_verifications")
         }
         assert {
             "review_revision",
@@ -117,12 +111,8 @@ def test_alembic_preserves_existing_chat_data(tmp_path: Path) -> None:
     engine = create_engine(f"sqlite:///{database.as_posix()}")
     try:
         inspector = inspect(engine)
-        assert "workspace_id" in {
-            item["name"] for item in inspector.get_columns("ff_chat_threads")
-        }
-        assert "code_run_id" in {
-            item["name"] for item in inspector.get_columns("ff_chat_messages")
-        }
+        assert "workspace_id" in {item["name"] for item in inspector.get_columns("ff_chat_threads")}
+        assert "code_run_id" in {item["name"] for item in inspector.get_columns("ff_chat_messages")}
         assert "desktop_run_id" in {
             item["name"] for item in inspector.get_columns("ff_chat_messages")
         }
